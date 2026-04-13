@@ -274,7 +274,7 @@ const { provider } = key;
         'Content-Type': 'application/json', 
         'Accept': 'application/json',
         'Authorization': `Bearer ${key.api_key ?? ''}`,
-        'User-Agent': 'curl/8.5.0'
+        
       };
       
       let url;
@@ -858,7 +858,7 @@ case 'testKey': {
               headers: {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${k.api_key ?? ''}`,
-                'User-Agent': 'curl/8.5.0'
+                
               },
               body: JSON.stringify({
                 model: modelId,
