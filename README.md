@@ -66,9 +66,13 @@ Follow these steps to deploy your own instance in under 5 minutes.
 4. Select your provider (e.g., `Groq`), enter the Model ID (e.g., `llama-3.3-70b-versatile`), and paste your API Key.
 5. Check the **Set as Primary** box and click **Save Key**.
 
-AI MODAL NAME: 
+### AI MODAL NAME: 
 - Chat modal name: google/gemma-4-26b-a4b-it
 - Summarize modal name: llama-3.3-70b-versatile
+
+### Recommend modal
+- Openrouter: nvidia/nemotron-3-super-120b-a12b:free
+(too lazy lol, only know this one was good, others one mostly crap)
 
 
 
