@@ -1220,7 +1220,7 @@ function getAppHTML() {
     </button>
     <div class="max-w-3xl mx-auto relative">
       <div class="border border-gray-200 dark:border-gray-800 rounded-xl bg-white dark:bg-[#111] shadow focus-within:border-black dark:focus-within:border-white focus-within:ring-1 focus-within:ring-black dark:focus-within:ring-white transition-all">
-        <textarea id="chat-input" rows="1" class="w-full bg-transparent p-3 sm:p-4 pr-12 resize-none outline-none text-base md:text-sm max-h-40 placeholder-gray-400 dark:placeholder-gray-600" placeholder="Message AIPHP..."></textarea>
+        <textarea id="chat-input" rows="1" class="w-full bg-transparent p-3 sm:p-4 pr-12 resize-none outline-none text-base md:text-sm max-h-40 placeholder-gray-400 dark:placeholder-gray-600" placeholder="Type here to chat. Ctrl + Enter to add a new line."></textarea>
         <!-- Toolbar row -->
         <div class="flex items-center justify-between px-2 pb-2">
           <!-- Thinking toggle -->
