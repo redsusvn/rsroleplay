@@ -224,21 +224,22 @@ async function buildCtx(sid, userMsg, db, beforeTs = null) {
   if (sysParts.length > 0) msgs.push({ role: 'system', content: sysParts.join('\n\n') });
   if (mem.current_summary) msgs.push({ role: 'system', content: 'Previous summary:\n' + mem.current_summary });
 
-  const ctxCount = Math.max(1, Math.min(mem.context_count ?? 20, 100));
-  const lastTs   = mem.last_summarized_timestamp ?? 0;
+const ctxCount = Math.max(1, Math.min(mem.context_count ?? 20, 100));
   
   let history;
   if (beforeTs) {
+    // FIXED: Always fetch the exact immediate history prior to the regenerated message, ignoring summary markers
     history = await db.all(
-      `SELECT * FROM chat_history WHERE session_id = ? AND is_main = 1 AND timestamp > ? AND timestamp < ?
+      `SELECT * FROM chat_history WHERE session_id = ? AND is_main = 1 AND timestamp < ?
        ORDER BY timestamp DESC LIMIT ?`,
-      [sid, lastTs, beforeTs, ctxCount]
+      [sid, beforeTs, ctxCount]
     );
   } else {
+    // FIXED: Always fetch the latest messages verbatim to guarantee immediate conversational tone
     history = await db.all(
-      `SELECT * FROM chat_history WHERE session_id = ? AND is_main = 1 AND timestamp > ?
+      `SELECT * FROM chat_history WHERE session_id = ? AND is_main = 1
        ORDER BY timestamp DESC LIMIT ?`,
-      [sid, lastTs, ctxCount]
+      [sid, ctxCount]
     );
   }
   history.reverse();
