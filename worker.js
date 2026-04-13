@@ -2061,12 +2061,17 @@ function toggleDropdown(e,id,isBot){
     const vars=el?getVars(el):[];const ids=el?getIds(el):[];
     const ai=el?parseInt(el.dataset.ai||'0'):0;
     const isGreeting = (!S.hasMore && S.msgs[0] && S.msgs[0].id == id && isBot);
+    
+    // NEW: Check if this is the absolute newest bot message
+    const latestBotMsg = S.msgs.slice().reverse().find(m => m.role === 'bot');
+    const isLatest = (latestBotMsg && latestBotMsg.id == id);
+
     drop.innerHTML=\`
         <button onclick="copyMsg('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left"><i data-lucide="copy"class="w-4 h-4 mr-2"></i>Copy</button>
         <button onclick="startEdit('\${id}',\${isBot})" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left"><i data-lucide="edit-2"class="w-4 h-4 mr-2"></i>Edit</button>
         \${isBot?\`<button onclick="pinMsg('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left"><i data-lucide="pin"class="w-4 h-4 mr-2"></i>Pin to Sketchboard</button>\`:''}
         \${isBot&&vars.length>1&&!isGreeting?\`<button onclick="setMainDrop('\${id}','\${ids[ai]}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left text-blue-600 dark:text-blue-400"><i data-lucide="check-circle"class="w-4 h-4 mr-2"></i>Keep this version only</button>\`:''}
-        \${isBot&&!isGreeting?\`<button onclick="regenDrop('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left"><i data-lucide="refresh-cw"class="w-4 h-4 mr-2"></i>Regenerate</button>\`:''}
+        \${isBot&&!isGreeting&&isLatest?\`<button onclick="regenDrop('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left"><i data-lucide="refresh-cw"class="w-4 h-4 mr-2"></i>Regenerate</button>\`:''}
         <div class="h-px bg-gray-200 dark:bg-gray-800 my-1"></div>
         <button onclick="rewindHere('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left text-red-500"><i data-lucide="rotate-ccw"class="w-4 h-4 mr-2"></i>Rewind Here</button>
         <button onclick="deleteMsg('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left text-red-500"><i data-lucide="trash-2"class="w-4 h-4 mr-2"></i>Delete</button>\`;
