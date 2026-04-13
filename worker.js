@@ -2114,7 +2114,22 @@ function togglePersonaDropdown(e) {
 
 function closeAllDropdowns(){$('global-dropdown').classList.add('hf');}
 function copyMsg(id){const m=S.msgs.find(m=>m.id==id);if(!m)return;navigator.clipboard.writeText(m.role==='bot'?(m.variants?.[m.active_index||0]||''):(m.content||''));toast('Copied!');closeAllDropdowns();}
-function pinMsg(id){const m=S.msgs.find(m=>m.id==id);if(!m)return;const t=(m.variants?.[m.active_index||0]||m.content||'').substring(0,120);addPinText(t);closeAllDropdowns();}
+function pinMsg(id) {
+    const m = S.msgs.find(m => m.id == id);
+    if (!m) return;
+    
+    // Grab the raw text of the message
+    let rawText = m.variants?.[m.active_index || 0] || m.content || '';
+    
+    // Double-escaped regex for Cloudflare template literal compatibility
+    let cleanText = rawText.replace(/<think>[\\s\\S]*?<\\/think>/gi, '').trim();
+    
+    // Send up to 2000 characters to the sketchboard
+    const t = cleanText.substring(0, 2000);
+    
+    addPinText(t);
+    closeAllDropdowns();
+}
 async function setMainDrop(msgId,varId){
     await api('keepVersionOnly',{id:varId});
     const m=S.msgs.find(m=>m.id==msgId);const el=document.getElementById(\`bb-\${msgId}\`);
