@@ -274,7 +274,14 @@ const { provider } = key;
         'Content-Type': 'application/json', 
         'Accept': 'application/json',
         'Authorization': `Bearer ${key.api_key ?? ''}`,
-        
+'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Sec-Ch-Ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-site',
+        'X-Forwarded-For': `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`
       };
       
       let url;
@@ -611,8 +618,15 @@ export default {
             return { bot_id: botId, group_id: groupId, should_summarize: shouldSummarize };
           });
 
+// Replace inside BOTH 'sendMessage' and 'regenerate'
           return new Response(unifiedStream, {
-            headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', ...SECURITY_HEADERS },
+            headers: { 
+              'Content-Type': 'text/event-stream', 
+              'Cache-Control': 'no-cache, no-transform', 
+              'Connection': 'keep-alive',       // Prevents connection timeouts
+              'X-Accel-Buffering': 'no',        // Tells proxies NOT to buffer the stream
+              ...SECURITY_HEADERS 
+            },
           });
         }
 
@@ -1519,11 +1533,16 @@ function formatContent(rawText) {
     let thoughtHtml = '';
     let mainText = rawText;
 
-    const thinkMatch = mainText.match(/<think>([\\s\\S]*?)<\\/think>/i);
+    // FIXED: Double backslashes so the worker outputs valid regex to the browser!
+    const hasOpenThink = /<think>/i.test(mainText) && !/<\\/think>/i.test(mainText);
+    const thinkMatch = mainText.match(/<think>([\\s\\S]*?)(?:<\\/think>|$)/i);
+    
     if (thinkMatch) {
         const thoughtContent = thinkMatch[1].trim();
+        const isOpen = hasOpenThink ? 'open' : ''; // Keep it open while streaming
+        
         thoughtHtml = \`
-            <details class="mb-3 group/think">
+            <details class="mb-3 group/think" \${isOpen}>
                 <summary class="cursor-pointer text-xs font-semibold text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 select-none flex items-center w-max">
                     <span class="border border-gray-200 dark:border-gray-700 rounded-md px-2 py-1 flex items-center space-x-1.5 bg-gray-50 dark:bg-[#1a1a1a]">
                         <i data-lucide="brain-circuit" class="w-3.5 h-3.5"></i>
@@ -1536,7 +1555,8 @@ function formatContent(rawText) {
                 </div>
             </details>
         \`;
-        mainText = mainText.replace(/<think>([\\s\\S]*?)<\\/think>/i, '').trim();
+        // FIXED: Double backslashes here too
+        mainText = mainText.replace(/<think>([\\s\\S]*?)(?:<\\/think>|$)/i, '').trim();
     }
 
     const parsedHtml = marked.parse(mainText);
@@ -1857,7 +1877,7 @@ async function handleSend(){
     try {
         const resp = await fetch('?action=sendMessage', {
             method: 'POST',
-            headers: {'Content-Type':'application/json','X-CSRF-Token':S.csrf,'X-Session-Id':S.session},
+            headers: {'Content-Type':'application/json','Accept': 'text/event-stream','X-CSRF-Token':S.csrf,'X-Session-Id':S.session},
             body: JSON.stringify({content:txt, thinking_effort:S.thinkingEffort})
         });
 
@@ -1950,7 +1970,7 @@ async function regenVariant(msgId,groupId){
     try {
         const resp = await fetch('?action=regenerate', {
             method: 'POST',
-            headers: {'Content-Type':'application/json','X-CSRF-Token':S.csrf,'X-Session-Id':S.session},
+            headers: {'Content-Type':'application/json','Accept': 'text/event-stream','X-CSRF-Token':S.csrf,'X-Session-Id':S.session},
             body: JSON.stringify({group_id:groupId})
         });
 
