@@ -1,5 +1,5 @@
 /**
- * RSROLEPLAY Engine for Single User - Cloudflare Workers + D1
+ * RSROLEPLAY Engine - Cloudflare Workers + D1
  * Auto-Installing Serverless Version
  */
 
@@ -583,8 +583,9 @@ export default {
     try {
       switch (action) {
 
-        case 'logout': {
-          await db.delete('user_sessions', { id: sessionDoc.id });
+case 'logout': {
+          // Nuke ALL sessions for this user across all devices
+          await db.delete('user_sessions', { user_id: userId });
           return jsonResponse({ success: true }, 200, {
             'Set-Cookie': 'aiphp_sess=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0',
           });
@@ -1010,7 +1011,13 @@ case 'testKey': {
             update.salt          = salt;
           }
           await db.update('users', { id: userId }, update);
-          return jsonResponse({ success: true });
+// NEW: Nuke ALL sessions to enforce re-login with new credentials
+          await db.delete('user_sessions', { user_id: userId });
+          
+          // NEW: Clear the cookie so the current browser drops the session immediately
+          return jsonResponse({ success: true }, 200, {
+             'Set-Cookie': 'aiphp_sess=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0',
+          });
         }
 
         case 'manageSketchboard': {
@@ -2613,10 +2620,20 @@ async function deleteKey(id){if(!confirm('Delete this key/endpoint?'))return;awa
 async function saveAccount(){
     const errEl=$('acct-error'),succEl=$('acct-success');errEl.classList.add('hf');succEl.classList.add('hf');
     const res=await api('updateAccount',{username:$('acct-username').value.trim(),password:$('acct-newpass').value,current_password:$('acct-curpass').value});
-    if(res.error){errEl.textContent=res.error;errEl.classList.remove('hf');return;}
-    S.username=$('acct-username').value.trim();$('sidebar-uname').textContent=S.username;
-    succEl.textContent='Account updated!';succEl.classList.remove('hf');
-    $('acct-curpass').value='';$('acct-newpass').value='';
+    
+    if(res.error){
+        errEl.textContent=res.error;
+        errEl.classList.remove('hf');
+        return;
+    }
+    
+    // NEW: Show a message and force the page to reload, kicking them to the login screen
+    succEl.textContent='Account updated. You are being logged out...';
+    succEl.classList.remove('hf');
+    
+    setTimeout(() => {
+        location.reload();
+    }, 1500);
 }
 
 function exportData(){window.location.href='?action=exportData';}
