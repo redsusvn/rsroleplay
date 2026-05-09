@@ -224,7 +224,7 @@ async function buildCtx(sid, userMsg, db, beforeTs = null) {
   if (sysParts.length > 0) msgs.push({ role: 'system', content: sysParts.join('\n\n') });
   if (mem.current_summary) msgs.push({ role: 'system', content: 'Previous summary:\n' + mem.current_summary });
 
-const ctxCount = Math.max(1, Math.min(mem.context_count ?? 20, 100));
+  const ctxCount = Math.max(1, Math.min(mem.context_count ?? 20, 100));
   
   let history;
   if (beforeTs) {
@@ -269,12 +269,12 @@ async function executeLLM(apiKeys, messages, mode, thinkingEffort, stream) {
   let lastErr = '';
   for (const key of keys) {
     try {
-const { provider } = key;
+      const { provider } = key;
       const headers = { 
         'Content-Type': 'application/json', 
         'Accept': 'application/json',
         'Authorization': `Bearer ${key.api_key ?? ''}`,
-'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Sec-Ch-Ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
         'Sec-Ch-Ua-Mobile': '?0',
         'Sec-Ch-Ua-Platform': '"Windows"',
@@ -315,13 +315,12 @@ const { provider } = key;
       // ── 3. PARAMETERS LOGIC ──
       if (mode === 'chat') {
         body.max_tokens = 4096;
-        body.temperature = 0.85;
-        body.top_p = 0.95;
+        body.temperature = 0.3;
+        body.top_p = 0.8;
         body.presence_penalty = 0.1;
         body.frequency_penalty = 0.1;
 
         // PHP FIX: ONLY inject thinking logic if we are in CHAT mode
-// PHP FIX: ONLY inject thinking logic if we are in CHAT mode
         if (isThinking(key.model)) {
           if (provider === 'groq') {
             // Groq R1 models FORBID temperature, top_p, and penalties. 
@@ -375,13 +374,33 @@ function createUnifiedStream(rawStream, provider, dbSaverCallback) {
   async function run() {
     let fullContent = '', fullReasoning = '', buffer = '';
     let hasError = false;
+    
+    // 1. KEEP-ALIVE PING: Sends a dummy comment every 10s to prevent Cloudflare/bad networks from dropping idle connections
+    const keepAliveTimer = setInterval(() => {
+      writer.write(enc.encode(": keepalive\n\n")).catch(() => {});
+    }, 10000);
+
     try {
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
-        buffer += dec.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
+        
+        if (value) {
+          buffer += dec.decode(value, { stream: true });
+        }
+        // Finalize TextDecoder if the stream is done
+        if (done) {
+          buffer += dec.decode(); 
+        }
+
+        let lines = buffer.split('\n');
+        
+        // 2. BUFFER FIX: Only pop the last incomplete line if the stream isn't finished yet
+        if (!done) {
+          buffer = lines.pop(); 
+        } else {
+          buffer = ''; 
+        }
+
         for (let line of lines) {
           line = line.trim();
           if (!line.startsWith('data:')) continue;
@@ -405,14 +424,21 @@ function createUnifiedStream(rawStream, provider, dbSaverCallback) {
             }
           } catch { /* malformed chunk */ }
         }
+
+        // 3. THE MISSING BREAK: Stop the loop so we can move to the 'finally' block and save!
+        if (done) break;
       }
     } catch (e) {
       hasError = true;
       await writer.write(enc.encode(`data: ${JSON.stringify({ error: e.message })}\n\n`));
     } finally {
+      clearInterval(keepAliveTimer); // Clean up the timer!
+      
       const finalOutput = fullReasoning
         ? `<think>\n${fullReasoning}\n</think>\n\n${fullContent}`
         : fullContent;
+        
+      // THIS is where the save happens. It was being blocked by the infinite loop.
       const meta = await dbSaverCallback(finalOutput, hasError);
       
       // Ensure the frontend doesn't finalize a broken stream
@@ -615,7 +641,7 @@ export default {
               [sid, lastTs]
             );
             const shouldSummarize = (row?.c ?? 0) >= (mem.summarize_threshold ?? 50);
-            return { bot_id: botId, group_id: groupId, should_summarize: shouldSummarize };
+            return { user_id: userMsgId, bot_id: botId, group_id: groupId, should_summarize: shouldSummarize };
           });
 
 // Replace inside BOTH 'sendMessage' and 'regenerate'
@@ -1871,7 +1897,7 @@ async function handleSend(){
     S.msgs.push({id:tbid,role:'bot',variants:[''],variant_ids:[tbid],active_index:0,group_id:''});
     appendMsgEl(S.msgs[S.msgs.length-1]);
     const typing=document.querySelector(\`[data-msg-id="\${tbid}"] .msg-content\`);
-    if(typing)typing.innerHTML='<span class="flex items-center space-x-2"><svg class="animate-spin w-4 h-4 text-gray-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-9-9"/></svg><span class="text-xs text-gray-400">Generating...</span></span>';
+    if(typing)typing.innerHTML='<span class="flex items-center space-x-2"><svg class="animate-spin w-4 h-4 text-gray-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-9-9"/></svg><span class="text-xs text-gray-400">Imagine about the scenes...</span></span>';
     if(!S.userScrolled)scrollToBottom();
 
     try {
@@ -1906,13 +1932,25 @@ async function handleSend(){
                     S.msgs[bi].variants = [display];
                     S.msgs[bi].content = display;
                 }
+                const ui = S.msgs.findIndex(m=>m.id==tuid);
+                if (ui !== -1 && data.user_id) {
+                    S.msgs[ui].id = data.user_id;
+                }
+
                 const bub = document.querySelector(\`[data-msg-id="\${tbid}"]\`);
                 if (bub) {
                     bub.dataset.msgId = data.bot_id;
                     const bbel = document.getElementById(\`bb-\${tbid}\`);
                     if(bbel) bbel.id = \`bb-\${data.bot_id}\`;
                 }
+                const ubub = document.querySelector(\`[data-msg-id="\${tuid}"]\`);
+                if (ubub && data.user_id) {
+                    ubub.dataset.msgId = data.user_id;
+                }
+
                 refreshMsgEl(data.bot_id);
+                if (data.user_id) refreshMsgEl(data.user_id);
+
                 if(!S.userScrolled)scrollToBottom();
                 if(data.should_summarize) triggerSummarizeSilent();
             }
@@ -1965,7 +2003,7 @@ async function regenVariant(msgId,groupId){
     S.generating=true;$('send-btn').disabled=true;
     const el=document.getElementById(\`bb-\${msgId}\`);
     const ci=el?.querySelector('.msg-content');
-    if(ci)ci.innerHTML='<span class="text-gray-400 text-xs flex items-center space-x-2"><svg class="animate-spin w-3 h-3"viewBox="0 0 24 24"fill="none"stroke="currentColor"stroke-width="2"><path d="M21 12a9 9 0 11-9-9"/></svg><span>Generating…</span></span>';
+    if(ci)ci.innerHTML='<span class="text-gray-400 text-xs flex items-center space-x-2"><svg class="animate-spin w-3 h-3"viewBox="0 0 24 24"fill="none"stroke="currentColor"stroke-width="2"><path d="M21 12a9 9 0 11-9-9"/></svg><span>Thinking about a better responses for you...</span></span>';
     
     try {
         const resp = await fetch('?action=regenerate', {
@@ -2181,7 +2219,7 @@ function startEdit(id,isBot){
     const wrap=document.querySelector(\`[data-msg-id="\${id}"]\`);if(!wrap)return;
     const txt=isBot?(m.variants?.[m.active_index||0]||''):(m.content||'');
     wrap.innerHTML=\`<div class="w-full max-w-2xl \${isBot?'':'ml-auto'} bg-white dark:bg-[#111] border border-gray-200 dark:border-gray-800 rounded-xl p-3">
-        <textarea id="edit-ta-\${id}"class="w-full bg-transparent resize-none outline-none text-base md:text-sm min-h-[80px] p-2 dark:text-white"autofocus></textarea>
+        <textarea id="edit-ta-\${id}"class="w-full bg-transparent outline-none text-base md:text-sm min-h-[500px] max-h-[60vh] overflow-y-auto p-2 dark:text-white"autofocus></textarea>
         <div class="flex justify-end space-x-2 mt-2">
             <button onclick="cancelEdit('\${id}')"class="text-xs px-3 py-1.5 rounded text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800">Cancel</button>
             <button onclick="saveEdit('\${id}',\${isBot})"class="text-xs px-3 py-1.5 rounded bg-black dark:bg-white text-white dark:text-black">Save</button>
@@ -2607,6 +2645,102 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeModals();close
 function applyTheme(dark){document.documentElement.classList.toggle('dark',dark);$('theme-icon')?.setAttribute('data-lucide',dark?'sun':'moon');lucide.createIcons();}
 function toggleTheme(){const d=document.documentElement.classList.toggle('dark');$('theme-icon')?.setAttribute('data-lucide',d?'sun':'moon');lucide.createIcons();document.cookie=\`aiphp_theme=\${d?'dark':'light'}; path=/; max-age=31536000\`;}
 </script>
+<script>
+(function() {
+  'use strict';
+
+  // ── CONFIG ──────────────────────────────────────────────────────────
+  const MODAL_LIST_MAX_H = '340px'; // max height for scrollable lists inside modals
+
+  // ── INJECT CSS ───────────────────────────────────────────────────────
+  const css = document.createElement('style');
+  css.textContent = [
+    '.rs-search{width:100%;border:1px solid #e5e7eb;border-radius:8px;padding:8px 12px;font-size:13px;outline:none;background:transparent;margin-bottom:12px;box-sizing:border-box;transition:border-color .15s}',
+    '.dark .rs-search{border-color:#374151;color:#fff}',
+    '.rs-search:focus{border-color:#000}.dark .rs-search:focus{border-color:#fff}',
+    '.rs-scroll-list{overflow-y:auto;max-height:' + MODAL_LIST_MAX_H + '}',
+  ].join('');
+  document.head.appendChild(css);
+
+  // ── HELPERS ──────────────────────────────────────────────────────────
+  function makeSearch(placeholder, onInput) {
+    const inp = document.createElement('input');
+    inp.type = 'text';
+    inp.placeholder = placeholder;
+    inp.className = 'rs-search';
+    inp.addEventListener('input', () => onInput(inp.value.trim().toLowerCase()));
+    return inp;
+  }
+
+  function filterChildren(container, query) {
+    Array.from(container.children).forEach(el => {
+      const text = el.textContent.toLowerCase();
+      el.style.display = query === '' || text.includes(query) ? '' : 'none';
+    });
+  }
+
+  // ── OBSERVE & PATCH MODALS ───────────────────────────────────────────
+  const patched = new Set();
+
+  function tryPatch() {
+
+    // ── 1. SESSIONS modal ──────────────────────────────────────────────
+    const sessionsList = document.getElementById('sessions-list');
+    if (sessionsList && !patched.has('sessions')) {
+      patched.add('sessions');
+      const container = sessionsList.parentElement; // the p-4/p-6 div
+      const search = makeSearch(' Search sessions\u2026', q => filterChildren(sessionsList, q));
+      sessionsList.classList.add('rs-scroll-list');
+      container.insertBefore(search, sessionsList.previousElementSibling
+        ? sessionsList.previousElementSibling.nextSibling
+        : sessionsList);
+    }
+
+    // ── 2. PERSONAS modal ──────────────────────────────────────────────
+    const personasCont = document.getElementById('personas-list-container');
+    if (personasCont && !patched.has('personas')) {
+      patched.add('personas');
+      personasCont.classList.add('rs-scroll-list');
+      const search = makeSearch(' Search personas\u2026', q => filterChildren(personasCont, q));
+      personasCont.parentElement.insertBefore(search, personasCont);
+    }
+
+    // ── 3. API ENDPOINTS modal ─────────────────────────────────────────
+    const keysCont = document.getElementById('keys-list-container');
+    if (keysCont && !patched.has('keys')) {
+      patched.add('keys');
+      keysCont.classList.add('rs-scroll-list');
+      const search = makeSearch(' Search endpoints\u2026', q => filterChildren(keysCont, q));
+      keysCont.parentElement.insertBefore(search, keysCont);
+    }
+
+    // ── 4. SKETCHBOARD sidebar search ──────────────────────────────────
+    const pinsList = document.getElementById('pins-list');
+    if (pinsList && !patched.has('sketchboard')) {
+      patched.add('sketchboard');
+      // Insert search between the add-pin row and the pins list
+      const addRow = document.getElementById('new-pin-input');
+      if (addRow) {
+        const wrapper = addRow.closest('.flex');
+        const search = makeSearch(' Filter pins\u2026', q => filterChildren(pinsList, q));
+        search.style.marginBottom = '8px';
+        wrapper.parentElement.insertBefore(search, wrapper.nextSibling);
+      }
+    }
+  }
+
+  // Re-run patch whenever the DOM changes (modals render dynamically)
+  const obs = new MutationObserver(tryPatch);
+  obs.observe(document.body, { childList: true, subtree: true });
+
+  // Also run once on load in case elements already exist
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', tryPatch);
+  } else {
+    tryPatch();
+  }
+})();
+</script>
 </body>
 </html>`;
 }
@@ -2688,6 +2822,7 @@ function getSetupHTML() {
   function showErr(msg) { document.getElementById('error-box').textContent = msg; document.getElementById('error-box').classList.remove('hidden'); }
   function resetBtn() { const btn = document.getElementById('btn'); btn.disabled = false; btn.innerHTML = '<span>Create Account</span>'; }
 </script>
+
 </body>
 </html>`;
 }
