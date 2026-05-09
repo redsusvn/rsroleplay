@@ -7,8 +7,8 @@
 const SECURITY_HEADERS = {
   'X-Content-Type-Options':  'nosniff',
   'X-Frame-Options':         'DENY',
-  'X-XSS-Protection':        '1; mode=block',
   'Referrer-Policy':         'strict-origin-when-cross-origin',
+  'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net https://unpkg.com https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: https:; connect-src 'self' https: wss:;"
 };
 
 // ── UTILITIES ────────────────────────────────────────────────────────
@@ -297,10 +297,28 @@ async function executeLLM(apiKeys, messages, mode, thinkingEffort, stream) {
           url = 'https://openrouter.ai/api/v1/chat/completions';
           headers['HTTP-Referer'] = 'http://localhost';
           headers['X-Title']      = 'AIPHP-Worker';
-        } else if (provider === 'custom') {
-          if (!key.custom_url) throw new Error('Custom provider requires a URL');
-          url = key.custom_url;
-        } else {
+} else if (provider === 'custom') {
+  if (!key.custom_url) throw new Error('Custom provider requires a URL');
+  try {
+    const parsedUrl = new URL(key.custom_url);
+    if (parsedUrl.protocol !== 'https:') throw new Error('Custom URLs must use HTTPS');
+    
+    // Block internal and reserved IP addresses
+    const hostname = parsedUrl.hostname;
+    if (
+      hostname === 'localhost' || 
+      hostname === '127.0.0.1' || 
+      hostname.startsWith('10.') || 
+      hostname.startsWith('192.168.') || 
+      hostname.startsWith('169.254.')
+    ) {
+      throw new Error('Local or Internal network requests are strictly forbidden.');
+    }
+  } catch (e) {
+    throw new Error('Invalid custom URL: ' + e.message);
+  }
+  url = key.custom_url;
+} else {
           throw new Error('Unknown provider: ' + provider);
         }
       }
@@ -1159,6 +1177,7 @@ function getAppHTML() {
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
 <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked-katex-extension@5.0.0/lib/index.umd.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
 <script>tailwind.config={darkMode:'class',theme:{extend:{fontFamily:{sans:['Inter','-apple-system','sans-serif']},animation:{'pulse-slow':'pulse 3s cubic-bezier(0.4,0,0.6,1) infinite','slide-up':'slideUp .25s ease-out forwards'},keyframes:{slideUp:{'0%':{transform:'translateY(6px)',opacity:'0'},'100%':{transform:'translateY(0)',opacity:'1'}}}}}}</script>
 <style>
 ::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#e5e5e5;border-radius:10px}.dark ::-webkit-scrollbar-thumb{background:#404040}
@@ -1585,7 +1604,7 @@ function formatContent(rawText) {
         mainText = mainText.replace(/<think>([\\s\\S]*?)(?:<\\/think>|$)/i, '').trim();
     }
 
-    const parsedHtml = marked.parse(mainText);
+    const parsedHtml = DOMPurify.sanitize(marked.parse(mainText));
     const tempDiv = document.createElement('div');
     tempDiv.innerHTML = parsedHtml;
 
