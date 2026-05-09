@@ -1,5 +1,5 @@
 /**
- * RSROLEPLAY Engine - Cloudflare Workers + D1
+ * RSROLEPLAY Engine for Single User - Cloudflare Workers + D1
  * Auto-Installing Serverless Version
  */
 
