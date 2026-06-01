@@ -215,9 +215,11 @@ async function buildCtx(sid, userMsg, db, beforeTs = null) {
   if (bot?.system_prompt)  sysParts.push(bot.system_prompt);
   if (bot?.user_persona)   sysParts.push('About the user: ' + bot.user_persona);
 
-  if (mem.sketchboard_active === 1) {
-    const pins = await db.all('SELECT * FROM sketchboard WHERE session_id = ? AND is_active = 1', [sid]);
-    if (pins.length > 0) sysParts.push('Key facts (Sketchboard):\n- ' + pins.map(p => p.content).join('\n- '));
+if (mem.sketchboard_active === 1) {
+    // ADDED: ORDER BY created_at DESC
+    const pins = await db.all('SELECT * FROM sketchboard WHERE session_id = ? AND is_active = 1 ORDER BY created_at DESC', [sid]);
+    
+    if (pins.length > 0) sysParts.push('Additional important infomation. Use this important infomation to continue the story:\n- ' + pins.map(p => p.content).join('\n- '));
   }
 
   const msgs = [];
@@ -258,15 +260,25 @@ const THINKING_EFFORTS = new Set(['none', 'low', 'medium', 'high']);
 
 function isThinking(model) {
   const m = model.toLowerCase();
-  return ['qwen3', 'deepseek-r1', 'gpt-oss', ':thinking', '-think'].some(x => m.includes(x));
+  return ['gemma-4', 'qwen3', 'deepseek-r1', 'gpt-oss', ':thinking', '-think'].some(x => m.includes(x));
 }
 
-async function executeLLM(apiKeys, messages, mode, thinkingEffort, stream) {
+async function executeLLM(apiKeys, messages, mode, thinkingEffort, stream, signal) {
   const effort = THINKING_EFFORTS.has(thinkingEffort) ? thinkingEffort : 'none';
-  const keys = apiKeys.filter(k => k.key_mode === mode).sort((a, b) => b.is_primary - a.is_primary);
+let keys = apiKeys.filter(k => k.key_mode === mode).sort((a, b) => b.is_primary - a.is_primary);
   if (keys.length === 0) throw new Error('No API keys configured for mode: ' + mode);
 
+  // GEMINI DEBUG: if a Gemini key is set as primary for chat, try ONLY Gemini so its
+  // error surfaces instead of silently rolling over to other providers.
+  if (mode === 'chat') {
+    const primary = keys[0];
+    if (primary && primary.provider === 'gemini') {
+      keys = keys.filter(k => k.provider === 'gemini');
+    }
+  }
+
   let lastErr = '';
+  let geminiError = null;
   for (const key of keys) {
     try {
       const { provider } = key;
@@ -293,6 +305,7 @@ async function executeLLM(apiKeys, messages, mode, thinkingEffort, stream) {
       } else {
         if      (provider === 'groq')       url = 'https://api.groq.com/openai/v1/chat/completions';
         else if (provider === 'mistral')    url = 'https://api.mistral.ai/v1/chat/completions';
+        else if (provider === 'gemini')     url = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
         else if (provider === 'openrouter') {
           url = 'https://openrouter.ai/api/v1/chat/completions';
           headers['HTTP-Referer'] = 'http://localhost';
@@ -331,15 +344,18 @@ async function executeLLM(apiKeys, messages, mode, thinkingEffort, stream) {
       const body = { model: modelId, messages, stream };
 
       // ── 3. PARAMETERS LOGIC ──
-      if (mode === 'chat') {
-        body.max_tokens = 4096;
+if (mode === 'chat') {
+        body.max_tokens = 8192;
         body.temperature = 0.3;
         body.top_p = 0.8;
-        body.presence_penalty = 0.1;
-        body.frequency_penalty = 0.1;
+        // Gemini's OpenAI-compat endpoint rejects penalty params on many models — skip them
+        if (provider !== 'gemini') {
+          body.presence_penalty = 0.1;
+          body.frequency_penalty = 0.1;
+        }
 
         // PHP FIX: ONLY inject thinking logic if we are in CHAT mode
-        if (isThinking(key.model)) {
+if (isThinking(key.model) && provider !== 'gemini') {
           if (provider === 'groq') {
             // Groq R1 models FORBID temperature, top_p, and penalties. 
             // We must remove them to avoid API rejection.
@@ -352,7 +368,11 @@ async function executeLLM(apiKeys, messages, mode, thinkingEffort, stream) {
           } else if (provider === 'openrouter') {
             body.include_reasoning = true;
             if (effort !== 'none') body.reasoning = { effort };
-          }
+          } else if (provider === 'custom' && key.custom_url.includes('nvidia.com')) {
+  body.chat_template_kwargs = { 
+    "enable_thinking": true 
+  };
+}
         }
       } else {
         // Summarize mode: Keep it very standard (Matching your PHP line 301)
@@ -361,10 +381,14 @@ async function executeLLM(apiKeys, messages, mode, thinkingEffort, stream) {
         // NEVER send reasoning_effort or penalties during summarization for Groq
       }
 
-      const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal });
       if (!res.ok) { 
         const errorBody = await res.text();
-        lastErr = `${provider} HTTP ${res.status}: ${errorBody.substring(0, 150)}`; 
+        lastErr = `${provider} HTTP ${res.status}: ${errorBody.substring(0, 150)}`;
+        // GEMINI DEBUG: keep the full, untruncated Google error so we can show it in chat
+        if (provider === 'gemini') {
+          geminiError = `Gemini HTTP ${res.status}\n\nModel: ${key.model}\nEndpoint: ${url}\n\nGoogle response:\n${errorBody.substring(0, 1500)}`;
+        }
         continue; 
       }
 
@@ -374,11 +398,24 @@ async function executeLLM(apiKeys, messages, mode, thinkingEffort, stream) {
       const msg = data.choices?.[0]?.message;
       if (!msg) throw new Error('No message returned from API');
       
-      const content = msg.content ?? '';
+let content = msg.content ?? '';
       const reasoning = msg.reasoning ?? '';
+      // Some Gemma/Gemini models emit reasoning as <thought>…</thought>. Normalize to <think>.
+      content = content.replace(/<thought>/gi, '<think>').replace(/<\/thought>/gi, '</think>');
       return reasoning ? `<think>\n${reasoning}\n</think>\n\n${content}` : content;
 
-    } catch (e) { lastErr = e.message; }
+} catch (e) {
+      lastErr = e.message;
+      if (key.provider === 'gemini') {
+        geminiError = `Gemini request failed\n\nModel: ${key.model}\n\nError: ${e.message}`;
+      }
+    }
+  }
+// If a Gemini key was the thing that failed, throw a tagged error carrying Google's real message
+  if (geminiError) {
+    const err = new Error(geminiError);
+    err.isGeminiDebug = true;
+    throw err;
   }
   throw new Error('All API keys failed. Last: ' + lastErr);
 }
@@ -392,6 +429,7 @@ function createUnifiedStream(rawStream, provider, dbSaverCallback) {
   async function run() {
     let fullContent = '', fullReasoning = '', buffer = '';
     let hasError = false;
+    let receivedDone = false;
     
     // 1. KEEP-ALIVE PING: Sends a dummy comment every 10s to prevent Cloudflare/bad networks from dropping idle connections
     const keepAliveTimer = setInterval(() => {
@@ -423,9 +461,21 @@ function createUnifiedStream(rawStream, provider, dbSaverCallback) {
           line = line.trim();
           if (!line.startsWith('data:')) continue;
           const dataStr = line.slice(5).trim();
-          if (!dataStr || dataStr === '[DONE]') continue;
+if (!dataStr) continue; // Remove the [DONE] check from here
+          
+          // ADD THIS BLOCK: Track if the stream finished naturally
+          if (dataStr === '[DONE]') {
+             receivedDone = true;
+             continue;
+          }
+
           try {
             const parsed = JSON.parse(dataStr);
+            
+            // ADD THIS: Alternative finish indicators used by some providers
+            if (parsed.done || parsed.choices?.[0]?.finish_reason) {
+                receivedDone = true;
+            }
             let textChunk = '', reasoningChunk = '';
             
             // Cloudflare v1/chat/completions now uses standard OpenAI delta format
@@ -444,7 +494,11 @@ function createUnifiedStream(rawStream, provider, dbSaverCallback) {
         }
 
         // 3. THE MISSING BREAK: Stop the loop so we can move to the 'finally' block and save!
-        if (done) break;
+if (done) {
+            // ADD THIS: Force an error if it stopped abruptly
+            if (!receivedDone) hasError = true;
+            break;
+        }
       }
     } catch (e) {
       hasError = true;
@@ -452,9 +506,13 @@ function createUnifiedStream(rawStream, provider, dbSaverCallback) {
     } finally {
       clearInterval(keepAliveTimer); // Clean up the timer!
       
+// Normalize <thought> tags (used by some Gemma/Gemini models) to <think> before saving
+      const normalizedContent = fullContent
+        .replace(/<thought>/gi, '<think>')
+        .replace(/<\/thought>/gi, '</think>');
       const finalOutput = fullReasoning
-        ? `<think>\n${fullReasoning}\n</think>\n\n${fullContent}`
-        : fullContent;
+        ? `<think>\n${fullReasoning}\n</think>\n\n${normalizedContent}`
+        : normalizedContent;
         
       // THIS is where the save happens. It was being blocked by the infinite loop.
       const meta = await dbSaverCallback(finalOutput, hasError);
@@ -608,38 +666,61 @@ case 'logout': {
         }
 
         case 'sendMessage': {
-          const content = str(body.content, 20000);
+          const content = str(body.content, 2000089769876987698769876);
           if (!content) return errResponse('Empty or too-long message');
           const thinkingEffort = THINKING_EFFORTS.has(body.thinking_effort) ? body.thinking_effort : 'none';
 
           // Lock the user timestamp
           const userTs = Date.now();
           const userMsgId = generateId();
-          await db.insert('chat_history', {
-            id: userMsgId, session_id: sid, group_id: 'g_' + generateId(),
-            is_main: 1, role: 'user', content, timestamp: userTs,
-          });
 
           const [ctxMsgs, apiKeys] = await Promise.all([
             buildCtx(sid, content, db),
             db.all('SELECT * FROM api_keys'),
           ]);
 
-          let provider, stream;
+let provider, stream;
           try {
-            const res = await executeLLM(apiKeys, ctxMsgs, 'chat', thinkingEffort, true);
+            const res = await executeLLM(apiKeys, ctxMsgs, 'chat', thinkingEffort, true, request.signal);
             provider = res.provider;
             stream = res.stream;
           } catch (e) {
-            // Delete user message to prevent orphans if API errors out instantly
+            // GEMINI DEBUG: if this was a Gemini failure, persist the real error as chat history
+            if (e.isGeminiDebug) {
+              const botId   = generateId();
+              const groupId = 'g_' + generateId();
+              let botTs = Date.now();
+              if (botTs <= userTs) botTs = userTs + 1;
+
+              // Save the user's message so the conversation stays intact
+              await db.insert('chat_history', {
+                id: userMsgId, session_id: sid, group_id: 'g_' + generateId(),
+                is_main: 1, role: 'user', content, timestamp: userTs,
+              });
+
+              // Save the Gemini error as a bot message, wrapped in a code block for readability
+              const errText = '⚠️ **Gemini API Error**\n\n```\n' + e.message + '\n```';
+              await db.insert('chat_history', {
+                id: botId, session_id: sid, group_id: groupId,
+                is_main: 1, role: 'bot', content: errText, timestamp: botTs,
+              });
+
+              return jsonResponse({
+                gemini_error: true,
+                user_id: userMsgId,
+                bot_id: botId,
+                group_id: groupId,
+                content: errText,
+              });
+            }
+            // All other providers: behave exactly as before
             await db.delete('chat_history', { id: userMsgId });
             return errResponse(e.message, 500);
           }
 
-          const unifiedStream = createUnifiedStream(stream, provider, async (finalText, hasError) => {
+const unifiedStream = createUnifiedStream(stream, provider, async (finalText, hasError) => {
             if (hasError) {
-              // Complete Rollback: Delete user prompt if stream crashes halfway
-              await db.delete('chat_history', { id: userMsgId });
+              // We don't need to delete anything anymore because we haven't saved it yet!
               return {};
             }
             const botId   = generateId();
@@ -649,6 +730,13 @@ case 'logout': {
             let botTs = Date.now();
             if (botTs <= userTs) botTs = userTs + 1;
             
+            // ADDED: Save user message HERE instead
+            await db.insert('chat_history', {
+              id: userMsgId, session_id: sid, group_id: 'g_' + generateId(),
+              is_main: 1, role: 'user', content, timestamp: userTs,
+            });
+
+            // Save bot message (unchanged)
             await db.insert('chat_history', {
               id: botId, session_id: sid, group_id: groupId,
               is_main: 1, role: 'bot', content: finalText, timestamp: botTs,
@@ -689,7 +777,7 @@ case 'logout': {
           
           let provider, stream;
           try {
-            const res = await executeLLM(apiKeys, ctxMsgs, 'chat', 'none', true);
+            const res = await executeLLM(apiKeys, ctxMsgs, 'chat', 'none', true, request.signal);
             provider = res.provider;
             stream = res.stream;
           } catch (e) {
@@ -741,13 +829,13 @@ case 'logout': {
             ? 'Previous summary:\n' + mem.current_summary + '\n\n' : '';
 
           const messages = [
-            { role: 'system', content: 'Summarize the chat history concisely. Keep key facts, decisions, names, and context.' },
+            { role: 'system', content: 'Summarize the chat history concisely. Keep key facts, decisions, names, and context. Use the previous generated summarize to add with your summarize to create a consistant summarize that both contain the previous chat history that are summarized and new chat history.' },
             { role: 'user',   content: old + 'Messages:\n\n' + lines },
           ];
           
           let resultText;
           try {
-            resultText = await executeLLM(apiKeys, messages, 'summarize', 'none', false);
+            resultText = await executeLLM(apiKeys, messages, 'summarize', 'none', false, request.signal);
           } catch (e) {
             return errResponse(e.message, 500);
           }
@@ -817,7 +905,7 @@ case 'logout': {
 
         case 'editMessage': {
           const id      = str(body.id, 100);
-          const content = str(body.content, 20000);
+          const content = str(body.content, 2000089769876987698769876);
           if (!id || !content) return errResponse('Invalid input');
           const row = await db.findOne('chat_history', { id });
           if (!row)                  return errResponse('Not found', 404);
@@ -847,7 +935,7 @@ case 'logout': {
         }
 
         case 'updateSummary': {
-          const summary = (typeof body.summary === 'string' ? body.summary : '').substring(0, 20000);
+          const summary = (typeof body.summary === 'string' ? body.summary : '').substring(0, 2000089769876987698769876);
           await db.update('memory_state', { session_id: sid }, { current_summary: summary });
           return jsonResponse({ success: true });
         }
@@ -868,7 +956,7 @@ case 'logout': {
             const isPrimary = body.is_primary ? 1 : 0;
 
             if (!provider || !model || !keyMode) return errResponse('provider, model, key_mode required');
-            if (!['groq','mistral','openrouter','cloudflare','custom'].includes(provider)) return errResponse('Unknown provider');
+            if (!['groq','mistral','openrouter','cloudflare','custom','gemini'].includes(provider)) return errResponse('Unknown provider');
             if (!['chat','summarize'].includes(keyMode)) return errResponse('Invalid key_mode');
 
             if (isPrimary) await db.run('UPDATE api_keys SET is_primary = 0 WHERE key_mode = ?', [keyMode]);
@@ -906,6 +994,7 @@ case 'testKey': {
           if (k.provider === 'cloudflare') url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(k.custom_url)}/ai/v1/chat/completions`;
           else if (k.provider === 'groq') url = 'https://api.groq.com/openai/v1/chat/completions';
           else if (k.provider === 'mistral') url = 'https://api.mistral.ai/v1/chat/completions';
+          else if (k.provider === 'gemini') url = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
           else if (k.provider === 'openrouter') url = 'https://openrouter.ai/api/v1/chat/completions';
           else url = k.custom_url;
 
@@ -942,11 +1031,11 @@ case 'testKey': {
             if (!name) return errResponse('Name required');
             const payload = {
               name,
-              avatar:           str(body.avatar,           50)    ?? 'AI',
-              description:      str(body.description,      500)   ?? '',
-              system_prompt:    str(body.system_prompt,    10000) ?? '',
-              user_persona:     str(body.user_persona,     5000)  ?? '',
-              greeting_message: str(body.greeting_message, 2000)  ?? '',
+              avatar:           str(body.avatar,           509887987698769876)    ?? 'AI',
+              description:      str(body.description,      5000987098709870987)   ?? '',
+              system_prompt:    str(body.system_prompt,    100000987098709870987) ?? '',
+              user_persona:     str(body.user_persona,     5000987098709870987987)  ?? '',
+              greeting_message: str(body.greeting_message, 2000987098709870987)  ?? '',
             };
             if (op === 'add') {
               await db.insert('personas', { id: generateId(), ...payload });
@@ -1030,13 +1119,13 @@ case 'testKey': {
             return jsonResponse({ pins, global_active: mem.sketchboard_active ?? 1 });
           }
           if (op === 'add') {
-            const content = str(body.content, 2000);
+            const content = str(body.content, 200075987698769976);
             if (!content) return errResponse('Empty content');
             await db.insert('sketchboard', { id: generateId(), session_id: sid, content, is_active: 1, created_at: Date.now() });
             return jsonResponse({ success: true });
           }
           if (op === 'edit') {
-            const id = str(body.id, 100), content = str(body.content, 2000);
+            const id = str(body.id, 100), content = str(body.content, 20009876987698769876);
             if (!id || !content) return errResponse('Invalid input');
             await db.run('UPDATE sketchboard SET content = ? WHERE id = ? AND session_id = ?', [content, id, sid]);
             return jsonResponse({ success: true });
@@ -1123,7 +1212,7 @@ case 'testKey': {
           let match, cnt = 0;
           while ((match = regex.exec(body.data)) !== null && cnt < 2000) {
             if (match[1] !== match[3]) continue;
-            const content = match[2].trim().substring(0, 20000);
+            const content = match[2].trim().substring(0, 2000089769876987698769876);
             if (!content) continue;
             await db.insert('chat_history', {
               id: generateId(), session_id: sid, group_id: 'g_' + generateId(),
@@ -1176,6 +1265,8 @@ function getAppHTML() {
   return `<!DOCTYPE html>
 <html lang="en" class="light">
 <head>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
 <title>RSROLEPLAY Engine</title>
 <script src="https://cdn.tailwindcss.com"></script>
@@ -1185,11 +1276,13 @@ function getAppHTML() {
 <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked-katex-extension@5.0.0/lib/index.umd.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
-<script>tailwind.config={darkMode:'class',theme:{extend:{fontFamily:{sans:['Inter','-apple-system','sans-serif']},animation:{'pulse-slow':'pulse 3s cubic-bezier(0.4,0,0.6,1) infinite','slide-up':'slideUp .25s ease-out forwards'},keyframes:{slideUp:{'0%':{transform:'translateY(6px)',opacity:'0'},'100%':{transform:'translateY(0)',opacity:'1'}}}}}}</script>
+<script>tailwind.config={darkMode:'class',theme:{extend:{fontFamily:{sans:['Instrument Sans','-apple-system','sans-serif']},animation:{'pulse-slow':'pulse 3s cubic-bezier(0.4,0,0.6,1) infinite','slide-up':'slideUp .25s ease-out forwards'},keyframes:{slideUp:{'0%':{transform:'translateY(6px)',opacity:'0'},'100%':{transform:'translateY(0)',opacity:'1'}}}}}}</script>
 <style>
 ::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#e5e5e5;border-radius:10px}.dark ::-webkit-scrollbar-thumb{background:#404040}
 .hf{display:none!important}
 .swipeable{transition:transform .18s ease-out;touch-action:pan-y}.swiping{transition:none}
+/* PERF FIX 4: let the browser skip layout/paint for off-screen messages */
+.msg-row{content-visibility:auto;contain-intrinsic-size:auto 90px}
 .msg-content p{margin-bottom:.5em}.msg-content p:last-child{margin-bottom:0}
 .msg-content code{background:rgba(127,127,127,.18);padding:.15em .35em;border-radius:4px;font-family:monospace;font-size:.85em}
 .msg-content pre{background:rgba(127,127,127,.1);padding:1em;border-radius:8px;overflow-x:auto;margin-bottom:1em;border:1px solid rgba(127,127,127,.12)}
@@ -1450,6 +1543,7 @@ function getAppHTML() {
                 <option value="groq">Groq</option>
                 <option value="mistral">Mistral</option>
                 <option value="openrouter">OpenRouter</option>
+                <option value="gemini">Google AI Studio (Gemini)</option>
                 <option value="cloudflare">Cloudflare AI (Worker)</option>
                 <option value="custom">Custom (OpenAI Compatible)</option>
             </select>
@@ -1586,12 +1680,14 @@ function formatContent(rawText) {
     let mainText = rawText;
 
     // FIXED: Double backslashes so the worker outputs valid regex to the browser!
+// Normalize <thought> (Gemma/Gemini) to <think> for live rendering
+    mainText = mainText.replace(/<thought>/gi, '<think>').replace(/<\\/thought>/gi, '</think>');
     const hasOpenThink = /<think>/i.test(mainText) && !/<\\/think>/i.test(mainText);
     const thinkMatch = mainText.match(/<think>([\\s\\S]*?)(?:<\\/think>|$)/i);
     
     if (thinkMatch) {
         const thoughtContent = thinkMatch[1].trim();
-        const isOpen = hasOpenThink ? 'open' : ''; // Keep it open while streaming
+        const isOpen = '';
         
         thoughtHtml = \`
             <details class="mb-3 group/think" \${isOpen}>
@@ -1661,6 +1757,10 @@ function copyCodeBlock(btn) {
         }).catch(() => toast('Failed to copy code'));
     }
 }
+function thinkingIndicatorHTML(){
+    return '<span class="flex items-center space-x-2"><svg class="animate-spin w-4 h-4 text-purple-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-9-9"/></svg><span class="text-xs text-gray-400">Thinking...</span></span>';
+}
+
 function setThinkingEffort(effort) {
     S.thinkingEffort = effort;
     const labels = {'none': 'Think: Off','low': 'Think: Low','medium': 'Think: Medium','high': 'Think: High'};
@@ -1707,7 +1807,13 @@ document.addEventListener('DOMContentLoaded', async ()=>{
     if(document.cookie.includes('aiphp_theme=dark'))applyTheme(true);
     lucide.createIcons();
     const ta=$('chat-input');
-    ta.addEventListener('input',function(){this.style.height='auto';this.style.height=this.scrollHeight+'px';});
+    // PERF FIX 5: coalesce the textarea auto-resize to at most once per animation frame
+    // (the old handler forced a full-page reflow on every single keystroke).
+    let _taRAF;
+    ta.addEventListener('input',function(){
+        if(_taRAF) return;
+        _taRAF=requestAnimationFrame(()=>{ _taRAF=null; ta.style.height='auto'; ta.style.height=Math.min(ta.scrollHeight,160)+'px'; });
+    });
 ta.addEventListener('keydown', e => {
         if (e.key === 'Enter' && !e.shiftKey) {
             // Allow default new line behavior on mobile screens (<768px)
@@ -1731,6 +1837,9 @@ ta.addEventListener('keydown', e => {
             $('custom-url-label').textContent = 'Cloudflare Account ID';
             $('key-custom-url').placeholder = 'e.g. a3b5c7d...';
             $('key-model').placeholder = 'e.g. @cf/meta/llama-3-8b-instruct';
+} else if (p === 'gemini') {
+            cont.classList.add('hf');
+            $('key-model').placeholder = 'e.g. gemini-2.0-flash';
         } else {
             cont.classList.add('hf');
             $('key-model').placeholder = 'e.g. mistral-large-latest';
@@ -1743,7 +1852,7 @@ ta.addEventListener('keydown', e => {
         S.userScrolled=!atBottom;
         $('scroll-btn').classList.toggle('hf',atBottom);
         if(cc.scrollTop<120&&S.hasMore&&!S.loadingOlder)loadOlderMessages();
-    });
+    },{passive:true});
 
     try {
         const d = await api('getInitData',{},'GET');
@@ -1829,7 +1938,8 @@ function buildMsgEl(msg){
   const isLatest = (latestBotMsg && latestBotMsg.id === msg.id);
 
   const wrap=document.createElement('div');
-  wrap.className=\`flex \${isBot?'justify-start':'justify-end'} group w-full relative\`;
+  // PERF FIX 4: the leading "msg-row" class enables content-visibility for off-screen messages
+  wrap.className=\`msg-row flex \${isBot?'justify-start':'justify-end'} group w-full relative\`;
   wrap.dataset.msgId=msg.id;
 
   if(isBot){
@@ -1927,7 +2037,7 @@ async function handleSend(){
     if(!S.userScrolled)scrollToBottom();
 
     try {
-        const resp = await fetch('?action=sendMessage', {
+const resp = await fetch('?action=sendMessage', {
             method: 'POST',
             headers: {'Content-Type':'application/json','Accept': 'text/event-stream','X-CSRF-Token':S.csrf,'X-Session-Id':S.session},
             body: JSON.stringify({content:txt, thinking_effort:S.thinkingEffort})
@@ -1938,16 +2048,63 @@ async function handleSend(){
             throw new Error(errJson.error || 'Server error');
         }
 
+        // GEMINI DEBUG: server returned a saved error message instead of a stream
+        const ctype = resp.headers.get('Content-Type') || '';
+        if (ctype.includes('application/json')) {
+            const data = await resp.json();
+            if (data.gemini_error) {
+                // Promote the placeholder bot bubble to the real saved error message
+                const bi = S.msgs.findIndex(m=>m.id==tbid);
+                if (bi !== -1) {
+                    S.msgs[bi].id = data.bot_id;
+                    S.msgs[bi].group_id = data.group_id;
+                    S.msgs[bi].variant_ids = [data.bot_id];
+                    S.msgs[bi].variants = [data.content];
+                    S.msgs[bi].content = data.content;
+                }
+                const ui = S.msgs.findIndex(m=>m.id==tuid);
+                if (ui !== -1 && data.user_id) S.msgs[ui].id = data.user_id;
+
+                // Fix DOM ids so the bubbles persist correctly
+                const bub = document.querySelector(\`[data-msg-id="\${tbid}"]\`);
+                if (bub) {
+                    bub.dataset.msgId = data.bot_id;
+                    const bbel = document.getElementById(\`bb-\${tbid}\`);
+                    if (bbel) bbel.id = \`bb-\${data.bot_id}\`;
+                }
+                const ubub = document.querySelector(\`[data-msg-id="\${tuid}"]\`);
+                if (ubub && data.user_id) ubub.dataset.msgId = data.user_id;
+
+                refreshMsgEl(data.bot_id);
+                if (data.user_id) refreshMsgEl(data.user_id);
+                if(!S.userScrolled)scrollToBottom();
+
+                S.generating=false;$('send-btn').disabled=false;
+                return; // stop here — there is no stream to read
+            }
+        }
+
         let fullText = "", fullReasoning = "";
         let display = "";
+        let lastRender = 0; // PERF FIX 3: throttle re-parsing while streaming
 
-        for await (const data of parseStream(resp)) {
+for await (const data of parseStream(resp)) {
             if (data.error) throw new Error(data.error);
             if (data.reasoning) fullReasoning += data.reasoning;
             if (data.chunk) fullText += data.chunk;
-            display = fullText;
-            if (fullReasoning) display = \`<think>\\n\${fullReasoning}\\n</think>\\n\\n\${fullText}\`;
-            typing.innerHTML = formatContent(display);
+
+            const _now = performance.now();
+            if (data.done || _now - lastRender > 90) {
+                lastRender = _now;
+                if (fullText.trim()) {
+                    // Answer text has started — render the real content (thought box stays collapsed)
+                    display = fullReasoning ? \`<think>\\n\${fullReasoning}\\n</think>\\n\\n\${fullText}\` : fullText;
+                    typing.innerHTML = formatContent(display);
+                } else if (fullReasoning) {
+                    // Still reasoning, no answer yet — show a lightweight indicator, NOT the reasoning
+                    typing.innerHTML = thinkingIndicatorHTML();
+                }
+            }
 
             if (data.done) {
                 const bi = S.msgs.findIndex(m=>m.id==tbid);
@@ -2044,13 +2201,15 @@ async function regenVariant(msgId,groupId){
         }
 
         let fullText = "", fullReasoning = "", display = "";
+        let lastRender = 0; // PERF FIX 3: throttle re-parsing while streaming
         for await (const data of parseStream(resp)) {
             if (data.error) throw new Error(data.error);
             if (data.reasoning) fullReasoning += data.reasoning;
             if (data.chunk) fullText += data.chunk;
             display = fullText;
             if (fullReasoning) display = \`<think>\\n\${fullReasoning}\\n</think>\\n\\n\${fullText}\`;
-            if(ci) ci.innerHTML = formatContent(display);
+            const _now = performance.now();
+            if(ci && (data.done || _now - lastRender > 90)){ lastRender = _now; ci.innerHTML = formatContent(display); }
 
             if (data.done) {
                 const m=S.msgs.find(m=>m.id==msgId);
@@ -2074,68 +2233,66 @@ async function regenVariant(msgId,groupId){
     }
 }
 
+/* ============================================================================
+   PERF FIX 1 — Swipe handling.
+   The old code attached window-level mousemove/touchmove/mouseup/touchend
+   listeners for EVERY bot message (all non-passive). With a long history that
+   meant hundreds of non-passive touchmove listeners on window, which forces the
+   browser to run JS before it can scroll => laggy scroll on phone and PC.
+
+   New design: ONE shared swipe state. Element-scoped touchstart/mousedown only
+   (passive). The window move/up listeners are added when a drag actually starts
+   and removed the instant it ends, so there are ZERO persistent move listeners
+   while you're just scrolling.
+   ========================================================================== */
+let _swipe = null;
+
+function _swipeMove(e){
+    const st = _swipe; if(!st) return;
+    const x = e.touches ? e.touches[0].clientX : e.clientX;
+    const y = e.touches ? e.touches[0].clientY : e.clientY;
+    const dx = x - st.sx, dy = y - st.sy;
+    if(!st.axis){
+        if(Math.abs(dx) > 10 || Math.abs(dy) > 10) st.axis = Math.abs(dx) > Math.abs(dy) ? 'x' : 'y';
+    }
+    if(!st.axis || st.axis === 'y') return;            // vertical => let the page scroll normally
+    if(e.cancelable) e.preventDefault();               // horizontal => take over for the swipe
+    st.el.classList.add('swiping');
+    st.el.style.transform = \`translateX(\${dx*.25}px)\`;
+    if(dx < -150){ const id = st.msgId; _swipeEnd(); changeVariation(id, 1); }
+    else if(dx > 150){ const id = st.msgId; _swipeEnd(); changeVariation(id, -1); }
+}
+function _swipeEnd(){
+    if(_swipe){ _swipe.el.style.transform=''; _swipe.el.classList.remove('swiping'); }
+    _swipe = null;
+    window.removeEventListener('mousemove', _swipeMove);
+    window.removeEventListener('touchmove', _swipeMove, {passive:false});
+    window.removeEventListener('mouseup', _swipeEnd);
+    window.removeEventListener('touchend', _swipeEnd);
+}
+function _swipeStart(e, el, msgId){
+    const latest = S.msgs.slice().reverse().find(m => m.role === 'bot');
+    if(!latest || latest.id != msgId) return;          // only the newest reply is swipeable
+    const x = e.touches ? e.touches[0].clientX : e.clientX;
+    const y = e.touches ? e.touches[0].clientY : e.clientY;
+    _swipe = { el, msgId, sx:x, sy:y, axis:null };
+    window.addEventListener('mousemove', _swipeMove);
+    window.addEventListener('touchmove', _swipeMove, {passive:false});
+    window.addEventListener('mouseup', _swipeEnd);
+    window.addEventListener('touchend', _swipeEnd);
+}
+
 function attachSwipeListeners(){
-  S.msgs.filter(m=>m.role==='bot').forEach(msg=>{
-    const isGreeting = (!S.hasMore && S.msgs[0] && S.msgs[0].id === msg.id);
-    if(isGreeting) return;
-    
-    // Escaped backticks and dollar signs for Worker compatibility
-    const el=document.getElementById(\`bb-\${msg.id}\`);
-    if(!el||el._swipe)return;
-    el._swipe=true;
-    
-    let sx=0, sy=0, drag=false, axisLocked=null;
-    
-    const start=e=>{
-      const latestBotMsg = S.msgs.slice().reverse().find(m => m.role === 'bot');
-      if (!latestBotMsg || latestBotMsg.id !== msg.id) return;
-      
-      sx = e.touches ? e.touches[0].clientX : e.clientX;
-      sy = e.touches ? e.touches[0].clientY : e.clientY;
-      drag = true;
-      axisLocked = null; // Reset the axis lock on every new touch
-    };
-    
-    const mv=e=>{
-      if(!drag) return;
-      const x = e.touches ? e.touches[0].clientX : e.clientX;
-      const y = e.touches ? e.touches[0].clientY : e.clientY;
-      const dx = x - sx;
-      const dy = y - sy;
-      
-      // Phase 1: Determine the primary axis of movement once we pass a 10px threshold
-      if (!axisLocked) {
-          if (Math.abs(dx) > 10 || Math.abs(dy) > 10) {
-              axisLocked = Math.abs(dx) > Math.abs(dy) ? 'x' : 'y';
-          }
-      }
-      
-      // Phase 2: If we haven't determined the axis yet, or if locked to vertical (scrolling), do NOTHING
-      if (!axisLocked || axisLocked === 'y') {
-          return; 
-      }
-      
-      // Phase 3: We are locked to horizontal (swiping). Prevent the screen from scrolling up/down.
-      if(e.cancelable) e.preventDefault();
-      
-      el.classList.add('swiping'); 
-      // Escaped backticks and dollar signs here
-      el.style.transform = \`translateX(\${dx*.25}px)\`;
-      
-      if (dx < -150) { 
-          drag=false; el.style.transform=''; el.classList.remove('swiping'); changeVariation(msg.id, 1); 
-      }
-      else if (dx > 150) { 
-          drag=false; el.style.transform=''; el.classList.remove('swiping'); changeVariation(msg.id, -1); 
-      }
-    };
-    
-    const end=()=>{ drag=false; axisLocked=null; el.style.transform=''; el.classList.remove('swiping'); };
-    
-    // Note: touchmove is set to passive: false so preventDefault() can freeze the screen during horizontal swipes
-    el.addEventListener('mousedown',start); window.addEventListener('mousemove',mv, {passive: false}); window.addEventListener('mouseup',end);
-    el.addEventListener('touchstart',start,{passive:true}); window.addEventListener('touchmove',mv,{passive:false}); window.addEventListener('touchend',end);
-  });
+    S.msgs.forEach(msg=>{
+        if(msg.role!=='bot') return;
+        const isGreeting = (!S.hasMore && S.msgs[0] && S.msgs[0].id === msg.id);
+        if(isGreeting) return;
+        const el=document.getElementById(\`bb-\${msg.id}\`);
+        if(!el || el._swipeBound) return;
+        el._swipeBound = true;                          // bind start handlers once per element
+        el.addEventListener('mousedown', e=>_swipeStart(e, el, msg.id));
+        el.addEventListener('touchstart', e=>_swipeStart(e, el, msg.id), {passive:true});
+    });
 }
 
 function toggleDropdown(e,id,isBot){
@@ -2666,6 +2823,8 @@ function openModal(id){
     document.querySelectorAll('.modal-content').forEach(m=>m.classList.add('hf'));
     $(id).classList.remove('hf');
     setTimeout(()=>bd.classList.remove('opacity-0'),10);
+    // PERF FIX 2: inject the modal search boxes on open (replaces the body-wide MutationObserver)
+    if(window.__rsPatchSearch) window.__rsPatchSearch();
 }
 
 function closeModals(){
@@ -2715,7 +2874,7 @@ function toggleTheme(){const d=document.documentElement.classList.toggle('dark')
     });
   }
 
-  // ── OBSERVE & PATCH MODALS ───────────────────────────────────────────
+  // ── PATCH MODALS (search boxes) ──────────────────────────────────────
   const patched = new Set();
 
   function tryPatch() {
@@ -2765,11 +2924,13 @@ function toggleTheme(){const d=document.documentElement.classList.toggle('dark')
     }
   }
 
-  // Re-run patch whenever the DOM changes (modals render dynamically)
-  const obs = new MutationObserver(tryPatch);
-  obs.observe(document.body, { childList: true, subtree: true });
+  // PERF FIX 2: expose tryPatch and call it on demand (from openModal) instead of
+  // running a MutationObserver over the whole document body. The old observer
+  // re-ran on EVERY DOM change — including every streamed token — for no reason,
+  // since all of these list containers already exist in the static HTML.
+  window.__rsPatchSearch = tryPatch;
 
-  // Also run once on load in case elements already exist
+  // Run once on load — the static containers already exist, so this is enough.
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', tryPatch);
   } else {
