@@ -1,6 +1,6 @@
 # 🚀 RSROLEPLAY Engine
 
-A lightning-fast, fully serverless AI chat platform powered by **Cloudflare Workers** and **Cloudflare D1**. Build your own private, customizable AI roleplay hub with zero hosting costs.
+A lightning-fast, fully serverless AI chat platform powered by **Cloudflare Workers** and **Cloudflare D1**. Build your own private, customizable AI roleplay hub with zero hosting costs or use it as your AI Chat client for daily usage.
 
 **Built by [@redsus.vn](https://miku.us.kg) |  Follow my tiktok for more info [https://www.tiktok.com/@redsusvn](https://www.tiktok.com/@redsusvn)**
 
@@ -15,7 +15,7 @@ A lightning-fast, fully serverless AI chat platform powered by **Cloudflare Work
 - **📚 Auto-Summarization:** Built-in memory management that automatically summarizes old messages in the background to save context tokens.
 - **🎭 Multi-Persona System:** Create and seamlessly switch between different AI characters or bots within the same session.
 - **🔄 Character.AI Import:** Easily drag-and-drop your exported `.txt` chat histories from Character.AI directly into the engine.
-- **🔌 Multi-Provider Support:** Plug in API keys from Groq, OpenRouter, Mistral, Cloudflare AI, or any Custom OpenAI-compatible endpoint.
+- **🔌 Multi-Provider Support:** Plug in API keys from Groq, OpenRouter, Mistral, Cloudflare AI, Gemini, or any Custom OpenAI-compatible endpoint.
 
 ---
 
