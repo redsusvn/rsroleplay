@@ -640,12 +640,58 @@ export default {
 
     try {
       switch (action) {
+case 'branchChat': {
+          const targetId = str(body.target_msg_id, 100);
+          const newLabel = str(body.new_label, 100) || 'Branched Chat';
+          if (!targetId) return errResponse('Invalid target message');
 
+          const targetMsg = await db.findOne('chat_history', { id: targetId });
+          if (!targetMsg) return errResponse('Not found', 404);
+          if (targetMsg.session_id !== sid) return errResponse('Forbidden', 403);
+
+          const history = await db.all('SELECT * FROM chat_history WHERE session_id = ? AND is_main = 1 AND timestamp <= ? ORDER BY timestamp ASC', [sid, targetMsg.timestamp]);
+          
+          const newSessionId = generateId();
+          const curSess = await db.findOne('chat_sessions', { id: sid });
+          
+          // 1. Create the new session
+          await db.insert('chat_sessions', { id: newSessionId, label: newLabel, persona_id: curSess?.persona_id ?? null, created_at: Date.now() });
+
+          // 2. Clone memory state rules (but reset the current summary)
+          const mem = await getMem(sid, db);
+          await db.insert('memory_state', {
+            id: generateId(), session_id: newSessionId, summarize_threshold: mem.summarize_threshold,
+            summarize_count: mem.summarize_count, context_count: mem.context_count,
+            history_fetch_count: mem.history_fetch_count, include_old_summary: mem.include_old_summary,
+            last_summarized_timestamp: 0, sketchboard_active: mem.sketchboard_active, current_summary: null
+          });
+
+          // 3. Batch insert messages (CRITICAL: chunked by 100 to avoid Cloudflare D1 batch limits)
+          const stmts = [];
+          for (const msg of history) {
+            stmts.push(db.d1.prepare('INSERT INTO chat_history (id, session_id, group_id, is_main, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)')
+              .bind(generateId(), newSessionId, 'g_' + generateId(), 1, msg.role, msg.content, msg.timestamp));
+          }
+          for (let i = 0; i < stmts.length; i += 100) {
+            await db.d1.batch(stmts.slice(i, i + 100));
+          }
+
+          // 4. Clone active sketchboard pins
+          const pins = await db.all('SELECT * FROM sketchboard WHERE session_id = ? AND is_active = 1', [sid]);
+          const pinStmts = [];
+          for (const p of pins) {
+             pinStmts.push(db.d1.prepare('INSERT INTO sketchboard (id, session_id, content, is_active, created_at) VALUES (?, ?, ?, ?, ?)')
+               .bind(generateId(), newSessionId, p.content, 1, p.created_at));
+          }
+          if (pinStmts.length > 0) await db.d1.batch(pinStmts);
+
+          return jsonResponse({ success: true, session_id: newSessionId, label: newLabel });
+        }
 case 'logout': {
           // Nuke ALL sessions for this user across all devices
           await db.delete('user_sessions', { user_id: userId });
           return jsonResponse({ success: true }, 200, {
-            'Set-Cookie': 'aiphp_sess=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0',
+            'Set-Cookie': 'aiphpcase_sess=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0',
           });
         }
 
@@ -2307,9 +2353,12 @@ function toggleDropdown(e,id,isBot){
     const latestBotMsg = S.msgs.slice().reverse().find(m => m.role === 'bot');
     const isLatest = (latestBotMsg && latestBotMsg.id == id);
 
-    drop.innerHTML=\`
+drop.innerHTML=\`
         <button onclick="copyMsg('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left"><i data-lucide="copy"class="w-4 h-4 mr-2"></i>Copy</button>
         <button onclick="startEdit('\${id}',\${isBot})" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left"><i data-lucide="edit-2"class="w-4 h-4 mr-2"></i>Edit</button>
+        
+        <button onclick="branchChat('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left text-purple-600 dark:text-purple-400"><i data-lucide="git-branch"class="w-4 h-4 mr-2"></i>New Chat From Here</button>
+        
         \${isBot?\`<button onclick="pinMsg('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left"><i data-lucide="pin"class="w-4 h-4 mr-2"></i>Pin to Sketchboard</button>\`:''}
         \${isBot&&vars.length>1&&!isGreeting?\`<button onclick="setMainDrop('\${id}','\${ids[ai]}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left text-blue-600 dark:text-blue-400"><i data-lucide="check-circle"class="w-4 h-4 mr-2"></i>Keep this version only</button>\`:''}
         \${isBot&&!isGreeting&&isLatest?\`<button onclick="regenDrop('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left"><i data-lucide="refresh-cw"class="w-4 h-4 mr-2"></i>Regenerate</button>\`:''}
@@ -2370,6 +2419,17 @@ function pinMsg(id) {
     
     addPinText(t);
     closeAllDropdowns();
+}
+async function branchChat(id){
+    closeAllDropdowns();
+    const label=prompt('Name for the new branched chat:','Branched Chat');if(!label)return;
+    toast('Branching chat...');
+    const res=await api('branchChat',{target_msg_id:id,new_label:label});
+    if(res.error){toast('Error: '+res.error);return;}
+    S.sessions.push({id:res.session_id,label:res.label});
+    renderSessionsList();
+    switchSession(res.session_id);
+    toast('Chat branched successfully!');
 }
 async function setMainDrop(msgId,varId){
     await api('keepVersionOnly',{id:varId});
