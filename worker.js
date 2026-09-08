@@ -111,25 +111,67 @@ class DB {
   }
 }
 
-// Automatically creates tables if they are missing
-async function checkAndInitDB(db) {
-  try {
-    await db.get('SELECT 1 FROM users LIMIT 1');
-  } catch (e) {
-    // If the query fails, it means the tables don't exist. Run Auto-Setup.
-    console.log("Initializing Database Schema...");
-    await db.d1.exec(`
-      CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, created_at INTEGER);
-      CREATE TABLE IF NOT EXISTS user_sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, session_token TEXT UNIQUE NOT NULL, csrf_token TEXT NOT NULL, expires_at INTEGER, created_at INTEGER);
-      CREATE TABLE IF NOT EXISTS ip_blocks (id TEXT PRIMARY KEY, failed_attempts INTEGER DEFAULT 0, locked_until INTEGER);
-      CREATE TABLE IF NOT EXISTS personas (id TEXT PRIMARY KEY, name TEXT NOT NULL, avatar TEXT, description TEXT, system_prompt TEXT, user_persona TEXT, greeting_message TEXT);
-      CREATE TABLE IF NOT EXISTS chat_sessions (id TEXT PRIMARY KEY, label TEXT, persona_id TEXT, created_at INTEGER);
-      CREATE TABLE IF NOT EXISTS chat_history (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, group_id TEXT NOT NULL, is_main INTEGER DEFAULT 1, role TEXT NOT NULL, content TEXT NOT NULL, timestamp INTEGER);
-      CREATE TABLE IF NOT EXISTS memory_state (id TEXT PRIMARY KEY, session_id TEXT UNIQUE NOT NULL, summarize_threshold INTEGER DEFAULT 50, summarize_count INTEGER DEFAULT 30, context_count INTEGER DEFAULT 20, history_fetch_count INTEGER DEFAULT 50, include_old_summary INTEGER DEFAULT 1, last_summarized_timestamp INTEGER DEFAULT 0, sketchboard_active INTEGER DEFAULT 1, current_summary TEXT);
-      CREATE TABLE IF NOT EXISTS sketchboard (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, content TEXT NOT NULL, is_active INTEGER DEFAULT 1, created_at INTEGER);
-      CREATE TABLE IF NOT EXISTS api_keys (id TEXT PRIMARY KEY, name TEXT, provider TEXT NOT NULL, model TEXT NOT NULL, api_key TEXT, custom_url TEXT, key_mode TEXT NOT NULL, is_primary INTEGER DEFAULT 0, created_at INTEGER);
-    `);
+// Bumped on every deploy so browsers revalidate the HTML shell cheaply.
+const APP_BUILD = '2026-09-08-perf1';
+const HTML_CACHE_CONTROL = 'private, max-age=0, must-revalidate';
+let _hasUsers = false, _appHTML = null, _setupHTML = null;
+
+const SSE_HEADERS = {
+  'Content-Type':    'text/event-stream; charset=utf-8',
+  'Cache-Control':   'no-cache, no-transform',
+  'Connection':      'keep-alive',
+  'X-Accel-Buffering': 'no',   // tell any proxy in front of us not to buffer
+  ...SECURITY_HEADERS,
+};
+
+// Sent when a dropped upstream stream is reconnected mid-reply.
+const CONTINUE_PROMPT = 'Your previous reply was cut off part-way through by a network error. Continue it from exactly where it stopped. Do not repeat any text you already wrote, do not restate, do not apologise, do not add a preamble - output only the remaining part of that reply.';
+
+// Bump this whenever SCHEMA_SQL changes; existing databases pick the change up
+// on the next cold start instead of needing a manual migration.
+const SCHEMA_VERSION = '4';
+
+// NOTE: d1.exec() requires exactly one statement per line.
+const SCHEMA_SQL = [
+  `CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL, created_at INTEGER);`,
+  `CREATE TABLE IF NOT EXISTS user_sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, session_token TEXT UNIQUE NOT NULL, csrf_token TEXT NOT NULL, expires_at INTEGER, created_at INTEGER);`,
+  `CREATE TABLE IF NOT EXISTS ip_blocks (id TEXT PRIMARY KEY, failed_attempts INTEGER DEFAULT 0, locked_until INTEGER);`,
+  `CREATE TABLE IF NOT EXISTS personas (id TEXT PRIMARY KEY, name TEXT NOT NULL, avatar TEXT, description TEXT, system_prompt TEXT, user_persona TEXT, greeting_message TEXT);`,
+  `CREATE TABLE IF NOT EXISTS chat_sessions (id TEXT PRIMARY KEY, label TEXT, persona_id TEXT, created_at INTEGER);`,
+  `CREATE TABLE IF NOT EXISTS chat_history (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, group_id TEXT NOT NULL, is_main INTEGER DEFAULT 1, role TEXT NOT NULL, content TEXT NOT NULL, timestamp INTEGER);`,
+  `CREATE TABLE IF NOT EXISTS memory_state (id TEXT PRIMARY KEY, session_id TEXT UNIQUE NOT NULL, summarize_threshold INTEGER DEFAULT 50, summarize_count INTEGER DEFAULT 30, context_count INTEGER DEFAULT 20, history_fetch_count INTEGER DEFAULT 50, include_old_summary INTEGER DEFAULT 1, last_summarized_timestamp INTEGER DEFAULT 0, sketchboard_active INTEGER DEFAULT 1, current_summary TEXT);`,
+  `CREATE TABLE IF NOT EXISTS sketchboard (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, content TEXT NOT NULL, is_active INTEGER DEFAULT 1, created_at INTEGER);`,
+  `CREATE TABLE IF NOT EXISTS api_keys (id TEXT PRIMARY KEY, name TEXT, provider TEXT NOT NULL, model TEXT NOT NULL, api_key TEXT, custom_url TEXT, key_mode TEXT NOT NULL, is_primary INTEGER DEFAULT 0, created_at INTEGER);`,
+  `CREATE TABLE IF NOT EXISTS gen_settings (id TEXT PRIMARY KEY, preset TEXT, temperature REAL, top_p REAL, presence_penalty REAL, frequency_penalty REAL, top_k INTEGER, repetition_penalty REAL, max_tokens INTEGER, updated_at INTEGER);`,
+  `CREATE TABLE IF NOT EXISTS _schema_meta (k TEXT PRIMARY KEY, v TEXT);`,
+  // Indexes. Without these every history read is a full scan of chat_history,
+  // which is what made loading a long session feel slow.
+  `CREATE INDEX IF NOT EXISTS idx_ch_sess_main_ts ON chat_history (session_id, is_main, timestamp);`,
+  `CREATE INDEX IF NOT EXISTS idx_ch_sess_ts ON chat_history (session_id, timestamp);`,
+  `CREATE INDEX IF NOT EXISTS idx_ch_group_ts ON chat_history (group_id, timestamp);`,
+  `CREATE INDEX IF NOT EXISTS idx_sb_sess_active ON sketchboard (session_id, is_active, created_at);`,
+  `CREATE INDEX IF NOT EXISTS idx_us_user ON user_sessions (user_id);`,
+  `CREATE INDEX IF NOT EXISTS idx_us_expires ON user_sessions (expires_at);`,
+  `CREATE INDEX IF NOT EXISTS idx_cs_created ON chat_sessions (created_at);`,
+  `CREATE INDEX IF NOT EXISTS idx_ak_mode ON api_keys (key_mode, is_primary);`,
+].join('\n');
+
+// The schema probe used to run on EVERY request, costing one extra D1 round
+// trip each time. It is memoised per isolate now: one query per cold start.
+let _schemaReady = null;
+
+function ensureSchema(db) {
+  if (!_schemaReady) {
+    _schemaReady = (async () => {
+      try {
+        const row = await db.get('SELECT v FROM _schema_meta WHERE k = ?', ['version']);
+        if (row?.v === SCHEMA_VERSION) return;
+      } catch { /* table missing: fresh install, or a database from before versioning */ }
+      await db.d1.exec(SCHEMA_SQL);
+      await db.run('INSERT OR REPLACE INTO _schema_meta (k, v) VALUES (?, ?)', ['version', SCHEMA_VERSION]);
+    })().catch(e => { _schemaReady = null; throw e; });
   }
+  return _schemaReady;
 }
 
 // ── AUTH HELPERS ─────────────────────────────────────────────────────
@@ -179,92 +221,195 @@ async function auth(req, db) {
 }
 
 // ── MEMORY & CONTEXT ─────────────────────────────────────────────────
-async function getMem(sid, db) {
-  let row = await db.findOne('memory_state', { session_id: sid });
-  if (!row) {
-    const global = await db.findOne('memory_state', { session_id: 'global' });
-    row = {
-      id: generateId(),
-      session_id:               sid,
-      summarize_threshold:      global?.summarize_threshold      ?? 50,
-      summarize_count:          global?.summarize_count          ?? 30,
-      context_count:            global?.context_count            ?? 20,
-      history_fetch_count:      global?.history_fetch_count      ?? 50,
-      include_old_summary:      global?.include_old_summary      ?? 1,
-      last_summarized_timestamp: 0,
-      sketchboard_active:       global?.sketchboard_active       ?? 1,
-      current_summary:          null,
-    };
-    await db.insert('memory_state', row);
-  }
-  return row;
+const MEM_DEFAULTS = {
+  summarize_threshold: 50, summarize_count: 30, context_count: 20,
+  history_fetch_count: 50, include_old_summary: 1, sketchboard_active: 1,
+};
+
+function newMemRow(sid, global) {
+  return {
+    id: generateId(),
+    session_id:                sid,
+    summarize_threshold:       global?.summarize_threshold ?? MEM_DEFAULTS.summarize_threshold,
+    summarize_count:           global?.summarize_count     ?? MEM_DEFAULTS.summarize_count,
+    context_count:             global?.context_count       ?? MEM_DEFAULTS.context_count,
+    history_fetch_count:       global?.history_fetch_count ?? MEM_DEFAULTS.history_fetch_count,
+    include_old_summary:       global?.include_old_summary ?? MEM_DEFAULTS.include_old_summary,
+    last_summarized_timestamp: 0,
+    sketchboard_active:        global?.sketchboard_active  ?? MEM_DEFAULTS.sketchboard_active,
+    current_summary:           null,
+  };
 }
 
-async function buildCtx(sid, userMsg, db, beforeTs = null) {
-  const sessionDoc = await db.findOne('chat_sessions', { id: sid });
-  const pid = sessionDoc?.persona_id ?? null;
+// Writing the defaulted row is not something the caller needs to wait for, so
+// hand it to waitUntil when we have an execution context. INSERT OR IGNORE
+// keeps two concurrent requests from colliding on session_id's UNIQUE index.
+function persistMemRow(db, row, ctx) {
+  const keys = Object.keys(row);
+  const p = db.run(
+    `INSERT OR IGNORE INTO memory_state (${keys.join(', ')}) VALUES (${keys.map(() => '?').join(', ')})`,
+    keys.map(k => row[k])
+  ).catch(() => {});
+  if (ctx?.waitUntil) { ctx.waitUntil(p); return; }
+  return p;
+}
 
-  let bot = pid ? await db.findOne('personas', { id: pid }) : null;
-  if (!bot) {
-    const personas = await db.all('SELECT * FROM personas LIMIT 1');
-    bot = personas[0] ?? null;
+// One round trip instead of two sequential ones.
+async function getMem(sid, db, ctx = null) {
+  const [own, glob] = await db.d1.batch([
+    db.d1.prepare('SELECT * FROM memory_state WHERE session_id = ? LIMIT 1').bind(sid),
+    db.d1.prepare('SELECT * FROM memory_state WHERE session_id = ? LIMIT 1').bind('global'),
+  ]);
+  const row = own.results?.[0];
+  if (row) return row;
+  const fresh = newMemRow(sid, glob.results?.[0]);
+  await persistMemRow(db, fresh, ctx);
+  return fresh;
+}
+
+// Returns { msgs, mem } — mem comes back so callers don't have to re-query it.
+// This used to be five sequential D1 queries (session, persona, memory, global
+// memory, pins, history); it is two batched round trips now.
+async function buildCtx(sid, userMsg, db, beforeTs = null, ctx = null) {
+  const [sessRes, memRes, globalMemRes, firstPersonaRes] = await db.d1.batch([
+    db.d1.prepare('SELECT p.* FROM chat_sessions s LEFT JOIN personas p ON p.id = s.persona_id WHERE s.id = ? LIMIT 1').bind(sid),
+    db.d1.prepare('SELECT * FROM memory_state WHERE session_id = ? LIMIT 1').bind(sid),
+    db.d1.prepare('SELECT * FROM memory_state WHERE session_id = ? LIMIT 1').bind('global'),
+    db.d1.prepare('SELECT * FROM personas ORDER BY id LIMIT 1'),
+  ]);
+
+  const joined = sessRes.results?.[0] ?? null;
+  // LEFT JOIN misses (no persona set, or a deleted one) come back all-NULL.
+  const bot = (joined && joined.id != null) ? joined : (firstPersonaRes.results?.[0] ?? null);
+
+  let mem = memRes.results?.[0];
+  if (!mem) {
+    mem = newMemRow(sid, globalMemRes.results?.[0]);
+    await persistMemRow(db, mem, ctx);
   }
 
-  const mem = await getMem(sid, db);
-  const sysParts = [];
-  if (bot?.system_prompt)  sysParts.push(bot.system_prompt);
-  if (bot?.user_persona)   sysParts.push('About the user: ' + bot.user_persona);
+  const ctxCount = Math.max(1, Math.min(mem.context_count ?? 20, 100));
+  const wantPins = mem.sketchboard_active === 1;
 
-if (mem.sketchboard_active === 1) {
-    // ADDED: ORDER BY created_at DESC
-    const pins = await db.all('SELECT * FROM sketchboard WHERE session_id = ? AND is_active = 1 ORDER BY created_at DESC', [sid]);
-    
-    if (pins.length > 0) sysParts.push('Additional important infomation. Use this important infomation to continue the story:\n- ' + pins.map(p => p.content).join('\n- '));
+  const stmts = [];
+  if (wantPins) {
+    stmts.push(db.d1.prepare('SELECT content FROM sketchboard WHERE session_id = ? AND is_active = 1 ORDER BY created_at DESC').bind(sid));
+  }
+  stmts.push(beforeTs
+    // Exact immediate history prior to the regenerated message, ignoring summary markers.
+    ? db.d1.prepare('SELECT role, content FROM chat_history WHERE session_id = ? AND is_main = 1 AND timestamp < ? ORDER BY timestamp DESC LIMIT ?').bind(sid, beforeTs, ctxCount)
+    : db.d1.prepare('SELECT role, content FROM chat_history WHERE session_id = ? AND is_main = 1 ORDER BY timestamp DESC LIMIT ?').bind(sid, ctxCount));
+
+  const res2    = await db.d1.batch(stmts);
+  const pins    = wantPins ? (res2[0].results ?? []) : [];
+  const history = res2[wantPins ? 1 : 0].results ?? [];
+
+  const sysParts = [];
+  if (bot?.system_prompt) sysParts.push(bot.system_prompt);
+  if (bot?.user_persona)  sysParts.push('About the user: ' + bot.user_persona);
+  if (pins.length > 0) {
+    sysParts.push('Additional important infomation. Use this important infomation to continue the story:\n- ' + pins.map(p => p.content).join('\n- '));
   }
 
   const msgs = [];
   if (sysParts.length > 0) msgs.push({ role: 'system', content: sysParts.join('\n\n') });
   if (mem.current_summary) msgs.push({ role: 'system', content: 'Previous summary:\n' + mem.current_summary });
 
-  const ctxCount = Math.max(1, Math.min(mem.context_count ?? 20, 100));
-  
-  let history;
-  if (beforeTs) {
-    // FIXED: Always fetch the exact immediate history prior to the regenerated message, ignoring summary markers
-    history = await db.all(
-      `SELECT * FROM chat_history WHERE session_id = ? AND is_main = 1 AND timestamp < ?
-       ORDER BY timestamp DESC LIMIT ?`,
-      [sid, beforeTs, ctxCount]
-    );
-  } else {
-    // FIXED: Always fetch the latest messages verbatim to guarantee immediate conversational tone
-    history = await db.all(
-      `SELECT * FROM chat_history WHERE session_id = ? AND is_main = 1
-       ORDER BY timestamp DESC LIMIT ?`,
-      [sid, ctxCount]
-    );
-  }
   history.reverse();
-
   for (const h of history) {
     // Strip <think> blocks so they don't consume context tokens
     const cleanContent = h.content.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
     msgs.push({ role: h.role === 'bot' ? 'assistant' : 'user', content: cleanContent });
   }
   if (userMsg) msgs.push({ role: 'user', content: userMsg });
-  return msgs;
+  return { msgs, mem, bot };
 }
 
 // ── LLM ──────────────────────────────────────────────────────────────
 const THINKING_EFFORTS = new Set(['none', 'low', 'medium', 'high']);
+
+// -- GENERATION SETTINGS ----------------------------------------------
+// One global row drives every API endpoint, so switching provider does not
+// change how the model behaves. 'default' is the tuning this app shipped with.
+const GEN_PRESETS = {
+  default:  { temperature: 0.3, top_p: 0.8,  presence_penalty: 0.1, frequency_penalty: 0.1, max_tokens: 8192 },
+  creative: { temperature: 1.0, top_p: 0.95, presence_penalty: 0.4, frequency_penalty: 0.4, max_tokens: 8192 },
+  precise:  { temperature: 0.1, top_p: 0.5,  presence_penalty: 0.0, frequency_penalty: 0.0, max_tokens: 8192 },
+};
+const GEN_PRESET_NAMES = ['default', 'creative', 'precise', 'custom'];
+
+// field: [min, max, fallback]
+const GEN_LIMITS = {
+  temperature:        [0,   2,     0.3],
+  top_p:              [0,   1,     0.8],
+  presence_penalty:   [-2,  2,     0.1],
+  frequency_penalty:  [-2,  2,     0.1],
+  top_k:              [0,   200,   0],     // 0 = do not send
+  repetition_penalty: [0,   2,     0],     // 0 = do not send
+  max_tokens:         [256, 32768, 8192],
+};
+
+function clampNum(v, lo, hi, dflt) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.min(hi, Math.max(lo, n));
+}
+
+// The stored numbers, clamped. These are what the Custom preset uses.
+function rawGen(row) {
+  const out = {};
+  for (const [k, [lo, hi, d]] of Object.entries(GEN_LIMITS)) out[k] = clampNum(row?.[k], lo, hi, d);
+  out.max_tokens = Math.round(out.max_tokens);
+  out.top_k      = Math.round(out.top_k);
+  return out;
+}
+
+// What actually gets sent to a provider.
+function resolveGen(row) {
+  const preset = GEN_PRESET_NAMES.includes(row?.preset) ? row.preset : 'default';
+  if (preset === 'custom') return { preset, ...rawGen(row) };
+  return { preset, ...GEN_PRESETS[preset], top_k: 0, repetition_penalty: 0 };
+}
+
+// API keys and the global generation settings in a single round trip.
+async function loadKeysAndGen(db) {
+  const [keysRes, genRes] = await db.d1.batch([
+    db.d1.prepare('SELECT * FROM api_keys'),
+    db.d1.prepare('SELECT * FROM gen_settings WHERE id = ? LIMIT 1').bind('global'),
+  ]);
+  return { apiKeys: keysRes.results ?? [], gen: resolveGen(genRes.results?.[0]) };
+}
+
+// How long we wait for an upstream provider to send response HEADERS. Once the
+// body starts streaming the abort is cleared and the stream layer's own stall
+// watchdog takes over, so a slow generation is never cut short.
+const LLM_HEADER_TIMEOUT_MS = 30_000;
+const LLM_TOTAL_TIMEOUT_MS  = 120_000; // non-streaming calls (summarize)
+
+async function fetchWithTimeout(url, init, ms, extSignal) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(new Error('Upstream timed out after ' + ms + 'ms')), ms);
+  const onAbort = () => ac.abort(extSignal.reason);
+  if (extSignal) {
+    if (extSignal.aborted) ac.abort(extSignal.reason);
+    else extSignal.addEventListener('abort', onAbort, { once: true });
+  }
+  try {
+    return await fetch(url, { ...init, signal: ac.signal });
+  } finally {
+    clearTimeout(timer);
+    if (extSignal) extSignal.removeEventListener('abort', onAbort);
+  }
+}
 
 function isThinking(model) {
   const m = model.toLowerCase();
   return ['gemma-4', 'qwen3', 'deepseek-r1', 'gpt-oss', ':thinking', '-think'].some(x => m.includes(x));
 }
 
-async function executeLLM(apiKeys, messages, mode, thinkingEffort, stream, signal) {
+async function executeLLM(apiKeys, messages, mode, thinkingEffort, stream, signal, gen = null) {
   const effort = THINKING_EFFORTS.has(thinkingEffort) ? thinkingEffort : 'none';
+  const g = gen ?? resolveGen(null);
 let keys = apiKeys.filter(k => k.key_mode === mode).sort((a, b) => b.is_primary - a.is_primary);
   if (keys.length === 0) throw new Error('No API keys configured for mode: ' + mode);
 
@@ -345,13 +490,22 @@ let keys = apiKeys.filter(k => k.key_mode === mode).sort((a, b) => b.is_primary 
 
       // ── 3. PARAMETERS LOGIC ──
 if (mode === 'chat') {
-        body.max_tokens = 8192;
-        body.temperature = 0.3;
-        body.top_p = 0.8;
+        // Driven by the global Advanced Settings row (see resolveGen).
+        body.max_tokens  = g.max_tokens;
+        body.temperature = g.temperature;
+        body.top_p       = g.top_p;
         // Gemini's OpenAI-compat endpoint rejects penalty params on many models — skip them
         if (provider !== 'gemini') {
-          body.presence_penalty = 0.1;
-          body.frequency_penalty = 0.1;
+          body.presence_penalty  = g.presence_penalty;
+          body.frequency_penalty = g.frequency_penalty;
+        }
+        // Not part of the OpenAI schema. Only sent when explicitly turned on,
+        // and only to providers that tolerate extra fields - a stray parameter
+        // is a 400 on Groq/Gemini, which is exactly the kind of failure that
+        // used to look like a dropped connection.
+        if (provider === 'openrouter' || provider === 'custom') {
+          if (g.top_k > 0)              body.top_k = g.top_k;
+          if (g.repetition_penalty > 0) body.repetition_penalty = g.repetition_penalty;
         }
 
         // PHP FIX: ONLY inject thinking logic if we are in CHAT mode
@@ -381,7 +535,12 @@ if (isThinking(key.model) && provider !== 'gemini') {
         // NEVER send reasoning_effort or penalties during summarization for Groq
       }
 
-const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal });
+const res = await fetchWithTimeout(
+        url,
+        { method: 'POST', headers, body: JSON.stringify(body) },
+        stream ? LLM_HEADER_TIMEOUT_MS : LLM_TOTAL_TIMEOUT_MS,
+        signal
+      );
       if (!res.ok) { 
         const errorBody = await res.text();
         lastErr = `${provider} HTTP ${res.status}: ${errorBody.substring(0, 150)}`;
@@ -419,118 +578,303 @@ let content = msg.content ?? '';
   }
   throw new Error('All API keys failed. Last: ' + lastErr);
 }
-// ── SSE STREAM ───────────────────────────────────────────────────────
-function createUnifiedStream(rawStream, provider, dbSaverCallback) {
+// -- HISTORY PAGING ---------------------------------------------------
+// Reads one page of history plus every variant of the bot messages on it.
+// The variants used to be fetched one query per message (up to 50 sequential
+// D1 round trips for a single page); they are one batched round trip now, and
+// has_more comes from an extra row rather than a second query.
+async function fetchHistoryPage(db, sid, limit, beforeTs = 0) {
+  const rows = beforeTs > 0
+    ? await db.all('SELECT * FROM chat_history WHERE session_id = ? AND is_main = 1 AND timestamp < ? ORDER BY timestamp DESC LIMIT ?', [sid, beforeTs, limit + 1])
+    : await db.all('SELECT * FROM chat_history WHERE session_id = ? AND is_main = 1 ORDER BY timestamp DESC LIMIT ?', [sid, limit + 1]);
+
+  const hasMore = rows.length > limit;
+  if (hasMore) rows.pop();   // DESC order, so the surplus row is the oldest one
+  rows.reverse();
+
+  const groupIds = [...new Set(rows.filter(r => r.role === 'bot').map(r => r.group_id))];
+  const byGroup = new Map();
+  if (groupIds.length > 0) {
+    const CHUNK = 60;   // stay well under SQLite's bound-parameter limit
+    const stmts = [];
+    for (let i = 0; i < groupIds.length; i += CHUNK) {
+      const slice = groupIds.slice(i, i + CHUNK);
+      stmts.push(db.d1
+        .prepare(`SELECT id, group_id, content, is_main FROM chat_history WHERE group_id IN (${slice.map(() => '?').join(', ')}) ORDER BY timestamp, id`)
+        .bind(...slice));
+    }
+    for (const res of await db.d1.batch(stmts)) {
+      for (const v of (res.results ?? [])) {
+        if (!byGroup.has(v.group_id)) byGroup.set(v.group_id, []);
+        byGroup.get(v.group_id).push(v);
+      }
+    }
+  }
+
+  for (const msg of rows) {
+    if (msg.role !== 'bot') continue;
+    const vars = byGroup.get(msg.group_id) ?? [];
+    if (vars.length === 0) {
+      msg.variants = [msg.content]; msg.variant_ids = [msg.id]; msg.active_index = 0;
+      continue;
+    }
+    let ai = 0;
+    vars.forEach((v, i) => { if (v.is_main === 1) ai = i; });
+    msg.variants     = vars.map(v => v.content);
+    msg.variant_ids  = vars.map(v => v.id);
+    msg.active_index = ai;
+    msg.id           = vars[ai]?.id ?? msg.id;
+  }
+
+  return { messages: rows, has_more: hasMore };
+}
+
+// -- SSE STREAM -------------------------------------------------------
+// Design rules, in order of importance:
+//   1. Never throw away text we already received. If the upstream provider
+//      drops the socket we save the partial reply instead of discarding it.
+//   2. If it drops mid-generation, transparently reconnect and ask the model to
+//      continue, stitching the halves back together (overlap-deduplicated).
+//   3. Writes to the browser are best-effort. If the tab goes away we keep
+//      reading and still persist the reply (the caller wraps the run promise in
+//      ctx.waitUntil), so a flaky client connection never loses a message.
+// Reasoning models can think for a long while before the first token, so the
+// first byte gets a much longer grace period than the gaps between tokens.
+const STREAM_FIRST_BYTE_MS = 150_000;
+const STREAM_STALL_MS      = 45_000; // no further bytes for this long => dropped
+const STREAM_MAX_RESUMES   = 2;      // reconnect attempts after a drop
+const RESUME_SCAN_CHARS    = 400;    // how much of a resumed reply we inspect for overlap
+
+// Some providers simply never send [DONE] or a finish_reason. Reconnecting
+// twice for every one of those messages would be pure waste, so we only resume
+// when the text actually reads as cut off mid-thought.
+function looksTruncated(text) {
+  const t = text.trimEnd();
+  if (!t) return true;
+  return !/[.!?\u2026"'\u201d\u2019)\]}*`~\u3002\uff01\uff1f]$/u.test(t);
+}
+
+// A resumed generation usually re-emits the tail of what we already have.
+// Strip the longest suffix/prefix overlap so the seam is invisible.
+function stripOverlap(prev, next) {
+  if (!prev || !next) return next;
+  const max = Math.min(prev.length, next.length, RESUME_SCAN_CHARS);
+  for (let n = max; n >= 4; n--) {
+    if (!prev.endsWith(next.slice(0, n))) continue;
+    // A long match is unambiguous. A short one only counts when it starts on a
+    // word boundary, so we never eat a legitimately repeated fragment.
+    if (n >= 12) return next.slice(n);
+    const before = prev[prev.length - n - 1];
+    if (before === undefined || /[\s\p{P}]/u.test(before)) return next.slice(n);
+  }
+  return next;
+}
+
+async function readWithTimeout(reader, ms) {
+  let timer;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('Upstream stalled')), ms); }),
+    ]);
+  } finally { clearTimeout(timer); }
+}
+
+/**
+ * @param openStream  async (partialSoFar|null) => ReadableStream - called once
+ *                    up front, then again for each resume attempt.
+ * @param onFinish    async (finalText, hardError, partial) => metadata object
+ */
+function createUnifiedStream({ openStream, onFinish }) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
-  const reader = rawStream.getReader();
-  const dec = new TextDecoder(), enc = new TextEncoder();
+  const enc = new TextEncoder();
 
-  async function run() {
-    let fullContent = '', fullReasoning = '', buffer = '';
-    let hasError = false;
-    let receivedDone = false;
-    
-    // 1. KEEP-ALIVE PING: Sends a dummy comment every 10s to prevent Cloudflare/bad networks from dropping idle connections
-    const keepAliveTimer = setInterval(() => {
-      writer.write(enc.encode(": keepalive\n\n")).catch(() => {});
-    }, 10000);
+  let clientGone = false;
+  const send = (obj) => {
+    if (clientGone) return Promise.resolve();
+    return writer.write(enc.encode(`data: ${JSON.stringify(obj)}\n\n`)).catch(() => { clientGone = true; });
+  };
+
+  let content = '', reasoning = '';
+  // While resuming we hold the first RESUME_SCAN_CHARS back so we can dedupe the seam.
+  let headBuf = null;
+  let skipChars = 0;   // characters of a restarted reply still to be dropped
+
+  async function pushText(chunk) {
+    if (skipChars > 0) {
+      if (chunk.length <= skipChars) { skipChars -= chunk.length; return; }
+      chunk = chunk.slice(skipChars);
+      skipChars = 0;
+    }
+    if (headBuf !== null) {
+      headBuf += chunk;
+      if (headBuf.length < RESUME_SCAN_CHARS) return;
+      return absorbHead();
+    }
+    content += chunk;
+    return send({ chunk });
+  }
+
+  // Decides what to do with the opening of a resumed reply.
+  async function absorbHead() {
+    const head = headBuf;
+    headBuf = null;
+    if (!head) return;
+
+    // Case 1: the model ignored "continue" and started the reply over. Skip
+    // ahead to the point we had already reached instead of duplicating it.
+    if (head.length >= 60) {
+      if (content.startsWith(head)) { skipChars = content.length - head.length; return; }
+      if (head.startsWith(content)) {
+        const rest = head.slice(content.length);
+        if (!rest) return;
+        content += rest;
+        return send({ chunk: rest });
+      }
+    }
+
+    // Case 2: it repeated only the tail before carrying on.
+    const merged = stripOverlap(content, head);
+    if (!merged) return;
+    content += merged;
+    return send({ chunk: merged });
+  }
+
+  async function flushHead() {
+    if (headBuf === null) return;
+    return absorbHead();
+  }
+
+  // Reads one upstream SSE stream. Returns true when the provider signalled a
+  // proper finish, false when the socket ended early.
+  async function pump(rawStream) {
+    const reader = rawStream.getReader();
+    const dec = new TextDecoder();
+    let buffer = '', finished = false, sawBytes = false;
 
     try {
       while (true) {
-        const { done, value } = await reader.read();
-        
-        if (value) {
-          buffer += dec.decode(value, { stream: true });
-        }
-        // Finalize TextDecoder if the stream is done
-        if (done) {
-          buffer += dec.decode(); 
-        }
+        const { done, value } = await readWithTimeout(reader, sawBytes ? STREAM_STALL_MS : STREAM_FIRST_BYTE_MS);
+        if (value) { sawBytes = true; buffer += dec.decode(value, { stream: true }); }
+        if (done)  buffer += dec.decode();
 
-        let lines = buffer.split('\n');
-        
-        // 2. BUFFER FIX: Only pop the last incomplete line if the stream isn't finished yet
-        if (!done) {
-          buffer = lines.pop(); 
-        } else {
-          buffer = ''; 
-        }
+        const lines = buffer.split('\n');
+        buffer = done ? '' : lines.pop();
 
         for (let line of lines) {
           line = line.trim();
           if (!line.startsWith('data:')) continue;
           const dataStr = line.slice(5).trim();
-if (!dataStr) continue; // Remove the [DONE] check from here
-          
-          // ADD THIS BLOCK: Track if the stream finished naturally
-          if (dataStr === '[DONE]') {
-             receivedDone = true;
-             continue;
-          }
+          if (!dataStr) continue;
+          if (dataStr === '[DONE]') { finished = true; continue; }
 
           try {
             const parsed = JSON.parse(dataStr);
-            
-            // ADD THIS: Alternative finish indicators used by some providers
-            if (parsed.done || parsed.choices?.[0]?.finish_reason) {
-                receivedDone = true;
-            }
-            let textChunk = '', reasoningChunk = '';
-            
-            // Cloudflare v1/chat/completions now uses standard OpenAI delta format
+            // Providers disagree on how they signal completion.
+            if (parsed.done || parsed.choices?.[0]?.finish_reason) finished = true;
+
             const delta = parsed.choices?.[0]?.delta ?? {};
-            textChunk = delta.content ?? '';
-            reasoningChunk = delta.reasoning ?? '';
+            const reasoningChunk = delta.reasoning ?? '';
+            const textChunk      = delta.content   ?? '';
             if (reasoningChunk) {
-              fullReasoning += reasoningChunk;
-              await writer.write(enc.encode(`data: ${JSON.stringify({ reasoning: reasoningChunk })}\n\n`));
+              reasoning += reasoningChunk;
+              await send({ reasoning: reasoningChunk });
             }
-            if (textChunk) {
-              fullContent += textChunk;
-              await writer.write(enc.encode(`data: ${JSON.stringify({ chunk: textChunk })}\n\n`));
-            }
+            if (textChunk) await pushText(textChunk);
           } catch { /* malformed chunk */ }
         }
 
-        // 3. THE MISSING BREAK: Stop the loop so we can move to the 'finally' block and save!
-if (done) {
-            // ADD THIS: Force an error if it stopped abruptly
-            if (!receivedDone) hasError = true;
-            break;
-        }
+        if (done) break;
       }
-    } catch (e) {
-      hasError = true;
-      await writer.write(enc.encode(`data: ${JSON.stringify({ error: e.message })}\n\n`));
     } finally {
-      clearInterval(keepAliveTimer); // Clean up the timer!
-      
-// Normalize <thought> tags (used by some Gemma/Gemini models) to <think> before saving
-      const normalizedContent = fullContent
+      await flushHead();
+      try { reader.cancel(); } catch { /* already closed */ }
+    }
+    return finished;
+  }
+
+  async function run() {
+    let clean = false;
+    let lastErr = null;
+
+    // Comment frames keep intermediaries (and mobile networks) from treating a
+    // long "thinking" pause as an idle connection and tearing it down.
+    const keepAlive = setInterval(() => {
+      if (clientGone) return;
+      writer.write(enc.encode(': ka\n\n')).catch(() => { clientGone = true; });
+    }, 10_000);
+
+    try {
+      for (let attempt = 0; attempt <= STREAM_MAX_RESUMES; attempt++) {
+        const lengthBefore = content.length;
+        let raw;
+        try {
+          raw = await openStream(attempt === 0 ? null : content);
+        } catch (e) {
+          lastErr = e;
+          if (attempt === 0) break;      // never even connected; nothing to resume
+          continue;
+        }
+        if (!raw) { lastErr = lastErr ?? new Error('Upstream returned no stream'); continue; }
+
+        if (attempt > 0) {
+          headBuf = '';                  // dedupe the seam of the resumed reply
+          await send({ resumed: true });
+        }
+
+        try {
+          if (await pump(raw)) { clean = true; break; }
+          lastErr = new Error('Upstream closed the stream before finishing');
+          // No finish marker, but the text reads as complete: accept it rather
+          // than spending two more requests on a provider that just never
+          // sends [DONE].
+          if (!looksTruncated(content)) { clean = true; break; }
+        } catch (e) {
+          lastErr = e;
+        }
+
+        // A resume that produced nothing means the model has nothing left to
+        // add - stop retrying rather than burning attempts on empty replies.
+        if (attempt > 0 && content.length === lengthBefore) break;
+      }
+    } finally {
+      clearInterval(keepAlive);
+
+      const normalized = content
         .replace(/<thought>/gi, '<think>')
         .replace(/<\/thought>/gi, '</think>');
-      const finalOutput = fullReasoning
-        ? `<think>\n${fullReasoning}\n</think>\n\n${normalizedContent}`
-        : normalizedContent;
-        
-      // THIS is where the save happens. It was being blocked by the infinite loop.
-      const meta = await dbSaverCallback(finalOutput, hasError);
-      
-      // Ensure the frontend doesn't finalize a broken stream
-      if (!hasError) {
-        await writer.write(enc.encode(`data: ${JSON.stringify({ done: true, ...meta })}\n\n`));
+      const finalOutput = reasoning
+        ? `<think>\n${reasoning}\n</think>\n\n${normalized}`
+        : normalized;
+
+      // Only a reply with zero text is a hard failure. Anything else gets saved.
+      const hardError = !clean && normalized.trim().length === 0;
+      const partial   = !clean && !hardError;
+
+      let meta = {};
+      try {
+        meta = (await onFinish(finalOutput, hardError, partial)) ?? {};
+      } catch (e) {
+        lastErr = e;
+        if (!hardError) await send({ warning: 'Reply received but could not be saved: ' + e.message });
       }
-      await writer.close();
+
+      if (hardError) {
+        await send({ error: lastErr?.message || 'Upstream connection failed' });
+      } else {
+        await send({ done: true, partial, ...meta });
+      }
+      await writer.close().catch(() => {});
     }
   }
-  run();
-  return readable;
+
+  return { readable, done: run() };
 }
 
 // ── MAIN ROUTER ──────────────────────────────────────────────────────
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (!env.DB) {
       return new Response('D1 database binding "DB" not found. Check your Cloudflare settings.', { status: 500 });
     }
@@ -539,8 +883,8 @@ export default {
     const url    = new URL(request.url);
     const action = url.searchParams.get('action');
 
-    // Run Auto-Setup check on every request
-    await checkAndInitDB(db);
+    // Schema check is memoised per isolate (see ensureSchema).
+    await ensureSchema(db);
 
     let body = {};
     if (request.method === 'POST') {
@@ -553,10 +897,27 @@ export default {
     }
 
     if (!action) {
-      const first = await db.all('SELECT id FROM users LIMIT 1');
-      const needsSetup = first.length === 0;
-      const html = needsSetup ? getSetupHTML() : getAppHTML();
-      return new Response(html, { headers: { 'Content-Type': 'text/html;charset=utf-8', ...SECURITY_HEADERS } });
+      // The shell is static, so repeat visits can be answered with a 304
+      // instead of re-sending ~180 KB of HTML. Only the "users exist" result is
+      // cached (it never goes back to false), so pre-setup stays correct.
+      if (!_hasUsers) _hasUsers = (await db.all('SELECT id FROM users LIMIT 1')).length > 0;
+
+      const etag = `W/"${_hasUsers ? 'app' : 'setup'}-${APP_BUILD}"`;
+      if (request.headers.get('If-None-Match') === etag) {
+        return new Response(null, { status: 304, headers: { 'ETag': etag, 'Cache-Control': HTML_CACHE_CONTROL } });
+      }
+      // Build the string once per isolate rather than once per request.
+      if (_hasUsers) _appHTML ??= getAppHTML();
+      else           _setupHTML ??= getSetupHTML();
+
+      return new Response(_hasUsers ? _appHTML : _setupHTML, {
+        headers: {
+          'Content-Type':  'text/html;charset=utf-8',
+          'ETag':          etag,
+          'Cache-Control': HTML_CACHE_CONTROL,
+          ...SECURITY_HEADERS,
+        },
+      });
     }
 
     // ── SETUP ────────────────────────────────────────────────────
@@ -574,6 +935,7 @@ export default {
       const { hash, salt } = await pbkdf2(password);
       const userId = generateId();
       await db.insert('users', { id: userId, username, password_hash: hash, salt, created_at: Date.now() });
+      _hasUsers = true;
 
       const personaId = generateId();
       await db.insert('personas', {
@@ -658,7 +1020,7 @@ case 'branchChat': {
           await db.insert('chat_sessions', { id: newSessionId, label: newLabel, persona_id: curSess?.persona_id ?? null, created_at: Date.now() });
 
           // 2. Clone memory state rules (but reset the current summary)
-          const mem = await getMem(sid, db);
+          const mem = await getMem(sid, db, ctx);
           await db.insert('memory_state', {
             id: generateId(), session_id: newSessionId, summarize_threshold: mem.summarize_threshold,
             summarize_count: mem.summarize_count, context_count: mem.context_count,
@@ -695,10 +1057,54 @@ case 'logout': {
           });
         }
 
+        case 'bootstrap': {
+          // Everything the app needs at boot in ONE http request and three
+          // batched D1 round trips. It used to be four separate requests, one
+          // of which fanned out into ~50 sequential per-message queries.
+          const [memOwn, memGlobal, personasRes, sessionsRes, curSessRes, userRes, pinsRes, genRes] = await db.d1.batch([
+            db.d1.prepare('SELECT * FROM memory_state WHERE session_id = ? LIMIT 1').bind(sid),
+            db.d1.prepare('SELECT * FROM memory_state WHERE session_id = ? LIMIT 1').bind('global'),
+            db.d1.prepare('SELECT * FROM personas ORDER BY id'),
+            db.d1.prepare('SELECT id, label, persona_id, created_at FROM chat_sessions ORDER BY created_at'),
+            db.d1.prepare('SELECT * FROM chat_sessions WHERE id = ? LIMIT 1').bind(sid),
+            db.d1.prepare('SELECT username FROM users WHERE id = ? LIMIT 1').bind(userId),
+            db.d1.prepare('SELECT * FROM sketchboard WHERE session_id = ? ORDER BY created_at DESC').bind(sid),
+            db.d1.prepare('SELECT * FROM gen_settings WHERE id = ? LIMIT 1').bind('global'),
+          ]);
+
+          let mem = memOwn.results?.[0];
+          if (!mem) {
+            mem = newMemRow(sid, memGlobal.results?.[0]);
+            await persistMemRow(db, mem, ctx);
+          }
+
+          const personas = personasRes.results ?? [];
+          const curSess  = curSessRes.results?.[0] ?? null;
+          const limit    = Math.max(10, Math.min(mem.history_fetch_count ?? 50, 200));
+          const page     = await fetchHistoryPage(db, sid, limit, 0);
+
+          return jsonResponse({
+            personas,
+            current_persona_id: curSess?.persona_id ?? (personas[0]?.id ?? null),
+            memory:             mem,
+            csrf_token:         sessionDoc.csrf_token,
+            session_id:         sid,
+            sessions:           sessionsRes.results ?? [],
+            username:           userRes.results?.[0]?.username ?? '',
+            messages:           page.messages,
+            has_more:           page.has_more,
+            pins:               pinsRes.results ?? [],
+            sketchboard_active: mem.sketchboard_active ?? 1,
+            session_missing:    !curSess,
+            gen:                resolveGen(genRes.results?.[0]),
+            gen_custom:         rawGen(genRes.results?.[0]),
+          });
+        }
+
         case 'getInitData': {
           const [personas, mem, sessions, curSess, user] = await Promise.all([
             db.all('SELECT * FROM personas ORDER BY id'),
-            getMem(sid, db),
+            getMem(sid, db, ctx),
             db.all('SELECT * FROM chat_sessions ORDER BY created_at'),
             db.findOne('chat_sessions', { id: sid }),
             db.findOne('users', { id: userId }),
@@ -720,16 +1126,18 @@ case 'logout': {
           const userTs = Date.now();
           const userMsgId = generateId();
 
-          const [ctxMsgs, apiKeys] = await Promise.all([
-            buildCtx(sid, content, db),
-            db.all('SELECT * FROM api_keys'),
+          const [built, cfg] = await Promise.all([
+            buildCtx(sid, content, db, null, ctx),
+            loadKeysAndGen(db),
           ]);
+          const { msgs: ctxMsgs, mem } = built;
+          const { apiKeys, gen } = cfg;
 
-let provider, stream;
+          // Open the upstream stream up front so a hard provider failure still
+          // comes back as a normal JSON error the UI can render.
+          let firstStream;
           try {
-            const res = await executeLLM(apiKeys, ctxMsgs, 'chat', thinkingEffort, true, request.signal);
-            provider = res.provider;
-            stream = res.stream;
+            firstStream = (await executeLLM(apiKeys, ctxMsgs, 'chat', thinkingEffort, true, null, gen)).stream;
           } catch (e) {
             // GEMINI DEBUG: if this was a Gemini failure, persist the real error as chat history
             if (e.isGeminiDebug) {
@@ -737,19 +1145,14 @@ let provider, stream;
               const groupId = 'g_' + generateId();
               let botTs = Date.now();
               if (botTs <= userTs) botTs = userTs + 1;
+              const errText = '\u26a0\ufe0f **Gemini API Error**\n\n```\n' + e.message + '\n```';
 
-              // Save the user's message so the conversation stays intact
-              await db.insert('chat_history', {
-                id: userMsgId, session_id: sid, group_id: 'g_' + generateId(),
-                is_main: 1, role: 'user', content, timestamp: userTs,
-              });
-
-              // Save the Gemini error as a bot message, wrapped in a code block for readability
-              const errText = '⚠️ **Gemini API Error**\n\n```\n' + e.message + '\n```';
-              await db.insert('chat_history', {
-                id: botId, session_id: sid, group_id: groupId,
-                is_main: 1, role: 'bot', content: errText, timestamp: botTs,
-              });
+              await db.d1.batch([
+                db.d1.prepare('INSERT INTO chat_history (id, session_id, group_id, is_main, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)')
+                  .bind(userMsgId, sid, 'g_' + generateId(), 1, 'user', content, userTs),
+                db.d1.prepare('INSERT INTO chat_history (id, session_id, group_id, is_main, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)')
+                  .bind(botId, sid, groupId, 1, 'bot', errText, botTs),
+              ]);
 
               return jsonResponse({
                 gemini_error: true,
@@ -759,98 +1162,122 @@ let provider, stream;
                 content: errText,
               });
             }
-            // All other providers: behave exactly as before
-            await db.delete('chat_history', { id: userMsgId });
             return errResponse(e.message, 500);
           }
 
-const unifiedStream = createUnifiedStream(stream, provider, async (finalText, hasError) => {
-            if (hasError) {
-              // We don't need to delete anything anymore because we haven't saved it yet!
-              return {};
+          // Called once with null, then again for each reconnect attempt after
+          // a mid-reply drop. On a reconnect we hand the model what it already
+          // produced and ask it to carry on from there.
+          const openStream = async (partial) => {
+            if (!partial) {
+              if (firstStream) { const s = firstStream; firstStream = null; return s; }
+              return (await executeLLM(apiKeys, ctxMsgs, 'chat', thinkingEffort, true, null, gen)).stream;
             }
-            const botId   = generateId();
-            const groupId = 'g_' + generateId();
-            
-            // Guarantee chronological order safely 
-            let botTs = Date.now();
-            if (botTs <= userTs) botTs = userTs + 1;
-            
-            // ADDED: Save user message HERE instead
-            await db.insert('chat_history', {
-              id: userMsgId, session_id: sid, group_id: 'g_' + generateId(),
-              is_main: 1, role: 'user', content, timestamp: userTs,
-            });
+            const resumeMsgs = [
+              ...ctxMsgs,
+              { role: 'assistant', content: partial },
+              { role: 'user', content: CONTINUE_PROMPT },
+            ];
+            return (await executeLLM(apiKeys, resumeMsgs, 'chat', thinkingEffort, true, null, gen)).stream;
+          };
 
-            // Save bot message (unchanged)
-            await db.insert('chat_history', {
-              id: botId, session_id: sid, group_id: groupId,
-              is_main: 1, role: 'bot', content: finalText, timestamp: botTs,
-            });
-            const mem    = await getMem(sid, db);
-            const lastTs = mem.last_summarized_timestamp ?? 0;
-            const row    = await db.get(
-              'SELECT COUNT(*) as c FROM chat_history WHERE session_id = ? AND is_main = 1 AND timestamp > ?',
-              [sid, lastTs]
-            );
-            const shouldSummarize = (row?.c ?? 0) >= (mem.summarize_threshold ?? 50);
-            return { user_id: userMsgId, bot_id: botId, group_id: groupId, should_summarize: shouldSummarize };
-          });
+          const { readable, done } = createUnifiedStream({
+            openStream,
+            onFinish: async (finalText, hardError) => {
+              if (hardError) return {};   // nothing was written, so nothing to clean up
 
-// Replace inside BOTH 'sendMessage' and 'regenerate'
-          return new Response(unifiedStream, {
-            headers: { 
-              'Content-Type': 'text/event-stream', 
-              'Cache-Control': 'no-cache, no-transform', 
-              'Connection': 'keep-alive',       // Prevents connection timeouts
-              'X-Accel-Buffering': 'no',        // Tells proxies NOT to buffer the stream
-              ...SECURITY_HEADERS 
+              const botId   = generateId();
+              const groupId = 'g_' + generateId();
+              // Guarantee chronological order safely
+              let botTs = Date.now();
+              if (botTs <= userTs) botTs = userTs + 1;
+              const lastTs = mem.last_summarized_timestamp ?? 0;
+
+              // Both inserts and the summarize counter in a single round trip.
+              const res = await db.d1.batch([
+                db.d1.prepare('INSERT INTO chat_history (id, session_id, group_id, is_main, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)')
+                  .bind(userMsgId, sid, 'g_' + generateId(), 1, 'user', content, userTs),
+                db.d1.prepare('INSERT INTO chat_history (id, session_id, group_id, is_main, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)')
+                  .bind(botId, sid, groupId, 1, 'bot', finalText, botTs),
+                db.d1.prepare('SELECT COUNT(*) AS c FROM chat_history WHERE session_id = ? AND is_main = 1 AND timestamp > ?')
+                  .bind(sid, lastTs),
+              ]);
+
+              const seen = res[2].results?.[0]?.c ?? 0;
+              return {
+                user_id: userMsgId,
+                bot_id: botId,
+                group_id: groupId,
+                should_summarize: seen >= (mem.summarize_threshold ?? 50),
+              };
             },
           });
+
+          // Keep draining and saving even if the browser drops the connection,
+          // so a flaky client never costs the user a generated reply.
+          ctx?.waitUntil?.(done);
+
+          return new Response(readable, { headers: SSE_HEADERS });
         }
 
         case 'regenerate': {
           const groupId = str(body.group_id, 100);
           if (!groupId) return errResponse('Invalid group_id');
           const oldMsg = await db.get('SELECT * FROM chat_history WHERE group_id = ? AND is_main = 1 LIMIT 1', [groupId]);
-          if (!oldMsg)              return errResponse('Not found', 404);
+          if (!oldMsg)                   return errResponse('Not found', 404);
           if (oldMsg.session_id !== sid) return errResponse('Forbidden', 403);
 
-          const [ctxMsgs, apiKeys] = await Promise.all([
-            buildCtx(oldMsg.session_id, null, db, oldMsg.timestamp),
-            db.all('SELECT * FROM api_keys'),
+          const [built, cfg] = await Promise.all([
+            buildCtx(oldMsg.session_id, null, db, oldMsg.timestamp, ctx),
+            loadKeysAndGen(db),
           ]);
-          
-          let provider, stream;
+          const ctxMsgs = built.msgs;
+          const { apiKeys, gen } = cfg;
+
+          let firstStream;
           try {
-            const res = await executeLLM(apiKeys, ctxMsgs, 'chat', 'none', true, request.signal);
-            provider = res.provider;
-            stream = res.stream;
+            firstStream = (await executeLLM(apiKeys, ctxMsgs, 'chat', 'none', true, null, gen)).stream;
           } catch (e) {
             return errResponse(e.message, 500);
           }
 
-          const unifiedStream = createUnifiedStream(stream, provider, async (finalText, hasError) => {
-            if (hasError) return {}; // Do not replace variant if stream fails at all
-            await db.run('UPDATE chat_history SET is_main = 0 WHERE group_id = ?', [groupId]);
-            const botId = generateId();
-            await db.insert('chat_history', {
-              id: botId, session_id: oldMsg.session_id,
-              group_id: groupId, is_main: 1, role: 'bot', content: finalText, 
-              timestamp: oldMsg.timestamp, // Reuse old timestamp to prevent context jumping!
-            });
-            return { bot_id: botId, content: finalText };
+          const openStream = async (partial) => {
+            if (!partial) {
+              if (firstStream) { const s = firstStream; firstStream = null; return s; }
+              return (await executeLLM(apiKeys, ctxMsgs, 'chat', 'none', true, null, gen)).stream;
+            }
+            const resumeMsgs = [
+              ...ctxMsgs,
+              { role: 'assistant', content: partial },
+              { role: 'user', content: CONTINUE_PROMPT },
+            ];
+            return (await executeLLM(apiKeys, resumeMsgs, 'chat', 'none', true, null, gen)).stream;
+          };
+
+          const { readable, done } = createUnifiedStream({
+            openStream,
+            onFinish: async (finalText, hardError) => {
+              if (hardError) return {};   // keep the existing variant untouched
+              const botId = generateId();
+              await db.d1.batch([
+                db.d1.prepare('UPDATE chat_history SET is_main = 0 WHERE group_id = ?').bind(groupId),
+                db.d1.prepare('INSERT INTO chat_history (id, session_id, group_id, is_main, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)')
+                  // Reuse the old timestamp to prevent context jumping.
+                  .bind(botId, oldMsg.session_id, groupId, 1, 'bot', finalText, oldMsg.timestamp),
+              ]);
+              return { bot_id: botId, content: finalText };
+            },
           });
 
-          return new Response(unifiedStream, {
-            headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', ...SECURITY_HEADERS },
-          });
+          ctx?.waitUntil?.(done);
+
+          return new Response(readable, { headers: SSE_HEADERS });
         }
 
         case 'triggerSummarize': {
           const [apiKeys, mem] = await Promise.all([
             db.all('SELECT * FROM api_keys'),
-            getMem(sid, db),
+            getMem(sid, db, ctx),
           ]);
           const cnt    = Math.max(1, Math.min(mem.summarize_count ?? 30, 200));
           const lastTs = mem.last_summarized_timestamp ?? 0;
@@ -881,7 +1308,9 @@ const unifiedStream = createUnifiedStream(stream, provider, async (finalText, ha
           
           let resultText;
           try {
-            resultText = await executeLLM(apiKeys, messages, 'summarize', 'none', false, request.signal);
+            // No client signal: a summary that is already running should finish and be
+            // saved even if the user navigates away mid-request.
+            resultText = await executeLLM(apiKeys, messages, 'summarize', 'none', false, null);
           } catch (e) {
             return errResponse(e.message, 500);
           }
@@ -895,36 +1324,10 @@ const unifiedStream = createUnifiedStream(stream, provider, async (finalText, ha
         }
 
         case 'getChatHistory': {
-          const mem      = await getMem(sid, db);
+          const mem      = await getMem(sid, db, ctx);
           const limit    = Math.max(10, Math.min(mem.history_fetch_count ?? 50, 200));
           const beforeTs = parseInt(url.searchParams.get('before_timestamp') ?? '0', 10);
-
-          const rows = beforeTs > 0
-            ? await db.all('SELECT * FROM chat_history WHERE session_id = ? AND is_main = 1 AND timestamp < ? ORDER BY timestamp DESC LIMIT ?', [sid, beforeTs, limit])
-            : await db.all('SELECT * FROM chat_history WHERE session_id = ? AND is_main = 1 ORDER BY timestamp DESC LIMIT ?', [sid, limit]);
-
-          rows.reverse();
-          const result = [];
-          for (const msg of rows) {
-            if (msg.role === 'bot') {
-              const vars = await db.all('SELECT * FROM chat_history WHERE group_id = ? ORDER BY timestamp', [msg.group_id]);
-              let ai = 0;
-              vars.forEach((v, i) => { if (v.is_main === 1) ai = i; });
-              msg.variants     = vars.map(v => v.content);
-              msg.variant_ids  = vars.map(v => v.id);
-              msg.active_index = ai;
-              msg.id           = vars[ai]?.id ?? msg.id;
-            }
-            result.push(msg);
-          }
-
-          let hasMore = false;
-          if (rows.length > 0) {
-            const oldest = rows[0].timestamp;
-            const more   = await db.all('SELECT id FROM chat_history WHERE session_id = ? AND is_main = 1 AND timestamp < ? LIMIT 1', [sid, oldest]);
-            hasMore = more.length > 0;
-          }
-          return jsonResponse({ messages: result, has_more: hasMore });
+          return jsonResponse(await fetchHistoryPage(db, sid, limit, beforeTs));
         }
 
         case 'setMainVariant': {
@@ -1109,6 +1512,21 @@ case 'testKey': {
           return jsonResponse({ success: true });
         }
 
+        case 'updateGenSettings': {
+          const g = body.gen;
+          if (typeof g !== 'object' || !g) return errResponse('Invalid settings');
+          const preset = GEN_PRESET_NAMES.includes(g.preset) ? g.preset : 'default';
+          // The numbers are always stored, whichever preset is active, so
+          // switching back to Custom restores what the user last dialled in.
+          const row = { id: 'global', preset, ...rawGen(g), updated_at: Date.now() };
+          const keys = Object.keys(row);
+          await db.run(
+            `INSERT OR REPLACE INTO gen_settings (${keys.join(', ')}) VALUES (${keys.map(() => '?').join(', ')})`,
+            keys.map(k => row[k])
+          );
+          return jsonResponse({ success: true, gen: resolveGen(row), gen_custom: rawGen(row) });
+        }
+
         case 'updateMemoryConfig': {
           const m = body.memory;
           if (typeof m !== 'object' || !m) return errResponse('Invalid memory config');
@@ -1160,7 +1578,7 @@ case 'testKey': {
           if (op === 'list') {
             const [pins, mem] = await Promise.all([
               db.all('SELECT * FROM sketchboard WHERE session_id = ? ORDER BY created_at DESC', [sid]),
-              getMem(sid, db),
+              getMem(sid, db, ctx),
             ]);
             return jsonResponse({ pins, global_active: mem.sketchboard_active ?? 1 });
           }
@@ -1321,7 +1739,7 @@ function getAppHTML() {
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
 <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked-katex-extension@5.0.0/lib/index.umd.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
 <script>tailwind.config={darkMode:'class',theme:{extend:{fontFamily:{sans:['Instrument Sans','-apple-system','sans-serif']},animation:{'pulse-slow':'pulse 3s cubic-bezier(0.4,0,0.6,1) infinite','slide-up':'slideUp .25s ease-out forwards'},keyframes:{slideUp:{'0%':{transform:'translateY(6px)',opacity:'0'},'100%':{transform:'translateY(0)',opacity:'1'}}}}}}</script>
 <style>
 ::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#e5e5e5;border-radius:10px}.dark ::-webkit-scrollbar-thumb{background:#404040}
@@ -1336,6 +1754,10 @@ function getAppHTML() {
 .msg-content strong{font-weight:600}.msg-content ul{list-style-type:disc;padding-left:1.5em;margin-bottom:.5em}.msg-content ol{list-style-type:decimal;padding-left:1.5em;margin-bottom:.5em}
 .msg-content h1,.msg-content h2,.msg-content h3{font-weight:700;margin:.6em 0 .3em}
 .msg-content table{border-collapse:collapse;width:100%;margin:.5em 0}.msg-content th,.msg-content td{border:1px solid #ccc;padding:.3em .6em}.dark .msg-content th,.dark .msg-content td{border-color:#444}
+/* Sandbox AI-generated HTML inside the bubble: even a stray position:absolute/fixed
+   or oversized element in the sanitized output stays clipped here instead of covering the page. */
+.msg-content{position:relative;overflow:hidden}
+.msg-content img{max-width:100%;height:auto}
 </style>
 </head>
 <body class="bg-white dark:bg-black text-black dark:text-white font-sans h-[100dvh] flex overflow-hidden transition-colors duration-300" onclick="closeAllDropdowns()">
@@ -1378,6 +1800,7 @@ function getAppHTML() {
       <button onclick="openModal('persona-modal');closeSidebarOnMobile()" class="w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"><i data-lucide="users" class="w-4 h-4"></i><span>Personas & Prompts</span></button>
       <button onclick="openModal('memory-modal');closeSidebarOnMobile()" class="w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"><i data-lucide="brain" class="w-4 h-4"></i><span>Memory Rules</span></button>
       <button onclick="openModal('keys-modal');closeSidebarOnMobile()" class="w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"><i data-lucide="key" class="w-4 h-4"></i><span>API Endpoints</span></button>
+      <button onclick="openModal('advanced-modal');closeSidebarOnMobile()" class="w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"><i data-lucide="sliders-horizontal" class="w-4 h-4"></i><span>Advanced AI</span></button>
       <button onclick="openModal('sync-modal');closeSidebarOnMobile()" class="w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"><i data-lucide="refresh-cw" class="w-4 h-4"></i><span>Data Sync</span></button>
       <button onclick="toggleTheme()" class="w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"><i data-lucide="moon" id="theme-icon" class="w-4 h-4"></i><span>Toggle Theme</span></button>
     </nav>
@@ -1568,6 +1991,88 @@ function getAppHTML() {
       <button onclick="saveMemorySettings()" class="w-full sm:w-auto bg-black dark:bg-white text-white dark:text-black px-4 py-2 rounded-md text-sm font-medium hover:opacity-80">Apply Rules</button>
     </div>
   </div>
+  <!-- Advanced AI Settings -->
+  <div id="advanced-modal" class="modal-content bg-white dark:bg-[#0a0a0a] w-[calc(100%-1rem)] max-w-2xl rounded-xl shadow-2xl border border-gray-200 dark:border-gray-800 hf flex flex-col max-h-[95vh]" onclick="event.stopPropagation()">
+    <div class="px-4 sm:px-6 py-4 border-b border-gray-200 dark:border-gray-800 flex justify-between items-center bg-gray-50 dark:bg-[#111]">
+      <div>
+        <h3 class="font-semibold text-base sm:text-lg">Advanced AI Settings</h3>
+        <p class="text-xs text-gray-500 mt-0.5">Global &mdash; applies to every API endpoint</p>
+      </div>
+      <button onclick="closeModals()" class="text-gray-500 hover:text-black dark:hover:text-white"><i data-lucide="x" class="w-5 h-5"></i></button>
+    </div>
+    <div class="p-4 sm:p-6 space-y-6 overflow-y-auto">
+      <div>
+        <label class="block text-xs font-medium text-gray-500 mb-2">Preset</label>
+        <div id="gen-presets" class="grid grid-cols-1 sm:grid-cols-2 gap-2"></div>
+      </div>
+      <div class="space-y-4 pt-1 border-t border-gray-200 dark:border-gray-800">
+        <div class="flex justify-between items-center pt-4">
+          <label class="text-xs font-medium text-gray-500">Parameters</label>
+          <span id="gen-custom-hint" class="text-[10px] text-amber-600 dark:text-amber-400">Choose Custom to edit these</span>
+        </div>
+      <div>
+        <div class="flex justify-between items-center mb-1">
+          <label class="text-xs font-medium text-gray-700 dark:text-gray-300">Temperature</label>
+          <span id="genv-temperature" class="text-xs font-mono text-gray-500">-</span>
+        </div>
+        <input type="range" id="gen-temperature" min="0" max="2" step="0.05" oninput="onGenInput('temperature')" class="w-full accent-black dark:accent-white cursor-pointer">
+        <p class="text-[10px] text-gray-400 mt-1">Randomness. Low sticks to the prompt, high is more inventive.</p>
+      </div>
+      <div>
+        <div class="flex justify-between items-center mb-1">
+          <label class="text-xs font-medium text-gray-700 dark:text-gray-300">Top P</label>
+          <span id="genv-top_p" class="text-xs font-mono text-gray-500">-</span>
+        </div>
+        <input type="range" id="gen-top_p" min="0" max="1" step="0.05" oninput="onGenInput('top_p')" class="w-full accent-black dark:accent-white cursor-pointer">
+        <p class="text-[10px] text-gray-400 mt-1">Nucleus sampling. Lower narrows the pool of candidate words.</p>
+      </div>
+      <div>
+        <div class="flex justify-between items-center mb-1">
+          <label class="text-xs font-medium text-gray-700 dark:text-gray-300">Presence Penalty</label>
+          <span id="genv-presence_penalty" class="text-xs font-mono text-gray-500">-</span>
+        </div>
+        <input type="range" id="gen-presence_penalty" min="-2" max="2" step="0.05" oninput="onGenInput('presence_penalty')" class="w-full accent-black dark:accent-white cursor-pointer">
+        <p class="text-[10px] text-gray-400 mt-1">Positive values push the model toward new topics.</p>
+      </div>
+      <div>
+        <div class="flex justify-between items-center mb-1">
+          <label class="text-xs font-medium text-gray-700 dark:text-gray-300">Frequency Penalty</label>
+          <span id="genv-frequency_penalty" class="text-xs font-mono text-gray-500">-</span>
+        </div>
+        <input type="range" id="gen-frequency_penalty" min="-2" max="2" step="0.05" oninput="onGenInput('frequency_penalty')" class="w-full accent-black dark:accent-white cursor-pointer">
+        <p class="text-[10px] text-gray-400 mt-1">Positive values discourage reusing the same words.</p>
+      </div>
+      <div>
+        <div class="flex justify-between items-center mb-1">
+          <label class="text-xs font-medium text-gray-700 dark:text-gray-300">Repetition Penalty</label>
+          <span id="genv-repetition_penalty" class="text-xs font-mono text-gray-500">-</span>
+        </div>
+        <input type="range" id="gen-repetition_penalty" min="0" max="2" step="0.05" oninput="onGenInput('repetition_penalty')" class="w-full accent-black dark:accent-white cursor-pointer">
+        <p class="text-[10px] text-gray-400 mt-1">OpenRouter and custom endpoints only. 0 = off (not sent).</p>
+      </div>
+      <div>
+        <div class="flex justify-between items-center mb-1">
+          <label class="text-xs font-medium text-gray-700 dark:text-gray-300">Top K</label>
+          <span id="genv-top_k" class="text-xs font-mono text-gray-500">-</span>
+        </div>
+        <input type="range" id="gen-top_k" min="0" max="200" step="1" oninput="onGenInput('top_k')" class="w-full accent-black dark:accent-white cursor-pointer">
+        <p class="text-[10px] text-gray-400 mt-1">OpenRouter and custom endpoints only. 0 = off (not sent).</p>
+      </div>
+      <div>
+        <div class="flex justify-between items-center mb-1">
+          <label class="text-xs font-medium text-gray-700 dark:text-gray-300">Max Tokens</label>
+          <span id="genv-max_tokens" class="text-xs font-mono text-gray-500">-</span>
+        </div>
+        <input type="range" id="gen-max_tokens" min="256" max="32768" step="256" oninput="onGenInput('max_tokens')" class="w-full accent-black dark:accent-white cursor-pointer">
+        <p class="text-[10px] text-gray-400 mt-1">Longest reply the model may produce in one turn.</p>
+      </div>
+      </div>
+    </div>
+    <div class="px-4 sm:px-6 py-4 border-t border-gray-200 dark:border-gray-800 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2 bg-gray-50 dark:bg-[#111]">
+      <span class="text-[10px] text-gray-400">Summarization keeps its own fixed settings.</span>
+      <button onclick="saveGenSettings()" class="w-full sm:w-auto bg-black dark:bg-white text-white dark:text-black px-4 py-2 rounded-md text-sm font-medium hover:opacity-80">Apply Globally</button>
+    </div>
+  </div>
 
   <!-- API Keys -->
   <div id="keys-modal" class="modal-content bg-white dark:bg-[#0a0a0a] w-[calc(100%-1rem)] max-w-2xl rounded-xl shadow-2xl border border-gray-200 dark:border-gray-800 hf flex flex-col max-h-[95vh]" onclick="event.stopPropagation()">
@@ -1672,6 +2177,29 @@ function getAppHTML() {
 marked.setOptions({breaks:true,gfm:true});
 marked.use(window.markedKatex({ throwOnError: false, displayMode: true }));
 
+// Chat content comes from the AI/model and must be treated as untrusted.
+// Beyond script execution, a bare DOMPurify default profile still allows
+// <style>, <form>/<input>, and inline position:fixed/z-index styles, any of
+// which can hijack or blank out the whole page without any JS running.
+const DOMPURIFY_CONFIG = {
+    FORBID_TAGS: ['style','iframe','object','embed','form','input','button','select','textarea','base','meta','link'],
+    FORBID_ATTR: ['formaction'],
+    ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto):|[^a-z]|[a-z+.\\-]+(?:[^a-z+.\\-:]|$))/i,
+};
+DOMPurify.addHook('uponSanitizeAttribute', (node, data) => {
+    if (data.attrName === 'style') {
+        data.attrValue = data.attrValue
+            .replace(/position\\s*:\\s*fixed/gi, 'position:relative')
+            .replace(/z-index\\s*:[^;]*/gi, '');
+    }
+});
+DOMPurify.addHook('afterSanitizeAttributes', (node) => {
+    if (node.tagName === 'A' && node.hasAttribute('href')) {
+        node.setAttribute('rel', 'noopener noreferrer nofollow');
+        node.setAttribute('target', '_blank');
+    }
+});
+
 const S={
     csrf:'',username:'',session:'default',sessionLabel:'default',
     generating:false,
@@ -1682,6 +2210,7 @@ const S={
     pins:[], sketchGlobal:true,
     editingKeyId:null, editingPersonaId:null,
     thinkingEffort:'none',
+    gen:{preset:'default'}, genCustom:{},
 };
 
 const $=id=>document.getElementById(id);
@@ -1691,10 +2220,12 @@ async function api(action,data={},method='POST'){
     if(method!=='GET')o.body=JSON.stringify(data);
     try{
         const r=await fetch(\`?action=\${action}\`,o);
-        if (r.status === 401 && action !== 'login' && action !== 'getInitData') { window.location.reload(); return; }
+        if (r.status === 401 && action !== 'login' && action !== 'getInitData' && action !== 'bootstrap') { window.location.reload(); return; }
         return r.json();
     }catch{return{error:'Network error'};}
 }
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function* parseStream(response) {
     const reader = response.body.getReader();
@@ -1702,10 +2233,13 @@ async function* parseStream(response) {
     let buffer = "";
     while(true) {
         const {done, value} = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, {stream: true});
+        if (value) buffer += decoder.decode(value, {stream: true});
+        if (done)  buffer += decoder.decode();
         let lines = buffer.split('\\n');
-        buffer = lines.pop();
+        // On the final read we keep the tail instead of discarding it: a last
+        // frame that arrived without a trailing newline used to be dropped,
+        // which is exactly how the 'done' event went missing.
+        buffer = done ? '' : lines.pop();
         for(let line of lines) {
             line = line.trim();
             if(!line.startsWith('data:')) continue;
@@ -1714,7 +2248,31 @@ async function* parseStream(response) {
                 try { yield JSON.parse(payload); } catch(e) {}
             }
         }
+        if (done) break;
     }
+}
+
+// Retries the CONNECT phase only. Once bytes are flowing we never retry from
+// here - the worker reconnects to the AI provider itself and keeps the reply.
+async function streamFetch(action, payload, tries = 3) {
+    let lastErr;
+    for (let i = 0; i < tries; i++) {
+        try {
+            const resp = await fetch(\`?action=\${action}\`, {
+                method: 'POST',
+                headers: {'Content-Type':'application/json','Accept':'text/event-stream','X-CSRF-Token':S.csrf,'X-Session-Id':S.session},
+                body: JSON.stringify(payload)
+            });
+            // 5xx here means the provider never opened a stream, so nothing was
+            // written server-side and retrying cannot duplicate a message.
+            if (resp.status >= 500 && i < tries - 1) { await sleep(400 * (i + 1)); continue; }
+            return resp;
+        } catch (e) {
+            lastErr = e;
+            if (i < tries - 1) await sleep(400 * (i + 1));
+        }
+    }
+    throw lastErr || new Error('Network error');
 }
 
 function toast(msg,dur=2400){const t=$('toast');t.textContent=msg;t.classList.remove('hf');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.add('hf'),dur);}
@@ -1753,7 +2311,7 @@ function formatContent(rawText) {
         mainText = mainText.replace(/<think>([\\s\\S]*?)(?:<\\/think>|$)/i, '').trim();
     }
 
-    const parsedHtml = DOMPurify.sanitize(marked.parse(mainText));
+    const parsedHtml = DOMPurify.sanitize(marked.parse(mainText), DOMPURIFY_CONFIG);
     const tempDiv = document.createElement('div');
     tempDiv.innerHTML = parsedHtml;
 
@@ -1901,19 +2459,11 @@ ta.addEventListener('keydown', e => {
     },{passive:true});
 
     try {
-        const d = await api('getInitData',{},'GET');
+        // One request for state + history + pins. This used to be four
+        // sequential round trips (init, history, sketchboard, api keys).
+        const d = await api('bootstrap',{},'GET');
         if(d && !d.error) {
-            $('login-screen').classList.add('hf');
-            $('app').classList.remove('hf');
-            S.csrf=d.csrf_token; S.username=d.username; S.session=d.session_id;
-            S.personas=d.personas||[];
-            S.currentPersonaId = d.current_persona_id || (S.personas[0]?S.personas[0].id:null);
-            S.memory=d.memory||{}; S.sessions=d.sessions||[];
-            
-            $('sidebar-uname').textContent=S.username;
-            updateHeader(); populateMemoryForm();
-            loadApiKeys(); loadSketchboard();
-            await loadChatHistory();
+            applyBootstrap(d);
         } else {
             $('login-screen').classList.remove('hf');
         }
@@ -1921,6 +2471,29 @@ ta.addEventListener('keydown', e => {
         $('login-screen').classList.remove('hf');
     }
 });
+
+// Paints the whole app from a single bootstrap payload.
+function applyBootstrap(d){
+    $('login-screen').classList.add('hf');
+    $('app').classList.remove('hf');
+    S.csrf=d.csrf_token; S.username=d.username; S.session=d.session_id;
+    S.personas=d.personas||[];
+    S.currentPersonaId = d.current_persona_id || (S.personas[0]?S.personas[0].id:null);
+    S.memory=d.memory||{}; S.sessions=d.sessions||[];
+    S.msgs=d.messages||[]; S.hasMore=!!d.has_more;
+    S.pins=Array.isArray(d.pins)?d.pins:[];
+    S.sketchGlobal = d.sketchboard_active===undefined ? true : (d.sketchboard_active==1);
+    S.gen = d.gen || {preset:'default'};
+    S.genCustom = d.gen_custom || {};
+    const cur = S.sessions.find(function(s){return s.id===S.session;});
+    S.sessionLabel = (cur && cur.label) || S.session;
+
+    $('sidebar-uname').textContent=S.username;
+    updateHeader(); populateMemoryForm();
+    renderAllMessages(); scrollToBottom();
+    renderSketchboard();
+    // API keys and personas load lazily when their modal opens (see openModal).
+}
 
 async function doLogin(){
     const btn=$('login-btn'),err=$('login-error');
@@ -1931,21 +2504,10 @@ async function doLogin(){
         const d=await r.json();
         if(d.error){err.textContent=d.error;err.classList.remove('hf');btn.innerHTML='<span>Sign In</span>';return;}
         
-        const initD = await fetch('?action=getInitData',{headers:{'X-Session-Id':S.session}}).then(x=>x.json());
+        const initD = await fetch('?action=bootstrap',{headers:{'X-Session-Id':S.session}}).then(x=>x.json());
         if(!initD || initD.error) throw new Error('Init failed');
-        
-        $('login-screen').classList.add('hf');
-        $('app').classList.remove('hf');
-        S.csrf=initD.csrf_token;S.session=initD.session_id;
-        S.personas=initD.personas||[];
-        S.currentPersonaId = initD.current_persona_id || (S.personas[0]?S.personas[0].id:null);
-        S.memory=initD.memory||{};S.sessions=initD.sessions||[];
-        $('sidebar-uname').textContent=initD.username;
-        S.username = initD.username;
-        
-        updateHeader(); populateMemoryForm();
-        loadApiKeys(); loadSketchboard();
-        await loadChatHistory();
+
+        applyBootstrap(initD);
         setThinkingEffort('none');
     }catch{err.textContent='Connection error.';err.classList.remove('hf');btn.innerHTML='<span>Sign In</span>';}
 }
@@ -2082,12 +2644,12 @@ async function handleSend(){
     if(typing)typing.innerHTML='<span class="flex items-center space-x-2"><svg class="animate-spin w-4 h-4 text-gray-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-9-9"/></svg><span class="text-xs text-gray-400">Imagine about the scenes...</span></span>';
     if(!S.userScrolled)scrollToBottom();
 
+    // Tracked so a broken stream never silently discards a reply the server
+    // already persisted.
+    let gotDone = false, gotAnyText = false;
+
     try {
-const resp = await fetch('?action=sendMessage', {
-            method: 'POST',
-            headers: {'Content-Type':'application/json','Accept': 'text/event-stream','X-CSRF-Token':S.csrf,'X-Session-Id':S.session},
-            body: JSON.stringify({content:txt, thinking_effort:S.thinkingEffort})
-        });
+        const resp = await streamFetch('sendMessage', {content:txt, thinking_effort:S.thinkingEffort});
 
         if (!resp.ok) {
             const errJson = await resp.json();
@@ -2136,8 +2698,10 @@ const resp = await fetch('?action=sendMessage', {
 
 for await (const data of parseStream(resp)) {
             if (data.error) throw new Error(data.error);
+            if (data.warning) toast(data.warning, 6000);
+            if (data.resumed) toast('Reconnected — continuing the reply…', 2500);
             if (data.reasoning) fullReasoning += data.reasoning;
-            if (data.chunk) fullText += data.chunk;
+            if (data.chunk) { fullText += data.chunk; gotAnyText = true; }
 
             const _now = performance.now();
             if (data.done || _now - lastRender > 90) {
@@ -2153,6 +2717,8 @@ for await (const data of parseStream(resp)) {
             }
 
             if (data.done) {
+                gotDone = true;
+                if (data.partial) toast('The AI connection dropped — the part that arrived was saved.', 6000);
                 const bi = S.msgs.findIndex(m=>m.id==tbid);
                 if (bi !== -1) {
                     S.msgs[bi].id = data.bot_id;
@@ -2185,10 +2751,21 @@ for await (const data of parseStream(resp)) {
             }
         }
     } catch (err) {
-        [tuid,tbid].forEach(id=>{S.msgs=S.msgs.filter(m=>m.id!=id);document.querySelector(\`[data-msg-id="\${id}"]\`)?.remove();});
-        toast('Error: ' + err.message, 5000);
+        if (gotAnyText) {
+            // The worker persists whatever it received, so pull the real state
+            // back instead of throwing away the user's message.
+            toast('Connection interrupted — resyncing…', 4000);
+            await loadChatHistory();
+            gotDone = true;   // already reconciled; skip the finally-block resync
+        } else {
+            [tuid,tbid].forEach(id=>{S.msgs=S.msgs.filter(m=>m.id!=id);document.querySelector(\`[data-msg-id="\${id}"]\`)?.remove();});
+            toast('Error: ' + err.message, 5000);
+        }
     } finally {
         S.generating=false;$('send-btn').disabled=false;
+        // Stream ended without a 'done' frame: the server may still have saved
+        // the reply, so reconcile rather than leaving a phantom bubble.
+        if (!gotDone && gotAnyText) { toast('Stream ended early — resyncing…', 4000); await loadChatHistory(); }
     }
 }
 
@@ -2235,11 +2812,7 @@ async function regenVariant(msgId,groupId){
     if(ci)ci.innerHTML='<span class="text-gray-400 text-xs flex items-center space-x-2"><svg class="animate-spin w-3 h-3"viewBox="0 0 24 24"fill="none"stroke="currentColor"stroke-width="2"><path d="M21 12a9 9 0 11-9-9"/></svg><span>Thinking about a better responses for you...</span></span>';
     
     try {
-        const resp = await fetch('?action=regenerate', {
-            method: 'POST',
-            headers: {'Content-Type':'application/json','Accept': 'text/event-stream','X-CSRF-Token':S.csrf,'X-Session-Id':S.session},
-            body: JSON.stringify({group_id:groupId})
-        });
+        const resp = await streamFetch('regenerate', {group_id:groupId});
 
         if (!resp.ok) {
             const errJson = await resp.json();
@@ -2250,6 +2823,8 @@ async function regenVariant(msgId,groupId){
         let lastRender = 0; // PERF FIX 3: throttle re-parsing while streaming
         for await (const data of parseStream(resp)) {
             if (data.error) throw new Error(data.error);
+            if (data.warning) toast(data.warning, 6000);
+            if (data.resumed) toast('Reconnected — continuing the reply…', 2500);
             if (data.reasoning) fullReasoning += data.reasoning;
             if (data.chunk) fullText += data.chunk;
             display = fullText;
@@ -2258,6 +2833,7 @@ async function regenVariant(msgId,groupId){
             if(ci && (data.done || _now - lastRender > 90)){ lastRender = _now; ci.innerHTML = formatContent(display); }
 
             if (data.done) {
+                if (data.partial) toast('The AI connection dropped — the part that arrived was saved.', 6000);
                 const m=S.msgs.find(m=>m.id==msgId);
                 if(m&&el){
                     const newVars=[...(m.variants||[]), display];
@@ -2575,24 +3151,19 @@ function renderSessionsList(){
     lucide.createIcons();
 }
 async function switchSession(id){
-    const res=await api('manageSessions',{op:'switch',session_id:id});
-    if(res.error){toast('Error: '+res.error);return;}
+    // Single round trip: bootstrap validates the session and returns its state,
+    // history and pins together (was: switch + getInitData + history + pins).
+    const prev=S.session;
     S.session=id;
+    const d=await api('bootstrap',{},'GET');
+    if(!d||d.error||d.session_missing){
+        S.session=prev;
+        toast('Error: '+((d&&d.error)||'Session not found'));
+        return;
+    }
     const s=S.sessions.find(s=>s.id===id);
     S.sessionLabel=s?.label||id;
-    const d=await api('getInitData',{},'GET');
-    if(d&&!d.error){
-        S.memory=d.memory||{}; S.csrf=d.csrf_token;
-        S.currentPersonaId=d.current_persona_id || (S.personas[0]?S.personas[0].id:null);
-        populateMemoryForm();
-    }
-    S.msgs=[];S.hasMore=false;
-    $('chat-container').innerHTML='';
-    await loadChatHistory();
-    S.pins=[];
-    renderSketchboard();
-    await loadSketchboard();
-    updateHeader();
+    applyBootstrap(d);
     closeModals();
 }
 async function newSession(){
@@ -2762,6 +3333,109 @@ async function saveMemorySettings(){
     if(res.success){toast('Memory settings saved!');closeModals();}
 }
 
+// ---- Advanced AI settings (global, every endpoint) ----------------------
+const GEN_PRESETS_UI = {
+    'default':  {temperature:0.3, top_p:0.8,  presence_penalty:0.1, frequency_penalty:0.1, max_tokens:8192},
+    'creative': {temperature:1.0, top_p:0.95, presence_penalty:0.4, frequency_penalty:0.4, max_tokens:8192},
+    'precise':  {temperature:0.1, top_p:0.5,  presence_penalty:0.0, frequency_penalty:0.0, max_tokens:8192}
+};
+const GEN_PRESET_INFO = [
+    ['default','Default','The tuning this app shipped with. Balanced and predictable.'],
+    ['creative','Creative','Warmer temperature. More surprising, more varied prose.'],
+    ['precise','Precise','Cooler temperature. Sticks tightly to the prompt.'],
+    ['custom','Custom','Your own values, set with the sliders below.']
+];
+const GEN_FIELDS = ['temperature','top_p','presence_penalty','frequency_penalty','repetition_penalty','top_k','max_tokens'];
+
+function genValue(f){
+    if(S.gen && S.gen[f]!==undefined && S.gen[f]!==null) return Number(S.gen[f]);
+    if(S.genCustom && S.genCustom[f]!==undefined && S.genCustom[f]!==null) return Number(S.genCustom[f]);
+    return f==='max_tokens' ? 8192 : 0;
+}
+
+function updateGenLabel(f){
+    const el=$('gen-'+f), lab=$('genv-'+f);
+    if(!el||!lab)return;
+    const v=parseFloat(el.value);
+    if(f==='max_tokens'||f==='top_k'){
+        lab.textContent = (f==='top_k' && Math.round(v)===0) ? 'off' : String(Math.round(v));
+    } else if(f==='repetition_penalty' && v===0){
+        lab.textContent='off';
+    } else {
+        lab.textContent=v.toFixed(2);
+    }
+}
+
+function renderGenSettings(){
+    if(!S.gen) S.gen={preset:'default'};
+    const preset = S.gen.preset || 'default';
+    const cont=$('gen-presets');
+    if(cont){
+        cont.innerHTML='';
+        GEN_PRESET_INFO.forEach(function(p){
+            const active = preset===p[0];
+            const b=document.createElement('button');
+            b.type='button';
+            b.onclick=function(){selectGenPreset(p[0]);};
+            b.className='text-left rounded-lg p-3 transition-all '+(active
+                ? 'border-2 border-black dark:border-white bg-gray-50 dark:bg-[#111]'
+                : 'border border-gray-200 dark:border-gray-700 opacity-70 hover:opacity-100 hover:border-gray-400 dark:hover:border-gray-500');
+            b.innerHTML='<div class="text-sm font-medium mb-0.5">'+esc(p[1])+'</div>'
+                       +'<div class="text-[11px] text-gray-500 leading-snug">'+esc(p[2])+'</div>';
+            cont.appendChild(b);
+        });
+    }
+    const custom = preset==='custom';
+    GEN_FIELDS.forEach(function(f){
+        const el=$('gen-'+f);
+        if(!el)return;
+        el.value=genValue(f);
+        el.disabled=!custom;
+        el.classList.toggle('opacity-40',!custom);
+        updateGenLabel(f);
+    });
+    const hint=$('gen-custom-hint');
+    if(hint)hint.classList.toggle('hf',custom);
+}
+
+function onGenInput(f){
+    if(!S.gen)S.gen={preset:'custom'};
+    if(!S.genCustom)S.genCustom={};
+    const v=parseFloat($('gen-'+f).value);
+    S.gen[f]=v;
+    S.genCustom[f]=v;   // remembered so a preset detour doesn't lose the value
+    updateGenLabel(f);
+}
+
+function selectGenPreset(p){
+    if(!S.gen)S.gen={};
+    if(p==='custom'){
+        S.gen={preset:'custom'};
+        GEN_FIELDS.forEach(function(f){
+            S.gen[f]=(S.genCustom&&S.genCustom[f]!==undefined)?S.genCustom[f]:genValue(f);
+        });
+    } else {
+        const base=GEN_PRESETS_UI[p]||GEN_PRESETS_UI['default'];
+        S.gen={preset:p, top_k:0, repetition_penalty:0};
+        Object.keys(base).forEach(function(k){S.gen[k]=base[k];});
+    }
+    renderGenSettings();
+}
+
+async function saveGenSettings(){
+    const payload={preset:(S.gen&&S.gen.preset)||'default'};
+    // Always send the custom numbers so switching back to Custom restores them.
+    GEN_FIELDS.forEach(function(f){
+        payload[f]=(S.genCustom&&S.genCustom[f]!==undefined)?S.genCustom[f]:genValue(f);
+    });
+    const r=await api('updateGenSettings',{gen:payload});
+    if(!r||r.error){toast('Error: '+((r&&r.error)||'Could not save'));return;}
+    S.gen=r.gen||S.gen;
+    S.genCustom=r.gen_custom||S.genCustom;
+    renderGenSettings();
+    toast('AI settings applied to all endpoints');
+}
+
 async function loadApiKeys(){
     const keys=await api('manageKeys',{op:'list'});
     const cont=$('keys-list-container');cont.innerHTML='';
@@ -2873,6 +3547,7 @@ async function nukeServer(){
 
 function openModal(id){
     if(id==='keys-modal')loadApiKeys();
+    if(id==='advanced-modal')renderGenSettings();
     if(id==='persona-modal')loadPersonas();
     if(id==='sessions-modal')renderSessionsList();
     if(id==='memory-modal'){
