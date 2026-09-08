@@ -111,8 +111,37 @@ class DB {
   }
 }
 
+// ── ISOLATE-LOCAL READ CACHE ─────────────────────────────────────────
+// A handful of rows (API keys, generation settings, personas, the shape of a
+// session's context window, the logged-in session) are read on almost every
+// request but only change when the user edits something. Holding them in the
+// isolate turns those reads into zero D1 rows and, more importantly, takes
+// whole round trips off the hot path. A write drops the entry immediately in
+// the isolate that served it; another isolate keeps the old value until the
+// TTL runs out, which is why the TTL is deliberately short.
+const CACHE_TTL_MS = 60_000;
+const _cache = new Map();
+
+function cacheGet(key) {
+  const hit = _cache.get(key);
+  if (!hit) return undefined;
+  if (hit.exp <= Date.now()) { _cache.delete(key); return undefined; }
+  return hit.v;
+}
+
+function cacheSet(key, v, ttl = CACHE_TTL_MS) {
+  // Session-keyed entries are unbounded in principle, so keep a hard ceiling.
+  if (_cache.size >= 256) _cache.clear();
+  _cache.set(key, { v, exp: Date.now() + ttl });
+  return v;
+}
+
+function cacheDrop(prefix) {
+  for (const k of [..._cache.keys()]) if (k.startsWith(prefix)) _cache.delete(k);
+}
+
 // Bumped on every deploy so browsers revalidate the HTML shell cheaply.
-const APP_BUILD = '2026-09-08-perf1';
+const APP_BUILD = '2026-09-08-perf2';
 const HTML_CACHE_CONTROL = 'private, max-age=0, must-revalidate';
 let _hasUsers = false, _appHTML = null, _setupHTML = null;
 
@@ -204,6 +233,12 @@ async function clearBlock(req, db) {
   await db.delete('ip_blocks', { id: getIP(req) });
 }
 
+// The session row is looked up on every single API call. Caching it briefly
+// takes that round trip off the front of every request. Logout, a credential
+// change and the nuke button all clear it in the isolate that served them, and
+// the short TTL bounds how long any other isolate can lag behind.
+const AUTH_TTL_MS = 30_000;
+
 async function auth(req, db) {
   const cookie = req.headers.get('Cookie') ?? '';
   const match  = cookie.match(/aiphp_sess=([A-Za-z0-9\-]+)/);
@@ -211,13 +246,16 @@ async function auth(req, db) {
   const token = match[1];
   if (!/^[0-9a-f-]{36}$/i.test(token)) return null;
 
+  const cached = cacheGet('auth:' + token);
+  if (cached) return cached.expires_at < Date.now() ? null : cached;
+
   const session = await db.findOne('user_sessions', { session_token: token });
   if (!session) return null;
   if (session.expires_at < Date.now()) {
     await db.delete('user_sessions', { session_token: token });
     return null;
   }
-  return session;
+  return cacheSet('auth:' + token, session, AUTH_TTL_MS);
 }
 
 // ── MEMORY & CONTEXT ─────────────────────────────────────────────────
@@ -254,55 +292,110 @@ function persistMemRow(db, row, ctx) {
   return p;
 }
 
-// One round trip instead of two sequential ones.
+// The session's own row and the global defaults, in one statement rather than
+// two. Callers pick the one they want out of the result with pickMem.
+const MEM_PAIR_SQL = "SELECT * FROM memory_state WHERE session_id IN (?, 'global')";
+
+function pickMem(rows, sid) {
+  return (rows ?? []).find(r => r.session_id === sid) ?? null;
+}
+
+function clampCtx(n) {
+  return Math.max(1, Math.min(n ?? 20, 100));
+}
+
+function clampFetch(n) {
+  return Math.max(10, Math.min(n ?? 50, 200));
+}
+
+// Keeps a cached context shape in step with a memory row we just read for real,
+// without inventing a persona id we have not seen.
+function rememberShape(sid, mem) {
+  const prev = cacheGet('shape:' + sid);
+  if (prev) {
+    cacheSet('shape:' + sid, {
+      ...prev,
+      ctxCount:   clampCtx(mem.context_count),
+      fetchCount: clampFetch(mem.history_fetch_count),
+      wantPins:   mem.sketchboard_active === 1,
+    });
+  }
+  return mem;
+}
+
+// One statement, one round trip.
 async function getMem(sid, db, ctx = null) {
-  const [own, glob] = await db.d1.batch([
-    db.d1.prepare('SELECT * FROM memory_state WHERE session_id = ? LIMIT 1').bind(sid),
-    db.d1.prepare('SELECT * FROM memory_state WHERE session_id = ? LIMIT 1').bind('global'),
-  ]);
-  const row = own.results?.[0];
-  if (row) return row;
-  const fresh = newMemRow(sid, glob.results?.[0]);
+  const rows = await db.all(MEM_PAIR_SQL, [sid]);
+  const row  = pickMem(rows, sid);
+  if (row) return rememberShape(sid, row);
+  const fresh = newMemRow(sid, pickMem(rows, 'global'));
   await persistMemRow(db, fresh, ctx);
   return fresh;
 }
 
-// Returns { msgs, mem } — mem comes back so callers don't have to re-query it.
-// This used to be five sequential D1 queries (session, persona, memory, global
-// memory, pins, history); it is two batched round trips now.
+function pinStmt(db, sid) {
+  return db.d1.prepare('SELECT content FROM sketchboard WHERE session_id = ? AND is_active = 1 ORDER BY created_at DESC').bind(sid);
+}
+
+function histStmt(db, sid, beforeTs, ctxCount) {
+  return beforeTs
+    // Exact immediate history prior to the regenerated message, ignoring summary markers.
+    ? db.d1.prepare('SELECT role, content FROM chat_history WHERE session_id = ? AND is_main = 1 AND timestamp < ? ORDER BY timestamp DESC LIMIT ?').bind(sid, beforeTs, ctxCount)
+    : db.d1.prepare('SELECT role, content FROM chat_history WHERE session_id = ? AND is_main = 1 ORDER BY timestamp DESC LIMIT ?').bind(sid, ctxCount);
+}
+
+// Returns { msgs, mem, bot } — mem comes back so callers don't have to re-query it.
+// What the context query looks like (which persona, how many messages, whether
+// pins are on) depends on rows that only change when the user edits settings,
+// so once that shape is cached the whole context loads in a single round trip.
+// A cold isolate still takes two, and the memory row itself is always read
+// fresh so a newly written summary is never missed.
 async function buildCtx(sid, userMsg, db, beforeTs = null, ctx = null) {
-  const [sessRes, memRes, globalMemRes, firstPersonaRes] = await db.d1.batch([
-    db.d1.prepare('SELECT p.* FROM chat_sessions s LEFT JOIN personas p ON p.id = s.persona_id WHERE s.id = ? LIMIT 1').bind(sid),
-    db.d1.prepare('SELECT * FROM memory_state WHERE session_id = ? LIMIT 1').bind(sid),
-    db.d1.prepare('SELECT * FROM memory_state WHERE session_id = ? LIMIT 1').bind('global'),
-    db.d1.prepare('SELECT * FROM personas ORDER BY id LIMIT 1'),
-  ]);
+  let shape    = cacheGet('shape:' + sid);
+  let personas = cacheGet('personas');
 
-  const joined = sessRes.results?.[0] ?? null;
-  // LEFT JOIN misses (no persona set, or a deleted one) come back all-NULL.
-  const bot = (joined && joined.id != null) ? joined : (firstPersonaRes.results?.[0] ?? null);
+  const stmts = [];
+  const at    = {};
+  at.mem = stmts.push(db.d1.prepare(MEM_PAIR_SQL).bind(sid)) - 1;
+  if (!shape)    at.sess     = stmts.push(db.d1.prepare('SELECT persona_id FROM chat_sessions WHERE id = ? LIMIT 1').bind(sid)) - 1;
+  if (!personas) at.personas = stmts.push(db.d1.prepare('SELECT * FROM personas ORDER BY id')) - 1;
+  if (shape) {
+    if (shape.wantPins) at.pins = stmts.push(pinStmt(db, sid)) - 1;
+    at.hist = stmts.push(histStmt(db, sid, beforeTs, shape.ctxCount)) - 1;
+  }
+  const res = await db.d1.batch(stmts);
 
-  let mem = memRes.results?.[0];
+  if (!personas) personas = cacheSet('personas', res[at.personas].results ?? []);
+
+  const memRows = res[at.mem].results;
+  let mem = pickMem(memRows, sid);
   if (!mem) {
-    mem = newMemRow(sid, globalMemRes.results?.[0]);
+    mem = newMemRow(sid, pickMem(memRows, 'global'));
     await persistMemRow(db, mem, ctx);
   }
 
-  const ctxCount = Math.max(1, Math.min(mem.context_count ?? 20, 100));
-  const wantPins = mem.sketchboard_active === 1;
-
-  const stmts = [];
-  if (wantPins) {
-    stmts.push(db.d1.prepare('SELECT content FROM sketchboard WHERE session_id = ? AND is_active = 1 ORDER BY created_at DESC').bind(sid));
+  let pins, history;
+  if (shape) {
+    pins    = shape.wantPins ? (res[at.pins].results ?? []) : [];
+    history = res[at.hist].results ?? [];
+  } else {
+    shape = cacheSet('shape:' + sid, {
+      personaId:  res[at.sess].results?.[0]?.persona_id ?? null,
+      ctxCount:   clampCtx(mem.context_count),
+      fetchCount: clampFetch(mem.history_fetch_count),
+      wantPins:   mem.sketchboard_active === 1,
+    });
+    const stmts2 = [];
+    if (shape.wantPins) stmts2.push(pinStmt(db, sid));
+    stmts2.push(histStmt(db, sid, beforeTs, shape.ctxCount));
+    const res2 = await db.d1.batch(stmts2);
+    pins    = shape.wantPins ? (res2[0].results ?? []) : [];
+    history = res2[shape.wantPins ? 1 : 0].results ?? [];
   }
-  stmts.push(beforeTs
-    // Exact immediate history prior to the regenerated message, ignoring summary markers.
-    ? db.d1.prepare('SELECT role, content FROM chat_history WHERE session_id = ? AND is_main = 1 AND timestamp < ? ORDER BY timestamp DESC LIMIT ?').bind(sid, beforeTs, ctxCount)
-    : db.d1.prepare('SELECT role, content FROM chat_history WHERE session_id = ? AND is_main = 1 ORDER BY timestamp DESC LIMIT ?').bind(sid, ctxCount));
 
-  const res2    = await db.d1.batch(stmts);
-  const pins    = wantPins ? (res2[0].results ?? []) : [];
-  const history = res2[wantPins ? 1 : 0].results ?? [];
+  // No persona set, or one that has since been deleted, falls back to the first
+  // persona — exactly what the old LEFT JOIN did.
+  const bot = personas.find(p => p.id === shape.personaId) ?? personas[0] ?? null;
 
   const sysParts = [];
   if (bot?.system_prompt) sysParts.push(bot.system_prompt);
@@ -371,13 +464,17 @@ function resolveGen(row) {
   return { preset, ...GEN_PRESETS[preset], top_k: 0, repetition_penalty: 0 };
 }
 
-// API keys and the global generation settings in a single round trip.
+// API keys and the global generation settings. Both only change from the
+// settings modals, so after the first read they come out of the isolate cache
+// for free - this used to be a full scan of api_keys on every single message.
 async function loadKeysAndGen(db) {
+  const hit = cacheGet('cfg');
+  if (hit) return hit;
   const [keysRes, genRes] = await db.d1.batch([
     db.d1.prepare('SELECT * FROM api_keys'),
     db.d1.prepare('SELECT * FROM gen_settings WHERE id = ? LIMIT 1').bind('global'),
   ]);
-  return { apiKeys: keysRes.results ?? [], gen: resolveGen(genRes.results?.[0]) };
+  return cacheSet('cfg', { apiKeys: keysRes.results ?? [], gen: resolveGen(genRes.results?.[0]) });
 }
 
 // How long we wait for an upstream provider to send response HEADERS. Once the
@@ -592,38 +689,37 @@ async function fetchHistoryPage(db, sid, limit, beforeTs = 0) {
   if (hasMore) rows.pop();   // DESC order, so the surplus row is the oldest one
   rows.reverse();
 
-  const groupIds = [...new Set(rows.filter(r => r.role === 'bot').map(r => r.group_id))];
+  // The alternative replies. Every row of a group keeps the group's original
+  // timestamp (regenerate deliberately reuses it), so one range scan over the
+  // (session_id, is_main, timestamp) index picks up every variant on the page.
+  // Asking only for is_main = 0 means the rows we are already holding are not
+  // read a second time; the old group_id IN (...) form re-read the entire page
+  // on top of the variants, roughly doubling the rows this endpoint cost.
   const byGroup = new Map();
-  if (groupIds.length > 0) {
-    const CHUNK = 60;   // stay well under SQLite's bound-parameter limit
-    const stmts = [];
-    for (let i = 0; i < groupIds.length; i += CHUNK) {
-      const slice = groupIds.slice(i, i + CHUNK);
-      stmts.push(db.d1
-        .prepare(`SELECT id, group_id, content, is_main FROM chat_history WHERE group_id IN (${slice.map(() => '?').join(', ')}) ORDER BY timestamp, id`)
-        .bind(...slice));
-    }
-    for (const res of await db.d1.batch(stmts)) {
-      for (const v of (res.results ?? [])) {
-        if (!byGroup.has(v.group_id)) byGroup.set(v.group_id, []);
-        byGroup.get(v.group_id).push(v);
-      }
+  if (rows.some(r => r.role === 'bot')) {
+    const extras = await db.all(
+      'SELECT id, group_id, content, timestamp FROM chat_history WHERE session_id = ? AND is_main = 0 AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp, id',
+      [sid, rows[0].timestamp, rows[rows.length - 1].timestamp]
+    );
+    for (const v of extras) {
+      if (!byGroup.has(v.group_id)) byGroup.set(v.group_id, []);
+      byGroup.get(v.group_id).push(v);
     }
   }
 
   for (const msg of rows) {
     if (msg.role !== 'bot') continue;
-    const vars = byGroup.get(msg.group_id) ?? [];
-    if (vars.length === 0) {
+    const extras = byGroup.get(msg.group_id);
+    if (!extras) {
       msg.variants = [msg.content]; msg.variant_ids = [msg.id]; msg.active_index = 0;
       continue;
     }
-    let ai = 0;
-    vars.forEach((v, i) => { if (v.is_main === 1) ai = i; });
+    // Reassembled in the (timestamp, id) order the single query used to return.
+    const vars = [...extras, { id: msg.id, content: msg.content, timestamp: msg.timestamp, main: true }]
+      .sort((a, b) => (a.timestamp - b.timestamp) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     msg.variants     = vars.map(v => v.content);
     msg.variant_ids  = vars.map(v => v.id);
-    msg.active_index = ai;
-    msg.id           = vars[ai]?.id ?? msg.id;
+    msg.active_index = vars.findIndex(v => v.main);
   }
 
   return { messages: rows, has_more: hasMore };
@@ -1052,36 +1148,51 @@ case 'branchChat': {
 case 'logout': {
           // Nuke ALL sessions for this user across all devices
           await db.delete('user_sessions', { user_id: userId });
+          cacheDrop('auth:');
           return jsonResponse({ success: true }, 200, {
             'Set-Cookie': 'aiphpcase_sess=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0',
           });
         }
 
         case 'bootstrap': {
-          // Everything the app needs at boot in ONE http request and three
-          // batched D1 round trips. It used to be four separate requests, one
-          // of which fanned out into ~50 sequential per-message queries.
-          const [memOwn, memGlobal, personasRes, sessionsRes, curSessRes, userRes, pinsRes, genRes] = await db.d1.batch([
-            db.d1.prepare('SELECT * FROM memory_state WHERE session_id = ? LIMIT 1').bind(sid),
-            db.d1.prepare('SELECT * FROM memory_state WHERE session_id = ? LIMIT 1').bind('global'),
-            db.d1.prepare('SELECT * FROM personas ORDER BY id'),
-            db.d1.prepare('SELECT id, label, persona_id, created_at FROM chat_sessions ORDER BY created_at'),
-            db.d1.prepare('SELECT * FROM chat_sessions WHERE id = ? LIMIT 1').bind(sid),
-            db.d1.prepare('SELECT username FROM users WHERE id = ? LIMIT 1').bind(userId),
-            db.d1.prepare('SELECT * FROM sketchboard WHERE session_id = ? ORDER BY created_at DESC').bind(sid),
-            db.d1.prepare('SELECT * FROM gen_settings WHERE id = ? LIMIT 1').bind('global'),
-          ]);
+          // Everything the app needs at boot in ONE http request and two
+          // batched D1 round trips. Both memory rows come from one statement,
+          // the current session is picked out of the session list instead of
+          // being queried a second time, and personas come from the isolate
+          // cache whenever it is warm.
+          let personas = cacheGet('personas');
+          const stmts  = [];
+          const at     = {};
+          at.mem      = stmts.push(db.d1.prepare(MEM_PAIR_SQL).bind(sid)) - 1;
+          at.sessions = stmts.push(db.d1.prepare('SELECT id, label, persona_id, created_at FROM chat_sessions ORDER BY created_at')) - 1;
+          at.user     = stmts.push(db.d1.prepare('SELECT username FROM users WHERE id = ? LIMIT 1').bind(userId)) - 1;
+          at.pins     = stmts.push(db.d1.prepare('SELECT * FROM sketchboard WHERE session_id = ? ORDER BY created_at DESC').bind(sid)) - 1;
+          at.gen      = stmts.push(db.d1.prepare('SELECT * FROM gen_settings WHERE id = ? LIMIT 1').bind('global')) - 1;
+          if (!personas) at.personas = stmts.push(db.d1.prepare('SELECT * FROM personas ORDER BY id')) - 1;
 
-          let mem = memOwn.results?.[0];
+          const res = await db.d1.batch(stmts);
+          if (!personas) personas = cacheSet('personas', res[at.personas].results ?? []);
+
+          const memRows = res[at.mem].results;
+          let mem = pickMem(memRows, sid);
           if (!mem) {
-            mem = newMemRow(sid, memGlobal.results?.[0]);
+            mem = newMemRow(sid, pickMem(memRows, 'global'));
             await persistMemRow(db, mem, ctx);
           }
 
-          const personas = personasRes.results ?? [];
-          const curSess  = curSessRes.results?.[0] ?? null;
-          const limit    = Math.max(10, Math.min(mem.history_fetch_count ?? 50, 200));
-          const page     = await fetchHistoryPage(db, sid, limit, 0);
+          const sessions = res[at.sessions].results ?? [];
+          const curSess  = sessions.find(x => x.id === sid) ?? null;
+          const genRow   = res[at.gen].results?.[0];
+
+          // Everything the next sendMessage needs to skip its settings queries.
+          cacheSet('shape:' + sid, {
+            personaId:  curSess?.persona_id ?? null,
+            ctxCount:   clampCtx(mem.context_count),
+            fetchCount: clampFetch(mem.history_fetch_count),
+            wantPins:   mem.sketchboard_active === 1,
+          });
+
+          const page = await fetchHistoryPage(db, sid, clampFetch(mem.history_fetch_count), 0);
 
           return jsonResponse({
             personas,
@@ -1089,15 +1200,15 @@ case 'logout': {
             memory:             mem,
             csrf_token:         sessionDoc.csrf_token,
             session_id:         sid,
-            sessions:           sessionsRes.results ?? [],
-            username:           userRes.results?.[0]?.username ?? '',
+            sessions,
+            username:           res[at.user].results?.[0]?.username ?? '',
             messages:           page.messages,
             has_more:           page.has_more,
-            pins:               pinsRes.results ?? [],
+            pins:               res[at.pins].results ?? [],
             sketchboard_active: mem.sketchboard_active ?? 1,
             session_missing:    !curSess,
-            gen:                resolveGen(genRes.results?.[0]),
-            gen_custom:         rawGen(genRes.results?.[0]),
+            gen:                resolveGen(genRow),
+            gen_custom:         rawGen(genRow),
           });
         }
 
@@ -1191,7 +1302,8 @@ case 'logout': {
               // Guarantee chronological order safely
               let botTs = Date.now();
               if (botTs <= userTs) botTs = userTs + 1;
-              const lastTs = mem.last_summarized_timestamp ?? 0;
+              const lastTs    = mem.last_summarized_timestamp ?? 0;
+              const threshold = Math.max(1, mem.summarize_threshold ?? 50);
 
               // Both inserts and the summarize counter in a single round trip.
               const res = await db.d1.batch([
@@ -1199,8 +1311,11 @@ case 'logout': {
                   .bind(userMsgId, sid, 'g_' + generateId(), 1, 'user', content, userTs),
                 db.d1.prepare('INSERT INTO chat_history (id, session_id, group_id, is_main, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)')
                   .bind(botId, sid, groupId, 1, 'bot', finalText, botTs),
-                db.d1.prepare('SELECT COUNT(*) AS c FROM chat_history WHERE session_id = ? AND is_main = 1 AND timestamp > ?')
-                  .bind(sid, lastTs),
+                // Stops counting once the threshold is reached. Unbounded,
+                // this re-scanned every message in the session on every single
+                // send, which is where most of the row reads were going.
+                db.d1.prepare('SELECT COUNT(*) AS c FROM (SELECT 1 FROM chat_history WHERE session_id = ? AND is_main = 1 AND timestamp > ? LIMIT ?)')
+                  .bind(sid, lastTs, threshold),
               ]);
 
               const seen = res[2].results?.[0]?.c ?? 0;
@@ -1208,7 +1323,7 @@ case 'logout': {
                 user_id: userMsgId,
                 bot_id: botId,
                 group_id: groupId,
-                should_summarize: seen >= (mem.summarize_threshold ?? 50),
+                should_summarize: seen >= threshold,
               };
             },
           });
@@ -1275,10 +1390,11 @@ case 'logout': {
         }
 
         case 'triggerSummarize': {
-          const [apiKeys, mem] = await Promise.all([
-            db.all('SELECT * FROM api_keys'),
+          const [cfg, mem] = await Promise.all([
+            loadKeysAndGen(db),
             getMem(sid, db, ctx),
           ]);
+          const apiKeys = cfg.apiKeys;
           const cnt    = Math.max(1, Math.min(mem.summarize_count ?? 30, 200));
           const lastTs = mem.last_summarized_timestamp ?? 0;
 
@@ -1324,8 +1440,10 @@ case 'logout': {
         }
 
         case 'getChatHistory': {
-          const mem      = await getMem(sid, db, ctx);
-          const limit    = Math.max(10, Math.min(mem.history_fetch_count ?? 50, 200));
+          // The page size only changes from the memory modal, so scrolling back
+          // through a long chat no longer re-reads memory_state every time.
+          let limit = cacheGet('shape:' + sid)?.fetchCount;
+          if (!limit) limit = clampFetch((await getMem(sid, db, ctx)).history_fetch_count);
           const beforeTs = parseInt(url.searchParams.get('before_timestamp') ?? '0', 10);
           return jsonResponse(await fetchHistoryPage(db, sid, limit, beforeTs));
         }
@@ -1422,12 +1540,14 @@ case 'logout': {
               if (apiKeyVal) setFields.api_key = apiKeyVal;
               await db.update('api_keys', { id }, setFields);
             }
+            cacheDrop('cfg');
             return jsonResponse({ success: true });
           }
           if (op === 'delete') {
             const id = str(body.id, 100);
             if (!id) return errResponse('Invalid id');
             await db.delete('api_keys', { id });
+            cacheDrop('cfg');
             return jsonResponse({ success: true });
           }
           return errResponse('Unknown op');
@@ -1493,6 +1613,7 @@ case 'testKey': {
               if (!id) return errResponse('Missing id');
               await db.update('personas', { id }, payload);
             }
+            cacheDrop('personas');
             return jsonResponse({ success: true });
           }
           if (op === 'delete') {
@@ -1500,6 +1621,8 @@ case 'testKey': {
             if (!id) return errResponse('Invalid id');
             await db.delete('personas', { id });
             await db.run('UPDATE chat_sessions SET persona_id = NULL WHERE persona_id = ?', [id]);
+            cacheDrop('personas');
+            cacheDrop('shape:');   // any session may have pointed at it
             return jsonResponse({ success: true });
           }
           return errResponse('Unknown op');
@@ -1509,6 +1632,7 @@ case 'testKey': {
           const sessionId = str(body.session_id, 100) ?? sid;
           const personaId = typeof body.persona_id === 'string' && body.persona_id.trim() ? body.persona_id.trim() : null;
           await db.update('chat_sessions', { id: sessionId }, { persona_id: personaId });
+          cacheDrop('shape:' + sessionId);
           return jsonResponse({ success: true });
         }
 
@@ -1524,6 +1648,7 @@ case 'testKey': {
             `INSERT OR REPLACE INTO gen_settings (${keys.join(', ')}) VALUES (${keys.map(() => '?').join(', ')})`,
             keys.map(k => row[k])
           );
+          cacheDrop('cfg');
           return jsonResponse({ success: true, gen: resolveGen(row), gen_custom: rawGen(row) });
         }
 
@@ -1541,6 +1666,7 @@ case 'testKey': {
             db.update('memory_state', { session_id: sid },      cfg),
             db.update('memory_state', { session_id: 'global' }, cfg),
           ]);
+          cacheDrop('shape:');
           return jsonResponse({ success: true });
         }
 
@@ -1566,6 +1692,7 @@ case 'testKey': {
           await db.update('users', { id: userId }, update);
 // NEW: Nuke ALL sessions to enforce re-login with new credentials
           await db.delete('user_sessions', { user_id: userId });
+          cacheDrop('auth:');
           
           // NEW: Clear the cookie so the current browser drops the session immediately
           return jsonResponse({ success: true }, 200, {
@@ -1610,6 +1737,7 @@ case 'testKey': {
           }
           if (op === 'toggleGlobal') {
             await db.update('memory_state', { session_id: sid }, { sketchboard_active: body.active ? 1 : 0 });
+            cacheDrop('shape:' + sid);
             return jsonResponse({ success: true });
           }
           return errResponse('Unknown op');
@@ -1656,6 +1784,7 @@ case 'testKey': {
               db.run('DELETE FROM sketchboard   WHERE session_id = ?', [sessionId]),
               db.delete('chat_sessions', { id: sessionId }),
             ]);
+            cacheDrop('shape:' + sessionId);
             return jsonResponse({ success: true });
           }
           return errResponse('Unknown op');
@@ -1703,6 +1832,7 @@ case 'testKey': {
             db.run('DELETE FROM chat_sessions'),
             db.run('DELETE FROM user_sessions'),
           ]);
+          _cache.clear();
           const { hash, salt } = await pbkdf2(crypto.randomUUID());
           await db.update('users', { id: userId }, {
             username: crypto.randomUUID().substring(0, 8), password_hash: hash, salt,
