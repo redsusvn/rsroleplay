@@ -412,6 +412,10 @@ async function buildCtx(sid, userMsg, db, beforeTs = null, ctx = null) {
   for (const h of history) {
     // Strip <think> blocks so they don't consume context tokens
     const cleanContent = h.content.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    // A failed generation leaves an empty bot row behind so the user's message
+    // survives (see savePlaceholderTurn). It must never reach a provider: an
+    // empty assistant turn is a 400 on Gemini and confuses everything else.
+    if (!cleanContent) continue;
     msgs.push({ role: h.role === 'bot' ? 'assistant' : 'user', content: cleanContent });
   }
   if (userMsg) msgs.push({ role: 'user', content: userMsg });
@@ -498,6 +502,33 @@ async function fetchWithTimeout(url, init, ms, extSignal) {
     if (extSignal) extSignal.removeEventListener('abort', onAbort);
   }
 }
+
+// fetch() settles as soon as the response HEADERS arrive, so the timeout above
+// stops covering anything the moment the body starts. A provider that stalls
+// half-way through its body would hang this read forever, and an abandoned body
+// keeps its connection open - which counts against the Worker's six
+// simultaneous connections and makes every later fetch() queue behind it. That
+// is how one bad upstream turned into "nothing works any more". Reading a body
+// therefore gets its own deadline and always hands the connection back.
+async function readBodyWithTimeout(res, ms) {
+  let timer;
+  try {
+    return await Promise.race([
+      res.text(),
+      new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('Upstream body timed out after ' + ms + 'ms')), ms); }),
+    ]);
+  } catch (e) {
+    try { await res.body?.cancel(); } catch { /* already gone */ }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// An error body only feeds the message we display, so it gets a short leash of
+// its own: a provider that never finishes sending its 500 page must not be able
+// to stall the failover to the next key.
+const ERROR_BODY_TIMEOUT_MS = 10_000;
 
 function isThinking(model) {
   const m = model.toLowerCase();
@@ -639,7 +670,9 @@ const res = await fetchWithTimeout(
         signal
       );
       if (!res.ok) { 
-        const errorBody = await res.text();
+        let errorBody = '';
+        try { errorBody = await readBodyWithTimeout(res, ERROR_BODY_TIMEOUT_MS); }
+        catch (be) { errorBody = '(error body unreadable: ' + be.message + ')'; }
         lastErr = `${provider} HTTP ${res.status}: ${errorBody.substring(0, 150)}`;
         // GEMINI DEBUG: keep the full, untruncated Google error so we can show it in chat
         if (provider === 'gemini') {
@@ -650,7 +683,10 @@ const res = await fetchWithTimeout(
 
       if (stream) return { provider, stream: res.body };
 
-      const data = await res.json();
+      const rawBody = await readBodyWithTimeout(res, LLM_TOTAL_TIMEOUT_MS);
+      let data;
+      try { data = JSON.parse(rawBody); }
+      catch { throw new Error('Upstream returned a non-JSON body: ' + rawBody.substring(0, 150)); }
       const msg = data.choices?.[0]?.message;
       if (!msg) throw new Error('No message returned from API');
       
@@ -723,6 +759,23 @@ async function fetchHistoryPage(db, sid, limit, beforeTs = 0) {
   }
 
   return { messages: rows, has_more: hasMore };
+}
+
+// A generation that produced no text must not cost the user what they typed.
+// We write their message plus an EMPTY bot row: the turn is still there after a
+// reload, and the ordinary regenerate flow fills the reply in, instead of the
+// message vanishing and having to be typed out again.
+// First attempt only - regenerate and swipe report the error and change nothing.
+async function savePlaceholderTurn(db, sid, userMsgId, content, userTs, botContent = '') {
+  const botId   = generateId();
+  const groupId = 'g_' + generateId();
+  const botTs   = Math.max(Date.now(), userTs + 1);   // guarantee chronological order
+  const ins = 'INSERT INTO chat_history (id, session_id, group_id, is_main, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)';
+  await db.d1.batch([
+    db.d1.prepare(ins).bind(userMsgId, sid, 'g_' + generateId(), 1, 'user', content, userTs),
+    db.d1.prepare(ins).bind(botId, sid, groupId, 1, 'bot', botContent, botTs),
+  ]);
+  return { user_id: userMsgId, bot_id: botId, group_id: groupId };
 }
 
 // -- SSE STREAM -------------------------------------------------------
@@ -957,7 +1010,10 @@ function createUnifiedStream({ openStream, onFinish }) {
       }
 
       if (hardError) {
-        await send({ error: lastErr?.message || 'Upstream connection failed' });
+        // meta carries the ids of the turn onFinish saved despite the failure,
+        // so the browser can keep the user's message on screen instead of
+        // throwing it away.
+        await send({ error: lastErr?.message || 'Upstream connection failed', ...meta });
       } else {
         await send({ done: true, partial, ...meta });
       }
@@ -1250,30 +1306,28 @@ case 'logout': {
           try {
             firstStream = (await executeLLM(apiKeys, ctxMsgs, 'chat', thinkingEffort, true, null, gen)).stream;
           } catch (e) {
+            // Make the next attempt re-read api_keys / gen_settings instead of
+            // trusting this isolate's copy, so fixing a broken key takes effect
+            // immediately rather than after the cache TTL.
+            cacheDrop('cfg');
+
             // GEMINI DEBUG: if this was a Gemini failure, persist the real error as chat history
             if (e.isGeminiDebug) {
-              const botId   = generateId();
-              const groupId = 'g_' + generateId();
-              let botTs = Date.now();
-              if (botTs <= userTs) botTs = userTs + 1;
               const errText = '\u26a0\ufe0f **Gemini API Error**\n\n```\n' + e.message + '\n```';
-
-              await db.d1.batch([
-                db.d1.prepare('INSERT INTO chat_history (id, session_id, group_id, is_main, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)')
-                  .bind(userMsgId, sid, 'g_' + generateId(), 1, 'user', content, userTs),
-                db.d1.prepare('INSERT INTO chat_history (id, session_id, group_id, is_main, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)')
-                  .bind(botId, sid, groupId, 1, 'bot', errText, botTs),
-              ]);
-
-              return jsonResponse({
-                gemini_error: true,
-                user_id: userMsgId,
-                bot_id: botId,
-                group_id: groupId,
-                content: errText,
-              });
+              const ids = await savePlaceholderTurn(db, sid, userMsgId, content, userTs, errText);
+              return jsonResponse({ gemini_error: true, ...ids, content: errText });
             }
-            return errResponse(e.message, 500);
+
+            // Upstream never opened a stream. Save the turn anyway, with an
+            // empty reply, so the message is not lost - and answer 200 with the
+            // error in the payload: a 5xx here makes streamFetch retry, which
+            // would write the same turn two more times.
+            try {
+              const ids = await savePlaceholderTurn(db, sid, userMsgId, content, userTs);
+              return jsonResponse({ upstream_error: true, error: e.message, ...ids });
+            } catch {
+              return errResponse(e.message, 500);   // nothing saved; the client keeps the draft
+            }
           }
 
           // Called once with null, then again for each reconnect attempt after
@@ -1295,7 +1349,14 @@ case 'logout': {
           const { readable, done } = createUnifiedStream({
             openStream,
             onFinish: async (finalText, hardError) => {
-              if (hardError) return {};   // nothing was written, so nothing to clean up
+              // The stream opened but produced no text at all. Same deal as a
+              // provider that never connected: keep the user's message with an
+              // empty reply attached, ready to be regenerated.
+              if (hardError) {
+                cacheDrop('cfg');
+                try { return await savePlaceholderTurn(db, sid, userMsgId, content, userTs); }
+                catch { return {}; }
+              }
 
               const botId   = generateId();
               const groupId = 'g_' + generateId();
@@ -1353,6 +1414,9 @@ case 'logout': {
           try {
             firstStream = (await executeLLM(apiKeys, ctxMsgs, 'chat', 'none', true, null, gen)).stream;
           } catch (e) {
+            // Regenerate deliberately saves nothing: the existing reply stays
+            // exactly as it was and the user just sees the error.
+            cacheDrop('cfg');
             return errResponse(e.message, 500);
           }
 
@@ -1372,10 +1436,13 @@ case 'logout': {
           const { readable, done } = createUnifiedStream({
             openStream,
             onFinish: async (finalText, hardError) => {
-              if (hardError) return {};   // keep the existing variant untouched
+              if (hardError) { cacheDrop('cfg'); return {}; }   // keep the existing variant untouched
               const botId = generateId();
               await db.d1.batch([
                 db.d1.prepare('UPDATE chat_history SET is_main = 0 WHERE group_id = ?').bind(groupId),
+                // Clear out the empty row a failed send left behind, so nobody
+                // ends up with a blank variant to swipe back through.
+                db.d1.prepare("DELETE FROM chat_history WHERE group_id = ? AND role = 'bot' AND TRIM(content) = ''").bind(groupId),
                 db.d1.prepare('INSERT INTO chat_history (id, session_id, group_id, is_main, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)')
                   // Reuse the old timestamp to prevent context jumping.
                   .bind(botId, oldMsg.session_id, groupId, 1, 'bot', finalText, oldMsg.timestamp),
@@ -2361,24 +2428,35 @@ async function* parseStream(response) {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    while(true) {
-        const {done, value} = await reader.read();
-        if (value) buffer += decoder.decode(value, {stream: true});
-        if (done)  buffer += decoder.decode();
-        let lines = buffer.split('\\n');
-        // On the final read we keep the tail instead of discarding it: a last
-        // frame that arrived without a trailing newline used to be dropped,
-        // which is exactly how the 'done' event went missing.
-        buffer = done ? '' : lines.pop();
-        for(let line of lines) {
-            line = line.trim();
-            if(!line.startsWith('data:')) continue;
-            const payload = line.slice(5).trim();
-            if(payload && payload !== '[DONE]') {
-                try { yield JSON.parse(payload); } catch(e) {}
+    try {
+        while(true) {
+            const {done, value} = await reader.read();
+            if (value) buffer += decoder.decode(value, {stream: true});
+            if (done)  buffer += decoder.decode();
+            let lines = buffer.split('\\n');
+            // On the final read we keep the tail instead of discarding it: a last
+            // frame that arrived without a trailing newline used to be dropped,
+            // which is exactly how the 'done' event went missing.
+            buffer = done ? '' : lines.pop();
+            for(let line of lines) {
+                line = line.trim();
+                if(!line.startsWith('data:')) continue;
+                const payload = line.slice(5).trim();
+                if(payload && payload !== '[DONE]') {
+                    try { yield JSON.parse(payload); } catch(e) {}
+                }
             }
+            if (done) break;
         }
-        if (done) break;
+    } finally {
+        // Leaving the for-await early - which is exactly what an error frame
+        // makes the caller do - does NOT close the response on its own. An
+        // abandoned body holds its HTTP connection open for good, and after a
+        // handful of failed generations the browser hits its per-origin
+        // connection cap: every later request then just hangs, whichever
+        // provider is selected, until the network is reset. That is why
+        // switching on a VPN appeared to "fix" it. Always hand the socket back.
+        try { await reader.cancel(); } catch(e) {}
     }
 }
 
@@ -2395,7 +2473,13 @@ async function streamFetch(action, payload, tries = 3) {
             });
             // 5xx here means the provider never opened a stream, so nothing was
             // written server-side and retrying cannot duplicate a message.
-            if (resp.status >= 500 && i < tries - 1) { await sleep(400 * (i + 1)); continue; }
+            if (resp.status >= 500 && i < tries - 1) {
+                // Drop the body we are about to discard, or its connection stays
+                // open and counts against the browser's per-origin limit.
+                try { await resp.body?.cancel(); } catch(e) {}
+                await sleep(400 * (i + 1));
+                continue;
+            }
             return resp;
         } catch (e) {
             lastErr = e;
@@ -2701,6 +2785,9 @@ function buildMsgEl(msg){
         <div class="w-px h-3 bg-gray-300 dark:bg-gray-700 mx-1"></div>
         <span class="text-[10px] px-1.5 py-0.5 rounded \${isLast?'text-green-600 dark:text-green-400 bg-green-100 dark:bg-green-900/30':'text-amber-600 dark:text-amber-400 bg-amber-100 dark:bg-amber-900/30'}">\${isLast?'Latest':'Older'}</span>
       </div>\`:'';
+    // An empty bot row is what a failed generation leaves behind: the message
+    // was saved, the reply was not. Offer the retry rather than a blank bubble.
+    const failedHtml = isGreeting ? '' : \`<span class="flex flex-wrap items-center gap-2 text-xs text-gray-500 dark:text-gray-400"><i data-lucide="alert-triangle" class="w-3.5 h-3.5 text-amber-500 flex-shrink-0"></i><span>No reply was generated — your message was saved.</span><button onclick="regenDrop('\${msg.id}')" class="px-2 py-0.5 rounded border border-gray-300 dark:border-gray-700 hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-700 dark:text-gray-300">Retry</button></span>\`;
     const vdata=encodeURIComponent(JSON.stringify(vars));
     const idata=encodeURIComponent(JSON.stringify(ids));
     wrap.innerHTML=\`
@@ -2708,7 +2795,7 @@ function buildMsgEl(msg){
         <div class="w-8 h-8 rounded-full bg-gray-100 dark:bg-[#111] border border-gray-200 dark:border-gray-800 flex items-center justify-center flex-shrink-0 mt-1 overflow-hidden">\${avatarHtml}</div>
         <div class="flex flex-1 min-w-0 items-start space-x-2">
           <div class="\${!isGreeting && isLatest ? 'swipeable' : ''} min-w-0" id="bb-\${msg.id}" data-group="\${esc(msg.group_id||'')}" data-vars="\${vdata}" data-ids="\${idata}" data-ai="\${ai}">
-            <div class="msg-content text-sm leading-relaxed bg-white dark:bg-[#111] border border-gray-100 dark:border-gray-800 rounded-2xl rounded-tl-sm p-4 shadow-sm w-fit max-w-full break-words">\${formatContent(content)}</div>
+            <div class="msg-content text-sm leading-relaxed bg-white dark:bg-[#111] border border-gray-100 dark:border-gray-800 rounded-2xl rounded-tl-sm p-4 shadow-sm w-fit max-w-full break-words">\${content ? formatContent(content) : failedHtml}</div>
             \${pill}
           </div>
           <div class="flex-shrink-0 pt-2"><button onclick="toggleDropdown(event,'\${msg.id}',true)" class="p-1 text-gray-400 hover:text-black dark:hover:text-white rounded opacity-0 group-hover:opacity-100 transition-opacity"><i data-lucide="more-vertical"class="w-4 h-4"></i></button></div>
@@ -2757,6 +2844,33 @@ function scrollToBottom(smooth=false){
     cc.scrollTo({top:cc.scrollHeight,behavior:smooth?'smooth':'instant'});
 }
 
+// Swap the optimistic bubble ids for the rows the server actually wrote, so the
+// turn survives a reload and the message menu / regenerate act on real ids.
+function adoptSavedTurn(tuid, tbid, d, botContent){
+    const bi = S.msgs.findIndex(m=>m.id==tbid);
+    if (bi !== -1 && d.bot_id) {
+        S.msgs[bi].id = d.bot_id;
+        S.msgs[bi].group_id = d.group_id || '';
+        S.msgs[bi].variant_ids = [d.bot_id];
+        S.msgs[bi].variants = [botContent];
+        S.msgs[bi].content = botContent;
+    }
+    const ui = S.msgs.findIndex(m=>m.id==tuid);
+    if (ui !== -1 && d.user_id) S.msgs[ui].id = d.user_id;
+
+    const bub = document.querySelector(\`[data-msg-id="\${tbid}"]\`);
+    if (bub && d.bot_id) {
+        bub.dataset.msgId = d.bot_id;
+        const bbel = document.getElementById(\`bb-\${tbid}\`);
+        if (bbel) bbel.id = \`bb-\${d.bot_id}\`;
+    }
+    const ubub = document.querySelector(\`[data-msg-id="\${tuid}"]\`);
+    if (ubub && d.user_id) ubub.dataset.msgId = d.user_id;
+
+    if (d.bot_id)  refreshMsgEl(d.bot_id);
+    if (d.user_id) refreshMsgEl(d.user_id);
+}
+
 async function handleSend(){
     if(S.generating)return;
     const ta=$('chat-input');const txt=ta.value.trim();if(!txt)return;
@@ -2777,6 +2891,9 @@ async function handleSend(){
     // Tracked so a broken stream never silently discards a reply the server
     // already persisted.
     let gotDone = false, gotAnyText = false;
+    // Set when the worker tells us it saved this turn even though the reply
+    // failed, so the catch below keeps the bubbles instead of deleting them.
+    let savedTurn = null;
 
     try {
         const resp = await streamFetch('sendMessage', {content:txt, thinking_effort:S.thinkingEffort});
@@ -2786,37 +2903,17 @@ async function handleSend(){
             throw new Error(errJson.error || 'Server error');
         }
 
-        // GEMINI DEBUG: server returned a saved error message instead of a stream
+        // The server answers with JSON instead of a stream when it has already
+        // written the turn to the database: a Gemini debug error, or an upstream
+        // that never opened at all. Either way the ids are real - adopt them so
+        // the message stays put and can simply be regenerated.
         const ctype = resp.headers.get('Content-Type') || '';
         if (ctype.includes('application/json')) {
             const data = await resp.json();
-            if (data.gemini_error) {
-                // Promote the placeholder bot bubble to the real saved error message
-                const bi = S.msgs.findIndex(m=>m.id==tbid);
-                if (bi !== -1) {
-                    S.msgs[bi].id = data.bot_id;
-                    S.msgs[bi].group_id = data.group_id;
-                    S.msgs[bi].variant_ids = [data.bot_id];
-                    S.msgs[bi].variants = [data.content];
-                    S.msgs[bi].content = data.content;
-                }
-                const ui = S.msgs.findIndex(m=>m.id==tuid);
-                if (ui !== -1 && data.user_id) S.msgs[ui].id = data.user_id;
-
-                // Fix DOM ids so the bubbles persist correctly
-                const bub = document.querySelector(\`[data-msg-id="\${tbid}"]\`);
-                if (bub) {
-                    bub.dataset.msgId = data.bot_id;
-                    const bbel = document.getElementById(\`bb-\${tbid}\`);
-                    if (bbel) bbel.id = \`bb-\${data.bot_id}\`;
-                }
-                const ubub = document.querySelector(\`[data-msg-id="\${tuid}"]\`);
-                if (ubub && data.user_id) ubub.dataset.msgId = data.user_id;
-
-                refreshMsgEl(data.bot_id);
-                if (data.user_id) refreshMsgEl(data.user_id);
+            if (data.gemini_error || data.upstream_error) {
+                adoptSavedTurn(tuid, tbid, data, data.content || '');
                 if(!S.userScrolled)scrollToBottom();
-
+                if (data.upstream_error) toast('AI error: ' + data.error + ' — your message was saved, press Retry.', 7000);
                 S.generating=false;$('send-btn').disabled=false;
                 return; // stop here — there is no stream to read
             }
@@ -2827,7 +2924,12 @@ async function handleSend(){
         let lastRender = 0; // PERF FIX 3: throttle re-parsing while streaming
 
 for await (const data of parseStream(resp)) {
-            if (data.error) throw new Error(data.error);
+            if (data.error) {
+                // The worker saves the turn even when the reply came back empty,
+                // and puts the ids it wrote on the error frame.
+                if (data.bot_id) savedTurn = data;
+                throw new Error(data.error);
+            }
             if (data.warning) toast(data.warning, 6000);
             if (data.resumed) toast('Reconnected — continuing the reply…', 2500);
             if (data.reasoning) fullReasoning += data.reasoning;
@@ -2849,33 +2951,7 @@ for await (const data of parseStream(resp)) {
             if (data.done) {
                 gotDone = true;
                 if (data.partial) toast('The AI connection dropped — the part that arrived was saved.', 6000);
-                const bi = S.msgs.findIndex(m=>m.id==tbid);
-                if (bi !== -1) {
-                    S.msgs[bi].id = data.bot_id;
-                    S.msgs[bi].group_id = data.group_id;
-                    S.msgs[bi].variant_ids = [data.bot_id];
-                    S.msgs[bi].variants = [display];
-                    S.msgs[bi].content = display;
-                }
-                const ui = S.msgs.findIndex(m=>m.id==tuid);
-                if (ui !== -1 && data.user_id) {
-                    S.msgs[ui].id = data.user_id;
-                }
-
-                const bub = document.querySelector(\`[data-msg-id="\${tbid}"]\`);
-                if (bub) {
-                    bub.dataset.msgId = data.bot_id;
-                    const bbel = document.getElementById(\`bb-\${tbid}\`);
-                    if(bbel) bbel.id = \`bb-\${data.bot_id}\`;
-                }
-                const ubub = document.querySelector(\`[data-msg-id="\${tuid}"]\`);
-                if (ubub && data.user_id) {
-                    ubub.dataset.msgId = data.user_id;
-                }
-
-                refreshMsgEl(data.bot_id);
-                if (data.user_id) refreshMsgEl(data.user_id);
-
+                adoptSavedTurn(tuid, tbid, data, display);
                 if(!S.userScrolled)scrollToBottom();
                 if(data.should_summarize) triggerSummarizeSilent();
             }
@@ -2887,9 +2963,21 @@ for await (const data of parseStream(resp)) {
             toast('Connection interrupted — resyncing…', 4000);
             await loadChatHistory();
             gotDone = true;   // already reconciled; skip the finally-block resync
+        } else if (savedTurn) {
+            // Upstream failed before a single token arrived, but the worker
+            // still saved the message with an empty reply. Keep both bubbles:
+            // the empty one renders a Retry button, so nothing has to be
+            // retyped. Only this first attempt saves - regenerate and swipe
+            // report the error and leave the history alone.
+            adoptSavedTurn(tuid, tbid, savedTurn, '');
+            if(!S.userScrolled)scrollToBottom();
+            toast('AI error: ' + err.message + ' — your message was saved, press Retry.', 7000);
         } else {
+            // Nothing reached the server, so put the draft back in the box
+            // rather than making the user type it out again.
             [tuid,tbid].forEach(id=>{S.msgs=S.msgs.filter(m=>m.id!=id);document.querySelector(\`[data-msg-id="\${id}"]\`)?.remove();});
-            toast('Error: ' + err.message, 5000);
+            if (!ta.value.trim()) { ta.value = txt; ta.style.height='auto'; ta.style.height=Math.min(ta.scrollHeight,160)+'px'; }
+            toast('Error: ' + err.message + ' — your message was put back in the box.', 6000);
         }
     } finally {
         S.generating=false;$('send-btn').disabled=false;
@@ -2966,8 +3054,13 @@ async function regenVariant(msgId,groupId){
                 if (data.partial) toast('The AI connection dropped — the part that arrived was saved.', 6000);
                 const m=S.msgs.find(m=>m.id==msgId);
                 if(m&&el){
-                    const newVars=[...(m.variants||[]), display];
-                    const newIds=[...(m.variant_ids||[]), data.bot_id];
+                    // The worker deletes the empty row a failed send left behind,
+                    // so replace it here instead of appending - nobody wants a
+                    // blank variant to swipe back to.
+                    const prevVars=m.variants||[], prevIds=m.variant_ids||[];
+                    const onlyPlaceholder=prevVars.length>0 && prevVars.every(v=>!v||!v.trim());
+                    const newVars=onlyPlaceholder?[display]:[...prevVars, display];
+                    const newIds=onlyPlaceholder?[data.bot_id]:[...prevIds, data.bot_id];
                     const newAi=newVars.length-1;
                     m.variants=newVars;m.variant_ids=newIds;m.active_index=newAi;
                     el.dataset.vars=encodeURIComponent(JSON.stringify(newVars));
@@ -2978,8 +3071,11 @@ async function regenVariant(msgId,groupId){
             }
         }
     } catch(err) {
-        toast('Regeneration failed: ' + err.message);
-        if(ci)ci.innerHTML='<span class="text-red-400 text-xs">Regeneration failed.</span>';
+        // Regenerate never writes anything on failure, so put the bubble back
+        // exactly as it was - including the Retry button when this message is
+        // the empty placeholder left by an earlier failed send.
+        toast('Regeneration failed: ' + err.message, 6000);
+        refreshMsgEl(msgId);
     } finally {
         S.generating=false;$('send-btn').disabled=false;
     }
@@ -3047,6 +3143,60 @@ function attachSwipeListeners(){
     });
 }
 
+/* Put the shared menu fully inside the viewport, whatever it is anchored to.
+   The old code assumed a fixed 208px width and never looked at the bottom edge,
+   so a menu opened near the composer - which is exactly where the newest reply
+   sits on a phone, and even more so when that reply is an empty bubble - ran
+   off the bottom of the screen with no way to reach the last few items. */
+function placeDropdown(drop, rect, align){
+    const M = 8;                       // clearance kept from every edge
+
+    // Measure at natural size: while .hf is applied the element has no box.
+    drop.style.maxHeight = '';
+    drop.style.overflowY = '';
+    drop.style.top = '0px';
+    drop.style.left = '0px';
+    drop.style.right = 'auto';
+    drop.classList.remove('hf');
+
+    const vw = window.innerWidth, vh = window.innerHeight;
+    drop.style.maxWidth = \`\${vw - 2*M}px\`;
+    const w = Math.min(drop.offsetWidth, vw - 2*M);
+    let   h = drop.offsetHeight;
+
+    // Vertical: below the button by default, flipped above when it does not
+    // fit, and capped + scrollable when neither side has room.
+    const below = vh - rect.bottom - 4 - M;
+    const above = rect.top - 4 - M;
+    let top;
+    if      (h <= below) top = rect.bottom + 4;
+    else if (h <= above) top = rect.top - 4 - h;
+    else {
+        const useAbove = above > below;
+        h = Math.max(140, useAbove ? above : below);
+        top = useAbove ? rect.top - 4 - h : rect.bottom + 4;
+    }
+
+    // The anchor can sit outside the viewport - a rect measured before an
+    // orientation change, a button scrolled out of view - so never trust the
+    // branch above to have landed on screen. Cap the height to what the screen
+    // can show, make it scrollable when it had to be capped, then clamp.
+    if (h > vh - 2*M) { h = vh - 2*M; }
+    if (h < drop.scrollHeight) {
+        drop.style.maxHeight = \`\${h}px\`;
+        drop.style.overflowY = 'auto';
+    }
+    top = Math.min(Math.max(M, top), Math.max(M, vh - h - M));
+
+    // Horizontal: anchor to the button's near edge, then clamp both sides.
+    let left = align === 'right' ? rect.right - w : rect.left;
+    left = Math.min(Math.max(M, left), Math.max(M, vw - w - M));
+
+    drop.style.left  = \`\${left}px\`;
+    drop.style.right = 'auto';
+    drop.style.top   = \`\${top}px\`;
+}
+
 function toggleDropdown(e,id,isBot){
     e.stopPropagation();
     const drop=$('global-dropdown'),btn=e.currentTarget,rect=btn.getBoundingClientRect();
@@ -3072,16 +3222,8 @@ drop.innerHTML=\`
         <button onclick="rewindHere('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left text-red-500"><i data-lucide="rotate-ccw"class="w-4 h-4 mr-2"></i>Rewind Here</button>
         <button onclick="deleteMsg('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left text-red-500"><i data-lucide="trash-2"class="w-4 h-4 mr-2"></i>Delete</button>\`;
     lucide.createIcons();
-    drop.classList.remove('hf');
-    drop.style.top=\`\${rect.bottom+4}px\`;
-    
-    if(isBot){
-        drop.style.left=\`\${rect.left}px\`;drop.style.right='auto';
-        if (rect.left + 208 > window.innerWidth) { drop.style.left = 'auto'; drop.style.right = '10px'; }
-    } else {
-        drop.style.right=\`\${window.innerWidth-rect.right}px\`;drop.style.left='auto';
-        if (window.innerWidth - rect.right + 208 > window.innerWidth) { drop.style.right = 'auto'; drop.style.left = '10px'; }
-    }
+    // A bot menu hangs off the left of its button, a user menu off the right.
+    placeDropdown(drop, rect, isBot ? 'left' : 'right');
 }
 
 function togglePersonaDropdown(e) {
@@ -3102,13 +3244,16 @@ function togglePersonaDropdown(e) {
         </div>
     \`;
     lucide.createIcons();
-    drop.classList.remove('hf');
-    drop.style.top = \`\${rect.bottom + 4}px\`;
-    drop.style.left = \`\${rect.left}px\`;
-    drop.style.right = 'auto';
+    placeDropdown(drop, rect, 'left');
 }
 
-function closeAllDropdowns(){$('global-dropdown').classList.add('hf');}
+function closeAllDropdowns(){
+    const d=$('global-dropdown');
+    d.classList.add('hf');
+    // Drop the clamp placeDropdown may have applied, so the next open measures
+    // the menu at its natural size again.
+    d.style.maxHeight=''; d.style.overflowY=''; d.style.maxWidth='';
+}
 function copyMsg(id){const m=S.msgs.find(m=>m.id==id);if(!m)return;navigator.clipboard.writeText(m.role==='bot'?(m.variants?.[m.active_index||0]||''):(m.content||''));toast('Copied!');closeAllDropdowns();}
 function pinMsg(id) {
     const m = S.msgs.find(m => m.id == id);
