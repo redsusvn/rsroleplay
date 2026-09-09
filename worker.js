@@ -141,7 +141,7 @@ function cacheDrop(prefix) {
 }
 
 // Bumped on every deploy so browsers revalidate the HTML shell cheaply.
-const APP_BUILD = '2026-09-08-perf2';
+const APP_BUILD = '2026-09-10-do1';
 const HTML_CACHE_CONTROL = 'private, max-age=0, must-revalidate';
 let _hasUsers = false, _appHTML = null, _setupHTML = null;
 
@@ -158,7 +158,7 @@ const CONTINUE_PROMPT = 'Your previous reply was cut off part-way through by a n
 
 // Bump this whenever SCHEMA_SQL changes; existing databases pick the change up
 // on the next cold start instead of needing a manual migration.
-const SCHEMA_VERSION = '4';
+const SCHEMA_VERSION = '5';
 
 // NOTE: d1.exec() requires exactly one statement per line.
 const SCHEMA_SQL = [
@@ -182,6 +182,10 @@ const SCHEMA_SQL = [
   `CREATE INDEX IF NOT EXISTS idx_us_user ON user_sessions (user_id);`,
   `CREATE INDEX IF NOT EXISTS idx_us_expires ON user_sessions (expires_at);`,
   `CREATE INDEX IF NOT EXISTS idx_cs_created ON chat_sessions (created_at);`,
+  // In-flight reply tracking, so a client can follow a generation that outlived
+  // its connection (see generationStatus).
+  `CREATE TABLE IF NOT EXISTS active_generations (bot_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, group_id TEXT NOT NULL, state TEXT NOT NULL, error TEXT, updated_at INTEGER);`,
+  `CREATE INDEX IF NOT EXISTS idx_ag_session ON active_generations (session_id);`,
   `CREATE INDEX IF NOT EXISTS idx_ak_mode ON api_keys (key_mode, is_primary);`,
 ].join('\n');
 
@@ -410,10 +414,12 @@ async function buildCtx(sid, userMsg, db, beforeTs = null, ctx = null) {
 
   history.reverse();
   for (const h of history) {
-    // Strip <think> blocks so they don't consume context tokens
-    const cleanContent = h.content.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    // Strip <think> blocks so they don't consume context tokens. The regex only
+    // runs when there is one to strip.
+    const cleanContent = (h.content.indexOf('<think>') === -1 ? h.content
+                          : h.content.replace(/<think>[\s\S]*?<\/think>/gi, '')).trim();
     // A failed generation leaves an empty bot row behind so the user's message
-    // survives (see savePlaceholderTurn). It must never reach a provider: an
+    // survives (see reserveTurn). It must never reach a provider: an
     // empty assistant turn is a 400 on Gemini and confuses everything else.
     if (!cleanContent) continue;
     msgs.push({ role: h.role === 'bot' ? 'assistant' : 'user', content: cleanContent });
@@ -555,18 +561,17 @@ let keys = apiKeys.filter(k => k.key_mode === mode).sort((a, b) => b.is_primary 
   for (const key of keys) {
     try {
       const { provider } = key;
-      const headers = { 
-        'Content-Type': 'application/json', 
-        'Accept': 'application/json',
+      // A server calling an API should look like one. The browser impersonation
+      // this used to send (a fake Chrome UA, Sec-Fetch-* headers, and a random
+      // X-Forwarded-For on every request) is a textbook bot signature and a
+      // plausible way to get a whole Cloudflare egress IP throttled - which
+      // would explain "works from any other client, dead from this one until
+      // the VPN moves me to another colo".
+      const headers = {
+        'Content-Type':  'application/json',
+        'Accept':        stream ? 'text/event-stream' : 'application/json',
         'Authorization': `Bearer ${key.api_key ?? ''}`,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Sec-Ch-Ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-        'Sec-Ch-Ua-Mobile': '?0',
-        'Sec-Ch-Ua-Platform': '"Windows"',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'same-site',
-        'X-Forwarded-For': `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`
+        'User-Agent':    'rsroleplay-worker/1.0',
       };
       
       let url;
@@ -761,38 +766,29 @@ async function fetchHistoryPage(db, sid, limit, beforeTs = 0) {
   return { messages: rows, has_more: hasMore };
 }
 
-// A generation that produced no text must not cost the user what they typed.
-// We write their message plus an EMPTY bot row: the turn is still there after a
-// reload, and the ordinary regenerate flow fills the reply in, instead of the
-// message vanishing and having to be typed out again.
-// First attempt only - regenerate and swipe report the error and change nothing.
-async function savePlaceholderTurn(db, sid, userMsgId, content, userTs, botContent = '') {
-  const botId   = generateId();
-  const groupId = 'g_' + generateId();
-  const botTs   = Math.max(Date.now(), userTs + 1);   // guarantee chronological order
-  const ins = 'INSERT INTO chat_history (id, session_id, group_id, is_main, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)';
-  await db.d1.batch([
-    db.d1.prepare(ins).bind(userMsgId, sid, 'g_' + generateId(), 1, 'user', content, userTs),
-    db.d1.prepare(ins).bind(botId, sid, groupId, 1, 'bot', botContent, botTs),
-  ]);
-  return { user_id: userMsgId, bot_id: botId, group_id: groupId };
-}
-
 // -- SSE STREAM -------------------------------------------------------
 // Design rules, in order of importance:
 //   1. Never throw away text we already received. If the upstream provider
 //      drops the socket we save the partial reply instead of discarding it.
 //   2. If it drops mid-generation, transparently reconnect and ask the model to
 //      continue, stitching the halves back together (overlap-deduplicated).
-//   3. Writes to the browser are best-effort. If the tab goes away we keep
-//      reading and still persist the reply (the caller wraps the run promise in
-//      ctx.waitUntil), so a flaky client connection never loses a message.
-// Reasoning models can think for a long while before the first token, so the
-// first byte gets a much longer grace period than the gaps between tokens.
-const STREAM_FIRST_BYTE_MS = 150_000;
-const STREAM_STALL_MS      = 45_000; // no further bytes for this long => dropped
-const STREAM_MAX_RESUMES   = 2;      // reconnect attempts after a drop
-const RESUME_SCAN_CHARS    = 400;    // how much of a resumed reply we inspect for overlap
+//   3. The browser is only ever a spectator. Frames to it are best-effort and
+//      can never slow the upstream read; the reply is checkpointed to the
+//      database as it arrives and finished under waitUntil, so a phone with
+//      a bad connection - or no connection - still ends up with the full text.
+//   4. CPU is the scarce resource. A Free-plan Worker gets 10 ms per request,
+//      accrued over the entire stream, so the hot loop does no JSON parsing
+//      of provider deltas, writes no per-delta frames and arms no per-read
+//      timers (see createUnifiedStream).
+const STREAM_FIRST_BYTE_MS = 90_000;  // reasoning models can think a while before the first token
+const STREAM_STALL_MS      = 30_000;  // no further bytes for this long => dropped
+const STREAM_MAX_RESUMES   = 2;       // reconnect attempts after a mid-reply drop
+const STREAM_TOTAL_MS      = 240_000; // hard ceiling on one generation, resumes included
+const RESUME_SCAN_CHARS    = 400;     // how much of a resumed reply we inspect for overlap
+const FLUSH_MS             = 150;     // outbound frames are coalesced to this cadence...
+const FLUSH_CHARS          = 2048;    // ...or sooner once this much text is waiting
+const CHECKPOINT_MS        = 2000;    // partial reply -> database cadence
+const STALL_AFTER_MS       = 45_000;  // a 'running' row not checkpointed for this long is dead
 
 // Some providers simply never send [DONE] or a finish_reason. Reconnecting
 // twice for every one of those messages would be pure waste, so we only resume
@@ -808,7 +804,9 @@ function looksTruncated(text) {
 function stripOverlap(prev, next) {
   if (!prev || !next) return next;
   const max = Math.min(prev.length, next.length, RESUME_SCAN_CHARS);
+  const first = next.charCodeAt(0);
   for (let n = max; n >= 4; n--) {
+    if (prev.charCodeAt(prev.length - n) !== first) continue;   // cheap pre-check before slicing
     if (!prev.endsWith(next.slice(0, n))) continue;
     // A long match is unambiguous. A short one only counts when it starts on a
     // word boundary, so we never eat a legitimately repeated fragment.
@@ -819,143 +817,202 @@ function stripOverlap(prev, next) {
   return next;
 }
 
-async function readWithTimeout(reader, ms) {
-  let timer;
-  try {
-    return await Promise.race([
-      reader.read(),
-      new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('Upstream stalled')), ms); }),
-    ]);
-  } finally { clearTimeout(timer); }
+// The string value of `"key":"` inside one JSON line, without parsing the
+// object. Bounded to [s, e). The key pattern includes its opening quote, so it
+// cannot match inside a string value (where quotes are always escaped), and
+// `"content":"` cannot match `"reasoning_content":"`. Returns null when the
+// key is absent or not a string (e.g. `"content":null`).
+function jsonStr(text, keyPat, s, e) {
+  const k = text.indexOf(keyPat, s);
+  if (k === -1 || k >= e) return null;
+  const from = k + keyPat.length;
+  let i = from, esc = false;
+  for (; i < e; i++) {
+    const ch = text.charCodeAt(i);
+    if (esc) { esc = false; continue; }
+    if (ch === 92) { esc = true; continue; }   // backslash
+    if (ch === 34) break;                      // closing quote
+  }
+  const raw = text.slice(from, i);
+  if (raw.indexOf('\\') === -1) return raw;    // no escapes: verbatim
+  try { return JSON.parse('"' + raw + '"'); } catch { return null; }
 }
 
 /**
  * @param openStream  async (partialSoFar|null) => ReadableStream - called once
  *                    up front, then again for each resume attempt.
- * @param onFinish    async (finalText, hardError, partial) => metadata object
+ * @param onFinish    async (finalText, hardError, partial, errMsg) => metadata
+ * @param onProgress  (textSoFar) => Promise - throttled checkpoint of the
+ *                    partial reply. Failures are ignored, calls never overlap,
+ *                    and the last one is awaited before onFinish.
+ * @param initial     object sent as the very first frame (the saved row ids).
  */
-function createUnifiedStream({ openStream, onFinish }) {
-  const { readable, writable } = new TransformStream();
-  const writer = writable.getWriter();
+function createUnifiedStream({ openStream, onFinish, onProgress = null, initial = null }) {
   const enc = new TextEncoder();
-
-  let clientGone = false;
-  const send = (obj) => {
-    if (clientGone) return Promise.resolve();
-    return writer.write(enc.encode(`data: ${JSON.stringify(obj)}\n\n`)).catch(() => { clientGone = true; });
-  };
+  let controller = null, clientGone = false;
+  // A plain ReadableStream cannot exert backpressure on us: a slow phone just
+  // receives bigger frames while the provider is read at full speed. (The old
+  // TransformStream writer was awaited, so a stalled browser stalled the
+  // upstream read until the provider's idle timeout cut the reply short.)
+  const readable = new ReadableStream({
+    start(c) { controller = c; },
+    cancel()  { clientGone = true; },   // browser went away: keep generating, stop sending
+  });
+  function emit(str) {
+    if (clientGone) return;
+    try { controller.enqueue(enc.encode(str)); } catch { clientGone = true; }
+  }
+  const sendFrame = (obj) => emit('data: ' + JSON.stringify(obj) + '\n\n');
 
   let content = '', reasoning = '';
-  // While resuming we hold the first RESUME_SCAN_CHARS back so we can dedupe the seam.
-  let headBuf = null;
-  let skipChars = 0;   // characters of a restarted reply still to be dropped
+  let headBuf = null;      // resume: first RESUME_SCAN_CHARS held back for seam dedupe
+  let skipChars = 0;       // resume: characters of a restarted reply still to drop
+  let deadline = Infinity;
+  let streamError = null;  // an {"error":...} line the provider sent instead of text
 
-  async function pushText(chunk) {
+  // -- outbound coalescing ----------------------------------------------
+  let pendText = '', pendReasoning = '', flushTimer = null;
+  function flush() {
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+    if (!pendText && !pendReasoning) return;
+    const f = {};
+    if (pendReasoning) { f.reasoning = pendReasoning; pendReasoning = ''; }
+    if (pendText)      { f.chunk = pendText;          pendText = ''; }
+    sendFrame(f);
+  }
+  function queue(isText, t) {
+    if (isText) pendText += t; else pendReasoning += t;
+    if (pendText.length + pendReasoning.length >= FLUSH_CHARS) return flush();
+    if (!flushTimer) flushTimer = setTimeout(flush, FLUSH_MS);
+  }
+
+  // -- checkpointing ------------------------------------------------------
+  let lastCkAt = 0, lastCkLen = -1, ckPromise = null;
+  const compose = (body) => reasoning ? '<think>\n' + reasoning + '\n</think>\n\n' + body : body;
+  function maybeCheckpoint() {
+    if (!onProgress || ckPromise) return;
+    const now = Date.now();
+    // Nobody is watching once the browser is gone, so checkpoint more often:
+    // it is the only thing standing between the reply and a kill.
+    if (now - lastCkAt < (clientGone ? CHECKPOINT_MS / 2 : CHECKPOINT_MS)) return;
+    const len = content.length + reasoning.length;
+    if (len === lastCkLen || len === 0) return;
+    lastCkAt = now; lastCkLen = len;
+    // Not awaited: a database round trip must never stall the provider read.
+    ckPromise = Promise.resolve().then(() => onProgress(compose(content))).catch(() => {}).then(() => { ckPromise = null; });
+  }
+
+  // -- text intake (resume-aware) -----------------------------------------
+  function pushText(chunk) {
     if (skipChars > 0) {
       if (chunk.length <= skipChars) { skipChars -= chunk.length; return; }
-      chunk = chunk.slice(skipChars);
-      skipChars = 0;
+      chunk = chunk.slice(skipChars); skipChars = 0;
     }
     if (headBuf !== null) {
       headBuf += chunk;
-      if (headBuf.length < RESUME_SCAN_CHARS) return;
-      return absorbHead();
+      if (headBuf.length >= RESUME_SCAN_CHARS) absorbHead();
+      return;
     }
-    content += chunk;
-    return send({ chunk });
+    content += chunk; queue(true, chunk);
   }
-
   // Decides what to do with the opening of a resumed reply.
-  async function absorbHead() {
-    const head = headBuf;
-    headBuf = null;
+  function absorbHead() {
+    const head = headBuf; headBuf = null;
     if (!head) return;
-
-    // Case 1: the model ignored "continue" and started the reply over. Skip
-    // ahead to the point we had already reached instead of duplicating it.
     if (head.length >= 60) {
+      // Case 1: the model ignored "continue" and started the reply over. Skip
+      // ahead to the point we had already reached instead of duplicating it.
       if (content.startsWith(head)) { skipChars = content.length - head.length; return; }
       if (head.startsWith(content)) {
         const rest = head.slice(content.length);
-        if (!rest) return;
-        content += rest;
-        return send({ chunk: rest });
+        if (rest) { content += rest; queue(true, rest); }
+        return;
       }
     }
-
     // Case 2: it repeated only the tail before carrying on.
     const merged = stripOverlap(content, head);
-    if (!merged) return;
-    content += merged;
-    return send({ chunk: merged });
+    if (merged) { content += merged; queue(true, merged); }
   }
 
-  async function flushHead() {
-    if (headBuf === null) return;
-    return absorbHead();
+  // One SSE data payload, text[s, e). Returns true on a finish marker.
+  function handleData(text, s, e) {
+    if (text.startsWith('[DONE]', s)) return true;
+    let got = false;
+    const c = jsonStr(text, '"content":"', s, e);
+    if (c !== null) { got = true; if (c) pushText(c); }
+    let r = jsonStr(text, '"reasoning":"', s, e);
+    if (r === null) r = jsonStr(text, '"reasoning_content":"', s, e);
+    if (r !== null) { got = true; if (r) { reasoning += r; queue(false, r); } }
+    const f = text.indexOf('"finish_reason":"', s);          // a string, i.e. not null
+    if (f !== -1 && f < e) return true;
+    if (!got) {
+      const er = text.indexOf('"error"', s);
+      if (er !== -1 && er < e) streamError = text.slice(s, Math.min(e, s + 300));
+    }
+    return false;
   }
 
   // Reads one upstream SSE stream. Returns true when the provider signalled a
-  // proper finish, false when the socket ended early.
+  // proper finish, false when the socket ended early. Throws on a stall.
   async function pump(rawStream) {
     const reader = rawStream.getReader();
     const dec = new TextDecoder();
-    let buffer = '', finished = false, sawBytes = false;
-
+    let tail = '', finished = false, sawBytes = false, stalled = false;
+    let lastByteAt = Date.now();
+    // One coarse watchdog instead of a fresh timer race per read (which cost
+    // a promise + two timer calls for every chunk). Cancelling the reader
+    // settles a pending read(), which is how the loop below finds out.
+    const watchdog = setInterval(() => {
+      const limit = sawBytes ? STREAM_STALL_MS : STREAM_FIRST_BYTE_MS;
+      const now = Date.now();
+      if (now - lastByteAt > limit || now > deadline) {
+        stalled = true;
+        try { reader.cancel(); } catch { /* already closed */ }
+      }
+    }, 5000);
     try {
       while (true) {
-        const { done, value } = await readWithTimeout(reader, sawBytes ? STREAM_STALL_MS : STREAM_FIRST_BYTE_MS);
-        if (value) { sawBytes = true; buffer += dec.decode(value, { stream: true }); }
-        if (done)  buffer += dec.decode();
+        const { done, value } = await reader.read();
+        if (stalled) throw new Error(Date.now() > deadline ? 'Generation ran out of time' : 'Upstream stalled');
+        let text = '';
+        if (value) { sawBytes = true; lastByteAt = Date.now(); text = dec.decode(value, { stream: true }); }
+        if (done) text += dec.decode() + '\n';     // flush the decoder, terminate a last line
+        if (tail) { text = tail + text; tail = ''; }
 
-        const lines = buffer.split('\n');
-        buffer = done ? '' : lines.pop();
-
-        for (let line of lines) {
-          line = line.trim();
-          if (!line.startsWith('data:')) continue;
-          const dataStr = line.slice(5).trim();
-          if (!dataStr) continue;
-          if (dataStr === '[DONE]') { finished = true; continue; }
-
-          try {
-            const parsed = JSON.parse(dataStr);
-            // Providers disagree on how they signal completion.
-            if (parsed.done || parsed.choices?.[0]?.finish_reason) finished = true;
-
-            const delta = parsed.choices?.[0]?.delta ?? {};
-            const reasoningChunk = delta.reasoning ?? '';
-            const textChunk      = delta.content   ?? '';
-            if (reasoningChunk) {
-              reasoning += reasoningChunk;
-              await send({ reasoning: reasoningChunk });
-            }
-            if (textChunk) await pushText(textChunk);
-          } catch { /* malformed chunk */ }
+        let start = 0, nl;
+        while ((nl = text.indexOf('\n', start)) !== -1) {
+          let end = nl;
+          if (end > start && text.charCodeAt(end - 1) === 13) end--;   // \r
+          if (text.startsWith('data:', start)) {
+            let p = start + 5;
+            while (p < end && text.charCodeAt(p) === 32) p++;
+            if (p < end && handleData(text, p, end)) finished = true;
+          }
+          start = nl + 1;
         }
-
+        if (start < text.length && !done) tail = text.slice(start);
+        maybeCheckpoint();
         if (done) break;
       }
     } finally {
-      await flushHead();
+      clearInterval(watchdog);
+      if (headBuf !== null) absorbHead();
       try { reader.cancel(); } catch { /* already closed */ }
     }
     return finished;
   }
 
   async function run() {
-    let clean = false;
-    let lastErr = null;
-
+    let clean = false, lastErr = null;
+    deadline = Date.now() + STREAM_TOTAL_MS;
+    if (initial) sendFrame(initial);
     // Comment frames keep intermediaries (and mobile networks) from treating a
     // long "thinking" pause as an idle connection and tearing it down.
-    const keepAlive = setInterval(() => {
-      if (clientGone) return;
-      writer.write(enc.encode(': ka\n\n')).catch(() => { clientGone = true; });
-    }, 10_000);
+    const keepAlive = setInterval(() => emit(': ka\n\n'), 10_000);
 
     try {
       for (let attempt = 0; attempt <= STREAM_MAX_RESUMES; attempt++) {
+        if (Date.now() >= deadline) { lastErr = lastErr ?? new Error('Generation ran out of time'); break; }
         const lengthBefore = content.length;
         let raw;
         try {
@@ -969,63 +1026,272 @@ function createUnifiedStream({ openStream, onFinish }) {
 
         if (attempt > 0) {
           headBuf = '';                  // dedupe the seam of the resumed reply
-          await send({ resumed: true });
+          flush();
+          sendFrame({ resumed: true });
         }
 
         try {
           if (await pump(raw)) { clean = true; break; }
-          lastErr = new Error('Upstream closed the stream before finishing');
+          lastErr = new Error(streamError ? 'Upstream error: ' + streamError : 'Upstream closed the stream before finishing');
           // No finish marker, but the text reads as complete: accept it rather
-          // than spending two more requests on a provider that just never
-          // sends [DONE].
+          // than spending two more requests on a provider that never sends [DONE].
           if (!looksTruncated(content)) { clean = true; break; }
         } catch (e) {
           lastErr = e;
         }
 
-        // A resume that produced nothing means the model has nothing left to
-        // add - stop retrying rather than burning attempts on empty replies.
+        // Nothing at all came back. executeLLM has already failed over across
+        // every configured key, so a reconnect would just spend another
+        // first-byte timeout holding a socket open - the very thing that used
+        // to leave an isolate wedged for five minutes per attempt.
+        if (content.length === 0) break;
+        // A resume that produced nothing means the model has nothing left to add.
         if (attempt > 0 && content.length === lengthBefore) break;
       }
     } finally {
       clearInterval(keepAlive);
+      flush();
+      if (ckPromise) await ckPromise;    // never let a late checkpoint overwrite the final text
 
-      const normalized = content
-        .replace(/<thought>/gi, '<think>')
-        .replace(/<\/thought>/gi, '</think>');
-      const finalOutput = reasoning
-        ? `<think>\n${reasoning}\n</think>\n\n${normalized}`
-        : normalized;
+      const body = content.indexOf('<thought>') === -1 ? content
+        : content.replace(/<thought>/gi, '<think>').replace(/<\/thought>/gi, '</think>');
+      const finalOutput = compose(body);
 
       // Only a reply with zero text is a hard failure. Anything else gets saved.
-      const hardError = !clean && normalized.trim().length === 0;
+      const hardError = !clean && body.trim().length === 0;
       const partial   = !clean && !hardError;
 
       let meta = {};
       try {
-        meta = (await onFinish(finalOutput, hardError, partial)) ?? {};
+        meta = (await onFinish(finalOutput, hardError, partial, lastErr?.message ?? null)) ?? {};
       } catch (e) {
         lastErr = e;
-        if (!hardError) await send({ warning: 'Reply received but could not be saved: ' + e.message });
+        if (!hardError) sendFrame({ warning: 'Reply received but could not be saved: ' + e.message });
       }
 
-      if (hardError) {
-        // meta carries the ids of the turn onFinish saved despite the failure,
-        // so the browser can keep the user's message on screen instead of
-        // throwing it away.
-        await send({ error: lastErr?.message || 'Upstream connection failed', ...meta });
-      } else {
-        await send({ done: true, partial, ...meta });
-      }
-      await writer.close().catch(() => {});
+      if (hardError) sendFrame({ error: lastErr?.message || 'Upstream connection failed', ...meta });
+      else           sendFrame({ done: true, partial, ...meta });
+      try { controller.close(); } catch { /* client gone */ }
     }
   }
 
   return { readable, done: run() };
 }
 
+// -- GENERATION JOBS --------------------------------------------------
+function trackGeneration(db, sid, botId, groupId) {
+  return [
+    // One tracking row per session, so a browser that reconnects (or a brand
+    // new tab) can ask what became of the reply it stopped seeing.
+    db.d1.prepare('DELETE FROM active_generations WHERE session_id = ?').bind(sid),
+    db.d1.prepare('INSERT INTO active_generations (bot_id, session_id, group_id, state, error, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .bind(botId, sid, groupId, 'running', null, Date.now()),
+  ];
+}
+
+// A message is written to the database BEFORE anything talks to a provider.
+// From that point on nothing downstream - the provider, the stream, the
+// browser's connection, the Worker being stopped - can cost the user what they
+// typed, and the empty reply row is what Retry and follow-along hang off.
+async function reserveTurn(db, sid, content) {
+  const userTs  = Date.now();
+  const userId  = generateId();
+  const botId   = generateId();
+  const groupId = 'g_' + generateId();
+  const ins = 'INSERT INTO chat_history (id, session_id, group_id, is_main, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)';
+  await db.d1.batch([
+    db.d1.prepare(ins).bind(userId, sid, 'g_' + generateId(), 1, 'user', content, userTs),
+    db.d1.prepare(ins).bind(botId, sid, groupId, 1, 'bot', '', userTs + 1),
+    ...trackGeneration(db, sid, botId, groupId),
+  ]);
+  return { user_id: userId, bot_id: botId, group_id: groupId };
+}
+
+// Partial reply -> database. Runs every CHECKPOINT_MS while streaming, so a
+// Worker stopped mid-reply (CPU limit, eviction, the tab closing and waitUntil
+// running out) loses at most a couple of seconds of text.
+function checkpointReply(db, botId, text) {
+  return db.d1.batch([
+    db.d1.prepare('UPDATE chat_history SET content = ? WHERE id = ?').bind(text, botId),
+    db.d1.prepare('UPDATE active_generations SET updated_at = ? WHERE bot_id = ?').bind(Date.now(), botId),
+  ]);
+}
+
+function markGeneration(db, botId, state, error = null) {
+  return db.run('UPDATE active_generations SET state = ?, error = ?, updated_at = ? WHERE bot_id = ?',
+    [state, error ? String(error).slice(0, 500) : null, Date.now(), botId]).catch(() => {});
+}
+
+// Called once with null, then again for each reconnect attempt after a
+// mid-reply drop. On a reconnect the model gets what it already produced and
+// is asked to carry on from there.
+function makeOpenStream(apiKeys, ctxMsgs, thinkingEffort, gen, firstStream) {
+  return async (partial) => {
+    if (!partial) {
+      if (firstStream) { const s = firstStream; firstStream = null; return s; }
+      return (await executeLLM(apiKeys, ctxMsgs, 'chat', thinkingEffort, true, null, gen)).stream;
+    }
+    const resumeMsgs = [...ctxMsgs, { role: 'assistant', content: partial }, { role: 'user', content: CONTINUE_PROMPT }];
+    return (await executeLLM(apiKeys, resumeMsgs, 'chat', thinkingEffort, true, null, gen)).stream;
+  };
+}
+
+// The reply for a turn reserved by reserveTurn. Returns { json } when there is
+// nothing to stream (the provider never opened), else { readable, done }.
+async function runSendJob(db, job) {
+  const { sid, turn, thinkingEffort } = job;
+  // The user's message is already in the history, so nothing is appended.
+  const [built, cfg] = await Promise.all([buildCtx(sid, null, db, null, null), loadKeysAndGen(db)]);
+  const { msgs: ctxMsgs, mem } = built;
+  const { apiKeys, gen } = cfg;
+
+  let firstStream;
+  try {
+    firstStream = (await executeLLM(apiKeys, ctxMsgs, 'chat', thinkingEffort, true, null, gen)).stream;
+  } catch (e) {
+    // Re-read api_keys / gen_settings next time rather than trusting this
+    // isolate's copy, so fixing a broken key takes effect immediately.
+    cacheDrop('cfg');
+    if (e.isGeminiDebug) {
+      const errText = '\u26a0\ufe0f **Gemini API Error**\n\n```\n' + e.message + '\n```';
+      await db.run('UPDATE chat_history SET content = ? WHERE id = ?', [errText, turn.bot_id]);
+      await markGeneration(db, turn.bot_id, 'error', e.message);
+      return { json: { gemini_error: true, ...turn, content: errText } };
+    }
+    await markGeneration(db, turn.bot_id, 'error', e.message);
+    // 200 with the error in the payload: a 5xx would make the browser retry
+    // and reserve the same turn again.
+    return { json: { upstream_error: true, error: e.message, ...turn } };
+  }
+
+  return createUnifiedStream({
+    openStream: makeOpenStream(apiKeys, ctxMsgs, thinkingEffort, gen, firstStream),
+    initial:    { saved: turn },
+    onProgress: (text) => checkpointReply(db, turn.bot_id, text),
+    onFinish:   async (finalText, hardError, partial, errMsg) => {
+      if (hardError) { cacheDrop('cfg'); await markGeneration(db, turn.bot_id, 'error', errMsg); return turn; }
+      const lastTs    = mem.last_summarized_timestamp ?? 0;
+      const threshold = Math.max(1, mem.summarize_threshold ?? 50);
+      const res = await db.d1.batch([
+        db.d1.prepare('UPDATE chat_history SET content = ? WHERE id = ?').bind(finalText, turn.bot_id),
+        db.d1.prepare('UPDATE active_generations SET state = ?, updated_at = ? WHERE bot_id = ?')
+          .bind(partial ? 'partial' : 'done', Date.now(), turn.bot_id),
+        // Stops counting once the threshold is reached, rather than scanning
+        // the whole session on every send.
+        db.d1.prepare('SELECT COUNT(*) AS c FROM (SELECT 1 FROM chat_history WHERE session_id = ? AND is_main = 1 AND timestamp > ? LIMIT ?)')
+          .bind(sid, lastTs, threshold),
+      ]);
+      const seen = res[2].results?.[0]?.c ?? 0;
+      return { ...turn, should_summarize: seen >= threshold };
+    },
+  });
+}
+
+// A new variant for an existing reply. Failing outright leaves the history
+// untouched: the variant row only comes into being once real text exists, and
+// from then on it is checkpointed like any other reply.
+async function runRegenJob(db, job) {
+  const { sid, oldMsg } = job;
+  const groupId = oldMsg.group_id;
+  const [built, cfg] = await Promise.all([buildCtx(sid, null, db, oldMsg.timestamp, null), loadKeysAndGen(db)]);
+  const ctxMsgs = built.msgs;
+  const { apiKeys, gen } = cfg;
+
+  let firstStream;
+  try {
+    firstStream = (await executeLLM(apiKeys, ctxMsgs, 'chat', 'none', true, null, gen)).stream;
+  } catch (e) {
+    cacheDrop('cfg');
+    return { json: { error: e.message }, status: 500 };
+  }
+
+  let botId = null;
+  const upsert = (text) => {
+    if (botId) return checkpointReply(db, botId, text);
+    botId = generateId();
+    return db.d1.batch([
+      db.d1.prepare('UPDATE chat_history SET is_main = 0 WHERE group_id = ?').bind(groupId),
+      // Clear out the empty row a failed send left behind, so nobody ends up
+      // with a blank variant to swipe back through.
+      db.d1.prepare("DELETE FROM chat_history WHERE group_id = ? AND role = 'bot' AND TRIM(content) = ''").bind(groupId),
+      db.d1.prepare('INSERT INTO chat_history (id, session_id, group_id, is_main, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        // Reuse the old timestamp to prevent context jumping.
+        .bind(botId, sid, groupId, 1, 'bot', text, oldMsg.timestamp),
+      ...trackGeneration(db, sid, botId, groupId),
+    ]);
+  };
+
+  return createUnifiedStream({
+    openStream: makeOpenStream(apiKeys, ctxMsgs, 'none', gen, firstStream),
+    onProgress: upsert,
+    onFinish:   async (finalText, hardError, partial) => {
+      if (hardError) { cacheDrop('cfg'); return {}; }   // keep the existing variant untouched
+      await upsert(finalText);
+      await markGeneration(db, botId, partial ? 'partial' : 'done');
+      return { bot_id: botId, group_id: groupId, content: finalText };
+    },
+  });
+}
+
+async function finishGeneration(db, job, ctx) {
+  const r = job.kind === 'regen' ? await runRegenJob(db, job) : await runSendJob(db, job);
+  if (r.json) return jsonResponse(r.json, r.status ?? 200);
+  // Keep draining and saving even if the browser drops the connection.
+  ctx?.waitUntil?.(r.done);
+  return new Response(r.readable, { headers: SSE_HEADERS });
+}
+
+// Runs a job where the CPU budget allows. With the STREAMER Durable Object
+// bound, the Worker hands the job over and returns the object's response as
+// its own: the bytes are piped natively, so the Worker spends no CPU on the
+// stream, while the object carries it under its own 30 s budget, unlimited
+// wall time, and its own waitUntil for finishing after the browser leaves.
+// Without the binding the very same code runs here, inside the Worker's 10 ms.
+function dispatchGeneration(env, ctx, db, job) {
+  if (env.STREAMER) {
+    const stub = env.STREAMER.get(env.STREAMER.idFromName(job.sid));
+    return stub.fetch('https://streamer/generate', { method: 'POST', body: JSON.stringify(job) });
+  }
+  return finishGeneration(db, job, ctx);
+}
+
+// ── STREAMING DURABLE OBJECT ─────────────────────────────────────────
+// One per chat session. SQLite-backed objects are on the Free plan and get
+// 30 seconds of CPU per request where the Worker gets 10 ms - the difference
+// between a long reply finishing and being killed part-way through.
+export class ChatStreamer {
+  constructor(state, env) { this.state = state; this.env = env; }
+
+  async fetch(request) {
+    const job = await request.json();
+    const db  = new DB(this.env.DB);
+    // Watchdog: should this object be evicted mid-reply, the alarm still fires
+    // and marks the generation stalled so a following browser stops waiting.
+    try { await this.state.storage.setAlarm(Date.now() + STREAM_TOTAL_MS + 60_000); } catch { /* storage unavailable */ }
+    return finishGeneration(db, job, this.state);
+  }
+
+  async alarm() {
+    const db = new DB(this.env.DB);
+    await db.run("UPDATE active_generations SET state = 'stalled', updated_at = ? WHERE state = 'running' AND updated_at < ?",
+      [Date.now(), Date.now() - STALL_AFTER_MS]).catch(() => {});
+  }
+}
+
 // ── MAIN ROUTER ──────────────────────────────────────────────────────
 export default {
+  // Daily housekeeping, fired by the cron trigger in wrangler.toml (harmless
+  // if it never fires). Small tables keep every lookup above fast.
+  async scheduled(controller, env, ctx) {
+    if (!env.DB) return;
+    const db = new DB(env.DB), now = Date.now();
+    await db.d1.batch([
+      db.d1.prepare('DELETE FROM active_generations WHERE updated_at < ?').bind(now - 86_400_000),
+      db.d1.prepare('DELETE FROM user_sessions WHERE expires_at < ?').bind(now),
+      db.d1.prepare('DELETE FROM ip_blocks WHERE locked_until IS NULL OR locked_until < ?').bind(now),
+    ]);
+  },
+
   async fetch(request, env, ctx) {
     if (!env.DB) {
       return new Response('D1 database binding "DB" not found. Check your Cloudflare settings.', { status: 500 });
@@ -1289,171 +1555,22 @@ case 'logout': {
           if (!content) return errResponse('Empty or too-long message');
           const thinkingEffort = THINKING_EFFORTS.has(body.thinking_effort) ? body.thinking_effort : 'none';
 
-          // Lock the user timestamp
-          const userTs = Date.now();
-          const userMsgId = generateId();
+          // The message is committed first; the reply is generated against it.
+          let turn;
+          try { turn = await reserveTurn(db, sid, content); }
+          catch (e) { return errResponse('Could not save your message: ' + e.message, 500); }
 
-          const [built, cfg] = await Promise.all([
-            buildCtx(sid, content, db, null, ctx),
-            loadKeysAndGen(db),
-          ]);
-          const { msgs: ctxMsgs, mem } = built;
-          const { apiKeys, gen } = cfg;
-
-          // Open the upstream stream up front so a hard provider failure still
-          // comes back as a normal JSON error the UI can render.
-          let firstStream;
-          try {
-            firstStream = (await executeLLM(apiKeys, ctxMsgs, 'chat', thinkingEffort, true, null, gen)).stream;
-          } catch (e) {
-            // Make the next attempt re-read api_keys / gen_settings instead of
-            // trusting this isolate's copy, so fixing a broken key takes effect
-            // immediately rather than after the cache TTL.
-            cacheDrop('cfg');
-
-            // GEMINI DEBUG: if this was a Gemini failure, persist the real error as chat history
-            if (e.isGeminiDebug) {
-              const errText = '\u26a0\ufe0f **Gemini API Error**\n\n```\n' + e.message + '\n```';
-              const ids = await savePlaceholderTurn(db, sid, userMsgId, content, userTs, errText);
-              return jsonResponse({ gemini_error: true, ...ids, content: errText });
-            }
-
-            // Upstream never opened a stream. Save the turn anyway, with an
-            // empty reply, so the message is not lost - and answer 200 with the
-            // error in the payload: a 5xx here makes streamFetch retry, which
-            // would write the same turn two more times.
-            try {
-              const ids = await savePlaceholderTurn(db, sid, userMsgId, content, userTs);
-              return jsonResponse({ upstream_error: true, error: e.message, ...ids });
-            } catch {
-              return errResponse(e.message, 500);   // nothing saved; the client keeps the draft
-            }
-          }
-
-          // Called once with null, then again for each reconnect attempt after
-          // a mid-reply drop. On a reconnect we hand the model what it already
-          // produced and ask it to carry on from there.
-          const openStream = async (partial) => {
-            if (!partial) {
-              if (firstStream) { const s = firstStream; firstStream = null; return s; }
-              return (await executeLLM(apiKeys, ctxMsgs, 'chat', thinkingEffort, true, null, gen)).stream;
-            }
-            const resumeMsgs = [
-              ...ctxMsgs,
-              { role: 'assistant', content: partial },
-              { role: 'user', content: CONTINUE_PROMPT },
-            ];
-            return (await executeLLM(apiKeys, resumeMsgs, 'chat', thinkingEffort, true, null, gen)).stream;
-          };
-
-          const { readable, done } = createUnifiedStream({
-            openStream,
-            onFinish: async (finalText, hardError) => {
-              // The stream opened but produced no text at all. Same deal as a
-              // provider that never connected: keep the user's message with an
-              // empty reply attached, ready to be regenerated.
-              if (hardError) {
-                cacheDrop('cfg');
-                try { return await savePlaceholderTurn(db, sid, userMsgId, content, userTs); }
-                catch { return {}; }
-              }
-
-              const botId   = generateId();
-              const groupId = 'g_' + generateId();
-              // Guarantee chronological order safely
-              let botTs = Date.now();
-              if (botTs <= userTs) botTs = userTs + 1;
-              const lastTs    = mem.last_summarized_timestamp ?? 0;
-              const threshold = Math.max(1, mem.summarize_threshold ?? 50);
-
-              // Both inserts and the summarize counter in a single round trip.
-              const res = await db.d1.batch([
-                db.d1.prepare('INSERT INTO chat_history (id, session_id, group_id, is_main, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)')
-                  .bind(userMsgId, sid, 'g_' + generateId(), 1, 'user', content, userTs),
-                db.d1.prepare('INSERT INTO chat_history (id, session_id, group_id, is_main, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)')
-                  .bind(botId, sid, groupId, 1, 'bot', finalText, botTs),
-                // Stops counting once the threshold is reached. Unbounded,
-                // this re-scanned every message in the session on every single
-                // send, which is where most of the row reads were going.
-                db.d1.prepare('SELECT COUNT(*) AS c FROM (SELECT 1 FROM chat_history WHERE session_id = ? AND is_main = 1 AND timestamp > ? LIMIT ?)')
-                  .bind(sid, lastTs, threshold),
-              ]);
-
-              const seen = res[2].results?.[0]?.c ?? 0;
-              return {
-                user_id: userMsgId,
-                bot_id: botId,
-                group_id: groupId,
-                should_summarize: seen >= threshold,
-              };
-            },
-          });
-
-          // Keep draining and saving even if the browser drops the connection,
-          // so a flaky client never costs the user a generated reply.
-          ctx?.waitUntil?.(done);
-
-          return new Response(readable, { headers: SSE_HEADERS });
+          return dispatchGeneration(env, ctx, db, { kind: 'send', sid, turn, thinkingEffort });
         }
 
         case 'regenerate': {
           const groupId = str(body.group_id, 100);
           if (!groupId) return errResponse('Invalid group_id');
-          const oldMsg = await db.get('SELECT * FROM chat_history WHERE group_id = ? AND is_main = 1 LIMIT 1', [groupId]);
+          const oldMsg = await db.get('SELECT id, session_id, group_id, timestamp FROM chat_history WHERE group_id = ? AND is_main = 1 LIMIT 1', [groupId]);
           if (!oldMsg)                   return errResponse('Not found', 404);
           if (oldMsg.session_id !== sid) return errResponse('Forbidden', 403);
 
-          const [built, cfg] = await Promise.all([
-            buildCtx(oldMsg.session_id, null, db, oldMsg.timestamp, ctx),
-            loadKeysAndGen(db),
-          ]);
-          const ctxMsgs = built.msgs;
-          const { apiKeys, gen } = cfg;
-
-          let firstStream;
-          try {
-            firstStream = (await executeLLM(apiKeys, ctxMsgs, 'chat', 'none', true, null, gen)).stream;
-          } catch (e) {
-            // Regenerate deliberately saves nothing: the existing reply stays
-            // exactly as it was and the user just sees the error.
-            cacheDrop('cfg');
-            return errResponse(e.message, 500);
-          }
-
-          const openStream = async (partial) => {
-            if (!partial) {
-              if (firstStream) { const s = firstStream; firstStream = null; return s; }
-              return (await executeLLM(apiKeys, ctxMsgs, 'chat', 'none', true, null, gen)).stream;
-            }
-            const resumeMsgs = [
-              ...ctxMsgs,
-              { role: 'assistant', content: partial },
-              { role: 'user', content: CONTINUE_PROMPT },
-            ];
-            return (await executeLLM(apiKeys, resumeMsgs, 'chat', 'none', true, null, gen)).stream;
-          };
-
-          const { readable, done } = createUnifiedStream({
-            openStream,
-            onFinish: async (finalText, hardError) => {
-              if (hardError) { cacheDrop('cfg'); return {}; }   // keep the existing variant untouched
-              const botId = generateId();
-              await db.d1.batch([
-                db.d1.prepare('UPDATE chat_history SET is_main = 0 WHERE group_id = ?').bind(groupId),
-                // Clear out the empty row a failed send left behind, so nobody
-                // ends up with a blank variant to swipe back through.
-                db.d1.prepare("DELETE FROM chat_history WHERE group_id = ? AND role = 'bot' AND TRIM(content) = ''").bind(groupId),
-                db.d1.prepare('INSERT INTO chat_history (id, session_id, group_id, is_main, role, content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)')
-                  // Reuse the old timestamp to prevent context jumping.
-                  .bind(botId, oldMsg.session_id, groupId, 1, 'bot', finalText, oldMsg.timestamp),
-              ]);
-              return { bot_id: botId, content: finalText };
-            },
-          });
-
-          ctx?.waitUntil?.(done);
-
-          return new Response(readable, { headers: SSE_HEADERS });
+          return dispatchGeneration(env, ctx, db, { kind: 'regen', sid, oldMsg });
         }
 
         case 'triggerSummarize': {
@@ -1504,6 +1621,19 @@ case 'logout': {
             current_summary: cleanSummary, last_summarized_timestamp: lid,
           });
           return jsonResponse({ success: true, summary: cleanSummary });
+        }
+
+        // What became of the newest reply in this session. A browser whose
+        // stream dropped, or a brand new tab, follows the generation through
+        // this until the server reports it finished.
+        case 'generationStatus': {
+          const row = await db.get(
+            'SELECT g.bot_id, g.group_id, g.state, g.error, g.updated_at, h.content FROM active_generations g LEFT JOIN chat_history h ON h.id = g.bot_id WHERE g.session_id = ? LIMIT 1',
+            [sid]);
+          if (!row) return jsonResponse({ state: 'idle' });
+          // A Worker stopped mid-reply never gets to write a final state.
+          if (row.state === 'running' && Date.now() - (row.updated_at ?? 0) > STALL_AFTER_MS) row.state = 'stalled';
+          return jsonResponse(row);
         }
 
         case 'getChatHistory': {
@@ -2706,6 +2836,7 @@ function applyBootstrap(d){
     updateHeader(); populateMemoryForm();
     renderAllMessages(); scrollToBottom();
     renderSketchboard();
+    resumeFollowIfRunning();
     // API keys and personas load lazily when their modal opens (see openModal).
 }
 
@@ -2734,6 +2865,7 @@ async function loadChatHistory(){
     S.msgs=d.messages||[];S.hasMore=d.has_more||false;
     renderAllMessages();
     scrollToBottom();
+    resumeFollowIfRunning();
 }
 
 async function loadOlderMessages(){
@@ -2844,6 +2976,59 @@ function scrollToBottom(smooth=false){
     cc.scrollTo({top:cc.scrollHeight,behavior:smooth?'smooth':'instant'});
 }
 
+// Keeps a reply growing on screen after the live stream is gone. The server is
+// still generating and checkpointing it to the database, so poll until it
+// reports the generation finished, failed or stalled, then load the
+// authoritative copy. Nothing here can lose text: the database is the source
+// of truth, the stream was only ever a preview of it.
+async function followGeneration(match, msgId){
+    if (S.following) return;
+    S.following = true;
+    let terminal = false, misses = 0;
+    try {
+        const started = Date.now();
+        let shown = -1;
+        while (Date.now() - started < 6*60*1000) {
+            await sleep(1500);
+            const st = await api('generationStatus');
+            if (!st || !st.state) { if (++misses > 5) break; continue; }     // transient network error
+            misses = 0;
+            if (st.state === 'idle') { terminal = true; break; }
+            const ours = (match.bot_id && st.bot_id === match.bot_id) || (match.group_id && st.group_id === match.group_id);
+            if (!ours) break;                                                  // a newer generation took over
+            const c = document.querySelector(\`[data-msg-id="\${msgId}"] .msg-content\`);
+            if (c && st.content && st.content.length !== shown) {
+                shown = st.content.length;
+                c.innerHTML = formatContent(st.content);
+                if(!S.userScrolled)scrollToBottom();
+            }
+            if (st.state !== 'running') {
+                if (st.state === 'error')   toast('AI error: ' + (st.error || 'no reply was generated'), 6000);
+                if (st.state === 'stalled') toast('The reply stopped early — what arrived was kept.', 6000);
+                if (st.state === 'partial') toast('The AI connection dropped — the part that arrived was saved.', 6000);
+                terminal = true;
+                break;
+            }
+        }
+    } finally {
+        S.following = false;
+        // Only reload once the generation is over: mid-flight there may be a
+        // newer optimistic bubble on screen that a reload would throw away.
+        if (terminal) await loadChatHistory();
+    }
+}
+
+// A page that loads while a reply is still being generated picks it up.
+async function resumeFollowIfRunning(){
+    if (S.following || S.generating) return;
+    const st = await api('generationStatus');
+    if (!st || st.state !== 'running') return;
+    const m = S.msgs.find(m=>m.id==st.bot_id) || S.msgs.find(m=>m.role==='bot' && m.group_id && m.group_id==st.group_id);
+    if (!m) return;
+    toast('A reply is still being generated — following it…', 3000);
+    followGeneration({bot_id: st.bot_id, group_id: st.group_id}, m.id);
+}
+
 // Swap the optimistic bubble ids for the rows the server actually wrote, so the
 // turn survives a reload and the message menu / regenerate act on real ids.
 function adoptSavedTurn(tuid, tbid, d, botContent){
@@ -2888,19 +3073,21 @@ async function handleSend(){
     if(typing)typing.innerHTML='<span class="flex items-center space-x-2"><svg class="animate-spin w-4 h-4 text-gray-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-9-9"/></svg><span class="text-xs text-gray-400">Imagine about the scenes...</span></span>';
     if(!S.userScrolled)scrollToBottom();
 
-    // Tracked so a broken stream never silently discards a reply the server
-    // already persisted.
-    let gotDone = false, gotAnyText = false;
-    // Set when the worker tells us it saved this turn even though the reply
-    // failed, so the catch below keeps the bubbles instead of deleting them.
+    let gotDone = false;
+    // The worker's first frame carries the ids of the rows it committed before
+    // generating. From then on nothing can lose the message: whatever happens
+    // to the stream, the bubbles stay and the reply is followed via the server.
     let savedTurn = null;
+    let fullText = "", fullReasoning = "";
+    const composed = () => fullReasoning ? \`<think>\\n\${fullReasoning}\\n</think>\\n\\n\${fullText}\` : fullText;
 
     try {
         const resp = await streamFetch('sendMessage', {content:txt, thinking_effort:S.thinkingEffort});
 
         if (!resp.ok) {
-            const errJson = await resp.json();
-            throw new Error(errJson.error || 'Server error');
+            let msg = 'Server error ' + resp.status;
+            try { const j = await resp.json(); if (j && j.error) msg = j.error; } catch(e) {}
+            throw new Error(msg);
         }
 
         // The server answers with JSON instead of a stream when it has already
@@ -2919,21 +3106,19 @@ async function handleSend(){
             }
         }
 
-        let fullText = "", fullReasoning = "";
         let display = "";
         let lastRender = 0; // PERF FIX 3: throttle re-parsing while streaming
 
 for await (const data of parseStream(resp)) {
+            if (data.saved) savedTurn = data.saved;
             if (data.error) {
-                // The worker saves the turn even when the reply came back empty,
-                // and puts the ids it wrote on the error frame.
                 if (data.bot_id) savedTurn = data;
                 throw new Error(data.error);
             }
             if (data.warning) toast(data.warning, 6000);
             if (data.resumed) toast('Reconnected — continuing the reply…', 2500);
             if (data.reasoning) fullReasoning += data.reasoning;
-            if (data.chunk) { fullText += data.chunk; gotAnyText = true; }
+            if (data.chunk) fullText += data.chunk;
 
             const _now = performance.now();
             if (data.done || _now - lastRender > 90) {
@@ -2957,21 +3142,19 @@ for await (const data of parseStream(resp)) {
             }
         }
     } catch (err) {
-        if (gotAnyText) {
-            // The worker persists whatever it received, so pull the real state
-            // back instead of throwing away the user's message.
-            toast('Connection interrupted — resyncing…', 4000);
-            await loadChatHistory();
-            gotDone = true;   // already reconciled; skip the finally-block resync
-        } else if (savedTurn) {
-            // Upstream failed before a single token arrived, but the worker
-            // still saved the message with an empty reply. Keep both bubbles:
-            // the empty one renders a Retry button, so nothing has to be
-            // retyped. Only this first attempt saves - regenerate and swipe
-            // report the error and leave the history alone.
-            adoptSavedTurn(tuid, tbid, savedTurn, '');
+        if (savedTurn) {
+            // The worker committed this turn before it started generating, so
+            // the message is safe whatever happened next - and it is still
+            // generating and checkpointing to the database. Keep both bubbles,
+            // show what arrived, and follow the rest through the server.
+            // (Reloading history here is what used to wipe the screen: the
+            // reply was not written yet, so the resync came back without it.)
+            adoptSavedTurn(tuid, tbid, savedTurn, composed());
             if(!S.userScrolled)scrollToBottom();
-            toast('AI error: ' + err.message + ' — your message was saved, press Retry.', 7000);
+            gotDone = true;
+            S.generating=false;$('send-btn').disabled=false;
+            toast('Connection dropped — following the reply from the server…', 4000);
+            await followGeneration(savedTurn, savedTurn.bot_id);
         } else {
             // Nothing reached the server, so put the draft back in the box
             // rather than making the user type it out again.
@@ -2981,9 +3164,12 @@ for await (const data of parseStream(resp)) {
         }
     } finally {
         S.generating=false;$('send-btn').disabled=false;
-        // Stream ended without a 'done' frame: the server may still have saved
-        // the reply, so reconcile rather than leaving a phantom bubble.
-        if (!gotDone && gotAnyText) { toast('Stream ended early — resyncing…', 4000); await loadChatHistory(); }
+        // Stream ended without a 'done' frame: the server is still at it.
+        if (!gotDone && savedTurn) {
+            gotDone = true;
+            adoptSavedTurn(tuid, tbid, savedTurn, composed());
+            await followGeneration(savedTurn, savedTurn.bot_id);
+        }
     }
 }
 
@@ -3029,15 +3215,17 @@ async function regenVariant(msgId,groupId){
     const ci=el?.querySelector('.msg-content');
     if(ci)ci.innerHTML='<span class="text-gray-400 text-xs flex items-center space-x-2"><svg class="animate-spin w-3 h-3"viewBox="0 0 24 24"fill="none"stroke="currentColor"stroke-width="2"><path d="M21 12a9 9 0 11-9-9"/></svg><span>Thinking about a better responses for you...</span></span>';
     
+    let fullText = "", fullReasoning = "";
     try {
         const resp = await streamFetch('regenerate', {group_id:groupId});
 
         if (!resp.ok) {
-            const errJson = await resp.json();
-            throw new Error(errJson.error || 'Server error');
+            let msg = 'Server error ' + resp.status;
+            try { const j = await resp.json(); if (j && j.error) msg = j.error; } catch(e) {}
+            throw new Error(msg);
         }
 
-        let fullText = "", fullReasoning = "", display = "";
+        let display = "";
         let lastRender = 0; // PERF FIX 3: throttle re-parsing while streaming
         for await (const data of parseStream(resp)) {
             if (data.error) throw new Error(data.error);
@@ -3071,11 +3259,19 @@ async function regenVariant(msgId,groupId){
             }
         }
     } catch(err) {
-        // Regenerate never writes anything on failure, so put the bubble back
-        // exactly as it was - including the Retry button when this message is
-        // the empty placeholder left by an earlier failed send.
-        toast('Regeneration failed: ' + err.message, 6000);
-        refreshMsgEl(msgId);
+        if (fullText) {
+            // Text had started arriving, so the server has already created the
+            // new variant and keeps generating it: follow it to the end.
+            S.generating=false;$('send-btn').disabled=false;
+            toast('Connection dropped — following the reply from the server…', 4000);
+            await followGeneration({group_id: groupId}, msgId);
+        } else {
+            // Regenerate writes nothing when it fails outright, so put the
+            // bubble back exactly as it was - including the Retry button when
+            // this message is the empty placeholder left by an earlier send.
+            toast('Regeneration failed: ' + err.message, 6000);
+            refreshMsgEl(msgId);
+        }
     } finally {
         S.generating=false;$('send-btn').disabled=false;
     }
