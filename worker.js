@@ -223,7 +223,7 @@ function cacheDrop(prefix) {
 }
 
 // Bumped on every deploy so browsers revalidate the HTML shell cheaply.
-const APP_BUILD = '2026-09-13-pin1';
+const APP_BUILD = '2026-09-13-fill5';
 const HTML_CACHE_CONTROL = 'private, max-age=0, must-revalidate';
 let _hasUsers = false, _appHTML = null, _setupHTML = null;
 
@@ -7240,12 +7240,15 @@ body{background-color:var(--bg);background-image:var(--bg-art);background-attach
 #rail-panel > .modal-content{
   position:static; width:100%; max-width:none; height:100%; max-height:none;
   margin:0; border:0; border-radius:0; box-shadow:none; background:transparent;
-  /* Not a flex column: several of these panels have their own scroll container
-     inside and several do not, and flex sizing them uniformly gets one group or
-     the other wrong. Scrolling the panel itself is right for all of them, and
-     it is what puts a save button that sits at the very bottom back within
-     reach. */
-  display:block; overflow-y:auto; overscroll-behavior:contain;
+  /* A flex column, but sized with flex:1 0 auto on the panes below - the
+     no-shrink part is what makes one declaration right for both kinds of
+     panel. Some bring their own scroll container and some do not; a pane
+     that could shrink would squeeze a long panel into the column and clip
+     it, which is why this was display:block before. Basis auto starts a
+     pane at its content height, grow fills a short column, and no-shrink
+     lets a long one run past the bottom - where overflow-y:auto here
+     scrolls the panel, exactly as it always did. */
+  display:flex; flex-direction:column; overflow-y:auto; overscroll-behavior:contain;
 }
 #rail-panel > .modal-content > div:first-child{
   /* the panel's own title row lines up with the chat header beside it, and
@@ -7292,6 +7295,65 @@ body{background-color:var(--bg);background-image:var(--bg-art);background-attach
 #rail-panel > .modal-content > #keys-footer{
   background:color-mix(in oklab, var(--surface-2) 94%, transparent);
   border-top:1px solid var(--border);
+}
+
+
+/* ── DOCKED: THE BODY FILLS THE COLUMN ──────────────────────────────────
+   A panel used to stop wherever its content stopped, which in a 910px column
+   meant a form of four short boxes sitting in the top third with three hundred
+   pixels of nothing under the Save row. Measured across every dockable panel:
+   360 to 625px unused.
+
+   min-height rather than height, because a panel with more content than the
+   column - Advanced AI is 1000px of it - still has to run past the bottom and
+   let the panel scroll, which is what it already does. 4rem is the sticky
+   title row above this pane. */
+/* Every pane shares out the column; see the note on the panel above for why
+   this grows without being allowed to shrink. */
+/* Only a pane with something worth growing grows. Letting every pane take a
+   share turned Account Settings - three single-line inputs and a paragraph -
+   into three inputs spread down 900px with holes between them, which is worse
+   than the empty space it replaced. A pane earns the slack by holding a text
+   box or a list; everything else keeps its natural height and the column
+   simply ends where the content does. */
+#rail-panel > .modal-content > *{ flex:0 0 auto }
+#rail-panel > .modal-content > .overflow-y-auto,
+#rail-panel > .modal-content > div:has(textarea),
+#rail-panel > .modal-content > div:has(.rs-scroll-list){ flex:1 0 auto }
+/* and a bar is a bar even when it holds one of those */
+#rail-panel > .modal-content > :first-child,
+#rail-panel > .modal-content > [class*="border-t"],
+#rail-panel > .modal-content > #keys-footer{ flex:0 0 auto }
+#rail-panel > .modal-content > .overflow-y-auto{
+  display:flex; flex-direction:column;
+}
+
+/* Any wrapper that holds a text box shares out the height, and the box fills
+   its wrapper. This is what the persona form's right-hand column already did
+   for itself; stating it here gets every other panel the same treatment
+   without each one having to declare it. */
+#rail-panel > .modal-content div:has(> textarea){
+  flex:1 1 0; display:flex; flex-direction:column; min-height:104px;
+}
+#rail-panel > .modal-content textarea{ flex:1 1 auto; min-height:76px }
+
+/* The persona form is two columns side by side. The row holding them takes
+   what is left of the column, so both sides run to the same depth instead of
+   the left one finishing halfway up. */
+#rail-panel > .modal-content > #personas-form-view > div:first-of-type{
+  flex:1 1 auto; min-height:0;
+}
+#rail-panel > .modal-content > #personas-form-view > div:first-of-type > div{
+  display:flex; flex-direction:column; gap:1rem;
+}
+/* space-y-* spaces siblings with margins. With gap doing that job the two
+   stack, and the left column drifts a row lower than the right. */
+#rail-panel > .modal-content > #personas-form-view > div:first-of-type > div > * + *{
+  margin-top:0;
+}
+/* the buttons stay a button-sized strip at the bottom of whatever is above */
+#rail-panel > .modal-content > .overflow-y-auto > div:last-child{
+  flex:0 0 auto;
 }
 
 /* ── HOW SOLID THE DEFAULT BUBBLE IS ────────────────────────────────────
