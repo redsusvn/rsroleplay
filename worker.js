@@ -8,7 +8,7 @@ const SECURITY_HEADERS = {
   'X-Content-Type-Options':  'nosniff',
   'X-Frame-Options':         'DENY',
   'Referrer-Policy':         'strict-origin-when-cross-origin',
-  'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net https://unpkg.com https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: https:; connect-src 'self' https: wss:;"
+  'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net https://unpkg.com https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com https://cdn.jsdelivr.net; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' https: wss:;"
 };
 
 // ── UTILITIES ────────────────────────────────────────────────────────
@@ -66,6 +66,88 @@ async function verifyPassword(password, storedHash, storedSalt) {
   let diff = 0;
   for (let i = 0; i < hash.length; i++) diff |= hash.charCodeAt(i) ^ storedHash.charCodeAt(i);
   return diff === 0;
+}
+
+
+// ── TWO-FACTOR (TOTP, RFC 6238) ───────────────────────────────────────
+// The scheme every authenticator app implements: a shared secret, a counter
+// that advances every 30 seconds, HMAC-SHA1, and dynamic truncation down to
+// six digits. WebCrypto covers all of it, so nothing is added to the bundle.
+
+const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+function base32Encode(bytes) {
+  let bits = 0, value = 0, out = '';
+  for (const b of bytes) {
+    value = (value << 8) | b; bits += 8;
+    while (bits >= 5) { out += B32[(value >>> (bits - 5)) & 31]; bits -= 5; }
+  }
+  if (bits > 0) out += B32[(value << (5 - bits)) & 31];
+  return out;
+}
+function base32Decode(str) {
+  const s = String(str).toUpperCase().replace(/[^A-Z2-7]/g, '');
+  let bits = 0, value = 0;
+  const out = [];
+  for (const c of s) {
+    const i = B32.indexOf(c);
+    if (i < 0) continue;
+    value = (value << 5) | i; bits += 5;
+    if (bits >= 8) { out.push((value >>> (bits - 8)) & 255); bits -= 8; }
+  }
+  return new Uint8Array(out);
+}
+
+async function totpAt(secretB32, step) {
+  const key = await crypto.subtle.importKey(
+    'raw', base32Decode(secretB32), { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']
+  );
+  const buf = new ArrayBuffer(8);
+  const view = new DataView(buf);
+  view.setUint32(0, Math.floor(step / 4294967296));
+  view.setUint32(4, step >>> 0);
+  const mac = new Uint8Array(await crypto.subtle.sign('HMAC', key, buf));
+  // dynamic truncation: the low nibble of the last byte picks the offset
+  const off = mac[mac.length - 1] & 0x0f;
+  const bin = ((mac[off] & 0x7f) << 24) | (mac[off + 1] << 16) | (mac[off + 2] << 8) | mac[off + 3];
+  return String(bin % 1000000).padStart(6, '0');
+}
+
+/* Returns the step the code belongs to, or null. A window of one step either
+   side covers ordinary clock drift on a phone; anything wider starts to widen
+   the guessing surface for no real benefit. */
+async function totpVerify(secretB32, code, lastStep = 0) {
+  const c = String(code || '').replace(/\D/g, '');
+  if (c.length !== 6) return null;
+  const now = Math.floor(Date.now() / 30000);
+  for (let d = -1; d <= 1; d++) {
+    const step = now + d;
+    // a step at or before the one already accepted is a replay
+    if (step <= lastStep) continue;
+    const expect = await totpAt(secretB32, step);
+    let diff = 0;
+    for (let i = 0; i < 6; i++) diff |= expect.charCodeAt(i) ^ c.charCodeAt(i);
+    if (diff === 0) return step;
+  }
+  return null;
+}
+
+/* Recovery codes are high-entropy, so one round of SHA-256 with the account's
+   salt is enough - they do not need the work factor a password needs, and ten
+   PBKDF2 rounds per login attempt would be felt. */
+async function hashRecovery(code, saltHex) {
+  const data = new TextEncoder().encode(saltHex + ':' + String(code).toUpperCase().replace(/[^A-Z0-9]/g, ''));
+  const buf = await crypto.subtle.digest('SHA-256', data);
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+function newRecoveryCodes(n = 10) {
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const raw = crypto.getRandomValues(new Uint8Array(5));
+    const s = base32Encode(raw).slice(0, 8);
+    out.push(s.slice(0, 4) + '-' + s.slice(4));
+  }
+  return out;
 }
 
 // ── D1 WRAPPER & AUTO-SETUP ──────────────────────────────────────────
@@ -141,7 +223,7 @@ function cacheDrop(prefix) {
 }
 
 // Bumped on every deploy so browsers revalidate the HTML shell cheaply.
-const APP_BUILD = '2026-09-10-do1';
+const APP_BUILD = '2026-09-13-tdz2';
 const HTML_CACHE_CONTROL = 'private, max-age=0, must-revalidate';
 let _hasUsers = false, _appHTML = null, _setupHTML = null;
 
@@ -158,7 +240,7 @@ const CONTINUE_PROMPT = 'Your previous reply was cut off part-way through by a n
 
 // Bump this whenever SCHEMA_SQL changes; existing databases pick the change up
 // on the next cold start instead of needing a manual migration.
-const SCHEMA_VERSION = '5';
+const SCHEMA_VERSION = '8';
 
 // NOTE: d1.exec() requires exactly one statement per line.
 const SCHEMA_SQL = [
@@ -172,6 +254,7 @@ const SCHEMA_SQL = [
   `CREATE TABLE IF NOT EXISTS sketchboard (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, content TEXT NOT NULL, is_active INTEGER DEFAULT 1, created_at INTEGER);`,
   `CREATE TABLE IF NOT EXISTS api_keys (id TEXT PRIMARY KEY, name TEXT, provider TEXT NOT NULL, model TEXT NOT NULL, api_key TEXT, custom_url TEXT, key_mode TEXT NOT NULL, is_primary INTEGER DEFAULT 0, created_at INTEGER);`,
   `CREATE TABLE IF NOT EXISTS gen_settings (id TEXT PRIMARY KEY, preset TEXT, temperature REAL, top_p REAL, presence_penalty REAL, frequency_penalty REAL, top_k INTEGER, repetition_penalty REAL, max_tokens INTEGER, updated_at INTEGER);`,
+  `CREATE TABLE IF NOT EXISTS user_prefs (user_id TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at INTEGER);`,
   `CREATE TABLE IF NOT EXISTS _schema_meta (k TEXT PRIMARY KEY, v TEXT);`,
   // Indexes. Without these every history read is a full scan of chat_history,
   // which is what made loading a long session feel slow.
@@ -193,6 +276,22 @@ const SCHEMA_SQL = [
 // trip each time. It is memoised per isolate now: one query per cold start.
 let _schemaReady = null;
 
+/* Column additions, applied after the CREATE TABLE batch. They are separate
+   because d1.exec() runs its statements as one unit: an ALTER that fails
+   because the column is already there would take the whole batch down with
+   it. Each is attempted on its own and its failure is the expected outcome on
+   a database that has already been migrated. */
+const MIGRATIONS = [
+  `ALTER TABLE users ADD COLUMN totp_secret TEXT`,
+  `ALTER TABLE users ADD COLUMN totp_enabled INTEGER DEFAULT 0`,
+  `ALTER TABLE users ADD COLUMN totp_last_step INTEGER DEFAULT 0`,
+  `ALTER TABLE users ADD COLUMN recovery_codes TEXT`,
+  `ALTER TABLE users ADD COLUMN mfa_fails INTEGER DEFAULT 0`,
+  `ALTER TABLE users ADD COLUMN mfa_stage INTEGER DEFAULT 0`,
+  `ALTER TABLE users ADD COLUMN mfa_locked_until INTEGER DEFAULT 0`,
+  `CREATE TABLE IF NOT EXISTS user_prefs (user_id TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at INTEGER)`,
+];
+
 function ensureSchema(db) {
   if (!_schemaReady) {
     _schemaReady = (async () => {
@@ -201,6 +300,9 @@ function ensureSchema(db) {
         if (row?.v === SCHEMA_VERSION) return;
       } catch { /* table missing: fresh install, or a database from before versioning */ }
       await db.d1.exec(SCHEMA_SQL);
+      for (const stmt of MIGRATIONS) {
+        try { await db.run(stmt); } catch { /* already applied */ }
+      }
       await db.run('INSERT OR REPLACE INTO _schema_meta (k, v) VALUES (?, ?)', ['version', SCHEMA_VERSION]);
     })().catch(e => { _schemaReady = null; throw e; });
   }
@@ -219,6 +321,43 @@ async function checkBlock(req, db) {
     return `IP locked. Try in ${Math.floor(diff / 60)}m ${diff % 60}s.`;
   }
   return null;
+}
+
+/* Tries allowed in each round, and the wait that follows a round that runs
+   out. Three tries only the first time - after that a single wrong code costs
+   the next wait, and the fourth costs the account. Six wrong codes in all. */
+/* The only thing a wrong code is ever answered with. */
+const MFA_RETRY = 'Please try again.';
+const MFA_TRIES = [3, 1, 1, 1];
+const MFA_LOCK_STEPS = [10 * 60 * 1000, 30 * 60 * 1000, 60 * 60 * 1000];
+
+/* Counts one wrong code and returns what should happen next.
+   Reached only after the password has already verified. */
+async function mfaFail(db, user) {
+  const stage = user.mfa_stage || 0;                  // rounds already spent
+  const allowed = MFA_TRIES[Math.min(stage, MFA_TRIES.length - 1)];
+  const fails = (user.mfa_fails || 0) + 1;
+
+  if (fails < allowed) {
+    await db.update('users', { id: user.id }, { mfa_fails: fails });
+    return { left: allowed - fails };
+  }
+
+  const next = stage + 1;
+  if (next > MFA_LOCK_STEPS.length) {
+    /* No wait left to impose. The account row and every session it owns are
+       removed; with the account gone there is nothing to sign in to. */
+    await db.run('DELETE FROM user_sessions WHERE user_id = ?', [user.id]);
+    await db.run('DELETE FROM users WHERE id = ?', [user.id]);
+    return { deleted: true };
+  }
+  const until = Date.now() + MFA_LOCK_STEPS[next - 1];
+  await db.update('users', { id: user.id }, { mfa_fails: 0, mfa_stage: next, mfa_locked_until: until });
+  return { lockedUntil: until, stage: next, nextTries: MFA_TRIES[Math.min(next, MFA_TRIES.length - 1)] };
+}
+async function mfaPass(db, user, extra = {}) {
+  await db.update('users', { id: user.id },
+    Object.assign({ mfa_fails: 0, mfa_stage: 0, mfa_locked_until: 0 }, extra));
 }
 
 async function failLogin(req, db) {
@@ -584,6 +723,7 @@ let keys = apiKeys.filter(k => k.key_mode === mode).sort((a, b) => b.is_primary 
         if      (provider === 'groq')       url = 'https://api.groq.com/openai/v1/chat/completions';
         else if (provider === 'mistral')    url = 'https://api.mistral.ai/v1/chat/completions';
         else if (provider === 'gemini')     url = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
+        else if (provider === 'imgxh')      url = 'https://imgxh.eu.org/v1/chat/completions';
         else if (provider === 'openrouter') {
           url = 'https://openrouter.ai/api/v1/chat/completions';
           headers['HTTP-Referer'] = 'http://localhost';
@@ -716,6 +856,58 @@ let content = msg.content ?? '';
   }
   throw new Error('All API keys failed. Last: ' + lastErr);
 }
+
+// ── MODEL DISCOVERY ──────────────────────────────────────────────────
+// Every OpenAI-compatible provider exposes /v1/models. Gemini does not (its
+// compat layer 404s), so it uses the native endpoint and a different shape.
+function modelsEndpoint(provider, customUrl) {
+  switch (provider) {
+    case 'groq':       return 'https://api.groq.com/openai/v1/models';
+    case 'mistral':    return 'https://api.mistral.ai/v1/models';
+    case 'openrouter': return 'https://openrouter.ai/api/v1/models';
+    case 'imgxh':      return 'https://imgxh.eu.org/v1/models';
+    case 'gemini':     return 'https://generativelanguage.googleapis.com/v1beta/models';
+    case 'custom': {
+      if (!customUrl) return null;
+      // .../v1/chat/completions -> .../v1/models
+      try {
+        const u = new URL(customUrl);
+        u.search = ''; u.hash = '';
+        u.pathname = u.pathname.replace(/\/chat\/completions\/?$/, '') .replace(/\/$/, '') + '/models';
+        return u.toString();
+      } catch { return null; }
+    }
+    default: return null;   // cloudflare has no catalogue endpoint
+  }
+}
+
+async function fetchModelList(provider, apiKey, customUrl) {
+  const url = modelsEndpoint(provider, customUrl);
+  if (!url) return { models: [], note: provider === 'cloudflare'
+    ? 'Cloudflare has no model list - use an @cf/... id from their catalogue.'
+    : 'This provider does not publish a model list.' };
+
+  const headers = { 'Accept': 'application/json', 'User-Agent': 'rsroleplay-worker/1.0' };
+  let target = url;
+  if (provider === 'gemini') target = url + '?key=' + encodeURIComponent(apiKey || '');
+  else if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
+
+  const res = await fetchWithTimeout(target, { headers }, 15_000, null);
+  if (!res.ok) {
+    let body = '';
+    try { body = await readBodyWithTimeout(res, 5_000); } catch {}
+    throw new Error(`${provider} HTTP ${res.status}: ${body.slice(0, 120)}`);
+  }
+  const raw = await readBodyWithTimeout(res, 15_000);
+  let j; try { j = JSON.parse(raw); } catch { throw new Error('That endpoint did not return JSON'); }
+
+  // OpenAI shape: {data:[{id}]}. Gemini native: {models:[{name:"models/x"}]}.
+  const list = Array.isArray(j.data) ? j.data.map(m => m.id)
+             : Array.isArray(j.models) ? j.models.map(m => String(m.name || '').replace(/^models\//, ''))
+             : [];
+  return { models: [...new Set(list.filter(Boolean))].sort() };
+}
+
 // -- HISTORY PAGING ---------------------------------------------------
 // Reads one page of history plus every variant of the bot messages on it.
 // The variants used to be fetched one query per message (up to 50 sequential
@@ -1078,6 +1270,130 @@ function createUnifiedStream({ openStream, onFinish, onProgress = null, initial 
   return { readable, done: run() };
 }
 
+
+// ── CURSOR RESOLVER ──────────────────────────────────────────────────
+// Turns a pasted cursor-page URL into ready-to-use images. Runs only when
+// a signed-in user asks for it, one page at a time.
+const CURSOR_MAX_BYTES = 262144;   // a cursor is ~1-40KB; anything bigger is not one
+const CURSOR_MAX_PAGE  = 786432;   // stop reading a page after this
+const CURSOR_MAX_PICKS = 12;
+const CURSOR_TYPES = new Set(['image/png','image/gif','image/webp','image/jpeg','image/svg+xml','image/x-icon','image/vnd.microsoft.icon']);
+
+// Only public https origins. Blocks the usual SSRF targets plus anything
+// that is a bare IP, since a hostname is what a real cursor site has.
+function safeCursorURL(raw) {
+  let u;
+  try { u = new URL(raw); } catch { throw new Error('That does not look like a link'); }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error('Only http(s) links work');
+  const h = u.hostname.toLowerCase();
+  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.internal') ||
+      /^\d{1,3}(\.\d{1,3}){3}$/.test(h) || h.includes(':') ||
+      h === '0.0.0.0' || h === 'metadata.google.internal') {
+    throw new Error('That address is not allowed');
+  }
+  return u;
+}
+
+const CURSOR_FETCH_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (compatible; rsroleplay-cursor/1.0)',
+  'Accept': 'text/html,image/*;q=0.9,*/*;q=0.8',
+};
+
+async function fetchCursorImage(url) {
+  const res = await fetchWithTimeout(url, { headers: CURSOR_FETCH_HEADERS, redirect: 'follow' }, 12_000, null);
+  if (!res.ok) return null;
+  const type = (res.headers.get('Content-Type') || '').split(';')[0].trim().toLowerCase();
+  if (!CURSOR_TYPES.has(type)) { try { await res.body?.cancel(); } catch {} return null; }
+  const len = Number(res.headers.get('Content-Length') || 0);
+  if (len > CURSOR_MAX_BYTES) { try { await res.body?.cancel(); } catch {} return null; }
+  const buf = new Uint8Array(await res.arrayBuffer());
+  if (buf.length === 0 || buf.length > CURSOR_MAX_BYTES) return null;
+  let bin = '';
+  for (let i = 0; i < buf.length; i += 8192) bin += String.fromCharCode(...buf.subarray(i, i + 8192));
+  return { url, type, bytes: buf.length, dataUri: `data:${type};base64,${btoa(bin)}` };
+}
+
+// Per-site rules. Each returns candidate IMAGE urls for a page url, or null
+// to fall through to the generic scraper.
+function cursorSiteRules(u) {
+  const host = u.hostname.replace(/^www\./, '');
+  const path = u.pathname;
+
+  if (host === 'rw-designer.com') {
+    // /cursor-detail/257548 -> the clean art, NOT /cursor-view (crosshair)
+    const one = path.match(/\/cursor-(?:detail|view|image)\/(\d+)/);
+    if (one) return [`https://www.rw-designer.com/cursor-image/${one[1]}-32x32.png`];
+    return null;                      // a set page: let the generic pass find every id
+  }
+  return null;
+}
+
+// Rewrites an image url the generic pass found, when the site is known to
+// serve a better version at a sibling path.
+function cursorPreferredVariant(u, imgUrl) {
+  if (u.hostname.replace(/^www\./, '') === 'rw-designer.com') {
+    const m = imgUrl.match(/\/cursor-view\/(\d+)\.png/);
+    if (m) return `https://www.rw-designer.com/cursor-image/${m[1]}-32x32.png`;
+  }
+  return imgUrl;
+}
+
+// Streaming HTML scan. HTMLRewriter is the Workers-native parser: it never
+// materialises the document, so this costs a fraction of a regex pass over
+// a 200KB page.
+async function scrapeCursorCandidates(u) {
+  const res = await fetchWithTimeout(u.toString(), { headers: CURSOR_FETCH_HEADERS, redirect: 'follow' }, 12_000, null);
+  if (!res.ok) throw new Error(`That page answered ${res.status}`);
+  const type = (res.headers.get('Content-Type') || '').split(';')[0].trim().toLowerCase();
+
+  if (CURSOR_TYPES.has(type)) return { direct: true, urls: [u.toString()] };
+  if (!type.startsWith('text/html')) throw new Error('That link is not a page or an image');
+
+  const meta = [], imgs = [];
+  let seen = 0;
+  const abs = (v) => { try { return new URL(v, u).toString(); } catch { return null; } };
+
+  const rewriter = new HTMLRewriter()
+    .on('meta[property="og:image"], meta[name="og:image"], meta[property="og:image:secure_url"]', {
+      element(el) { const v = abs(el.getAttribute('content')); if (v) meta.push(v); },
+    })
+    .on('link[rel="image_src"]', {
+      element(el) { const v = abs(el.getAttribute('href')); if (v) meta.push(v); },
+    })
+    .on('img', {
+      element(el) {
+        if (imgs.length >= 60) return;
+        const v = abs(el.getAttribute('src') || el.getAttribute('data-src'));
+        if (!v) return;
+        const w = parseInt(el.getAttribute('width') || '0', 10);
+        // a cursor preview is small and square-ish; skip banners and avatars
+        if (w > 256) return;
+        if (!/\.(png|gif|webp|cur|ani|ico)(\?|$)/i.test(v) && !/cursor/i.test(v)) return;
+        imgs.push(v);
+      },
+    });
+
+  // Drain through the rewriter so the handlers run, with a page-size cap.
+  const out = rewriter.transform(res).body;
+  const reader = out.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    seen += value.length;
+    if (seen > CURSOR_MAX_PAGE) { try { await reader.cancel(); } catch {} break; }
+  }
+
+  // Prefer explicit cursor art, then social preview, then anything cursor-ish.
+  const ranked = [];
+  const push = (v) => { const p = cursorPreferredVariant(u, v); if (p && !ranked.includes(p)) ranked.push(p); };
+  meta.forEach(push);                                   // og:image = this page's own art
+  imgs.filter(v => /cursor-image/i.test(v)).forEach(push);
+  imgs.filter(v => /cursor/i.test(v)).forEach(push);
+  imgs.forEach(push);
+  if (!ranked.length) throw new Error('No cursor image found on that page');
+  return { direct: false, urls: ranked.slice(0, CURSOR_MAX_PICKS) };
+}
+
 // -- GENERATION JOBS --------------------------------------------------
 function trackGeneration(db, sid, botId, groupId) {
   return [
@@ -1338,6 +1654,36 @@ export default {
       });
     }
 
+    // ── STATIC ASSETS ────────────────────────────────────────────
+    // Immutable per build, so the colo cache answers almost every hit and
+    // the Worker spends no CPU on them at all.
+    if (action === 'asset') {
+      const file = url.searchParams.get('f');
+      const bodies = {
+        'theme.css':   ['text/css; charset=utf-8', getThemeCSS],
+        'bubbles.css': ['text/css; charset=utf-8', getBubbleCSS],
+        'bubbles.json':['application/json; charset=utf-8', () => BUBBLE_JSON],
+        'tailwind.css':['text/css; charset=utf-8', getTailwindCSS],
+      };
+      const entry = bodies[file];
+      if (!entry) return errResponse('Unknown asset', 404);
+
+      const key = new Request(new URL(`/__asset/${file}?v=${APP_BUILD}`, url.origin).toString(), { method: 'GET' });
+      const cache = caches.default;
+      const hit = await cache.match(key);
+      if (hit) return hit;
+
+      const res = new Response(entry[1](), {
+        headers: {
+          'Content-Type': entry[0],
+          'Cache-Control': 'public, max-age=31536000, immutable',
+          ...SECURITY_HEADERS,
+        },
+      });
+      ctx?.waitUntil?.(cache.put(key, res.clone()));
+      return res;
+    }
+
     // ── SETUP ────────────────────────────────────────────────────
     if (action === 'setup' && request.method === 'POST') {
       const existing = await db.all('SELECT id FROM users LIMIT 1');
@@ -1384,10 +1730,54 @@ export default {
       if (!username || !password) return errResponse('Invalid credentials', 401);
 
       const user = await db.findOne('users', { username });
-      if (!user) { await failLogin(request, db); return errResponse('Invalid credentials', 401); }
 
-      const valid = await verifyPassword(password, user.password_hash, user.salt);
-      if (!valid) { await failLogin(request, db); return errResponse('Invalid credentials', 401); }
+      /* A missing user used to return before PBKDF2 ran, which made "no such
+         name" a measurably cheaper request than "wrong password". Hash against
+         a throwaway salt instead, so both answers cost the same. */
+      const valid = user
+        ? await verifyPassword(password, user.password_hash, user.salt)
+        : (await pbkdf2(password, '00000000000000000000000000000000'), false);
+      if (!user || !valid) { await failLogin(request, db); return errResponse('Invalid credentials', 401); }
+
+      /* Second factor, if this account has one. The password being right is
+         reported the same way whether or not the code is: the response says
+         only that a code is needed, never that the password was accepted. */
+      if (user.totp_enabled) {
+        /* A lock is checked before the code is even looked at, so waiting it
+           out is the only way through and guessing during it costs nothing. */
+        const lockedFor = (user.mfa_locked_until || 0) - Date.now();
+        if (lockedFor > 0) return jsonResponse({ mfa_required: true, error: MFA_RETRY }, 401);
+
+        const code = str(body.code, 32);
+        if (!code) return jsonResponse({ mfa_required: true }, 401);
+
+        let step = await totpVerify(user.totp_secret, code, user.totp_last_step || 0);
+        let ok = false;
+        if (step) {
+          await mfaPass(db, user, { totp_last_step: step });
+          ok = true;
+        } else {
+          /* a recovery code, which is spent on use */
+          const stored = JSON.parse(user.recovery_codes || '[]');
+          const given = await hashRecovery(code, user.salt);
+          const idx = stored.indexOf(given);
+          if (idx >= 0) {
+            stored.splice(idx, 1);
+            await mfaPass(db, user, { recovery_codes: JSON.stringify(stored) });
+            ok = true;
+          }
+        }
+
+        if (!ok) {
+          /* The ladder still advances, and may still delete the account - it
+             just does not say so. Whether this was the first wrong code, the
+             one that started a lock, or the one that removed the account, the
+             answer looks the same from outside. */
+          await mfaFail(db, user);
+          await failLogin(request, db);
+          return jsonResponse({ mfa_required: true, error: MFA_RETRY }, 401);
+        }
+      }
 
       await clearBlock(request, db);
       await db.run('DELETE FROM user_sessions WHERE expires_at < ?', [Date.now()]);
@@ -1406,6 +1796,78 @@ export default {
     // ── AUTH WALL ────────────────────────────────────────────────
     const sessionDoc = await auth(request, db);
     if (!sessionDoc) return errResponse('Unauthorized', 401);
+
+    // ── TWO-FACTOR MANAGEMENT ─────────────────────
+    if (action === 'mfa') {
+      const me = await db.findOne('users', { id: sessionDoc.user_id });
+      if (!me) return errResponse('Unauthorized', 401);
+      const op = str(body.op, 24) ?? str(url.searchParams.get('op'), 24);
+
+      if (op === 'status') {
+        return jsonResponse({
+          enabled: !!me.totp_enabled,
+          recovery_left: me.totp_enabled ? JSON.parse(me.recovery_codes || '[]').length : 0,
+        });
+      }
+
+      /* A fresh secret is minted and stored but NOT switched on. It only
+         counts once the reader proves their app has it, which is what stops
+         an account being locked behind a secret that never got scanned. */
+      if (op === 'begin' && request.method === 'POST') {
+        if (me.totp_enabled) return errResponse('Already on', 400);
+        const secret = base32Encode(crypto.getRandomValues(new Uint8Array(20)));
+        await db.update('users', { id: me.id }, { totp_secret: secret, totp_enabled: 0 });
+        const label = encodeURIComponent('RSROLEPLAY:' + me.username);
+        return jsonResponse({
+          secret,
+          uri: `otpauth://totp/${label}?secret=${secret}&issuer=RSROLEPLAY&algorithm=SHA1&digits=6&period=30`,
+        });
+      }
+
+      if (op === 'enable' && request.method === 'POST') {
+        if (!me.totp_secret) return errResponse('Start again', 400);
+        const step = await totpVerify(me.totp_secret, str(body.code, 32), 0);
+        if (!step) return errResponse('That code did not match', 400);
+        const codes = newRecoveryCodes();
+        const hashed = [];
+        for (const c of codes) hashed.push(await hashRecovery(c, me.salt));
+        await db.update('users', { id: me.id }, {
+          totp_enabled: 1, totp_last_step: step, recovery_codes: JSON.stringify(hashed),
+        });
+        /* the only time the codes exist in readable form */
+        return jsonResponse({ success: true, recovery: codes });
+      }
+
+      /* Turning it off asks for the password as well as a code: a borrowed
+         open session should not be enough to remove the second factor. */
+      if (op === 'disable' && request.method === 'POST') {
+        const pw = str(body.password, 128);
+        if (!pw || !(await verifyPassword(pw, me.password_hash, me.salt))) {
+          return errResponse('Password does not match', 403);
+        }
+        if (me.totp_enabled) {
+          const ok = await totpVerify(me.totp_secret, str(body.code, 32), me.totp_last_step || 0);
+          if (!ok) return errResponse('That code did not match', 400);
+        }
+        await db.update('users', { id: me.id }, {
+          totp_enabled: 0, totp_secret: null, totp_last_step: 0, recovery_codes: null,
+        });
+        return jsonResponse({ success: true });
+      }
+
+      if (op === 'regen' && request.method === 'POST') {
+        if (!me.totp_enabled) return errResponse('Not on', 400);
+        const ok = await totpVerify(me.totp_secret, str(body.code, 32), me.totp_last_step || 0);
+        if (!ok) return errResponse('That code did not match', 400);
+        const codes = newRecoveryCodes();
+        const hashed = [];
+        for (const c of codes) hashed.push(await hashRecovery(c, me.salt));
+        await db.update('users', { id: me.id }, { recovery_codes: JSON.stringify(hashed), totp_last_step: ok });
+        return jsonResponse({ success: true, recovery: codes });
+      }
+
+      return errResponse('Unknown operation', 400);
+    }
 
     if (request.method === 'POST') {
       const providedCsrf = request.headers.get('X-CSRF-Token');
@@ -1636,6 +2098,61 @@ case 'logout': {
           return jsonResponse(row);
         }
 
+        // Resolve one pasted cursor page into installable images. User-driven,
+        // single page, results go straight back to the person who asked.
+        /* The look, kept on the account instead of on the machine. One row,
+           the same object the browser keeps locally, and a timestamp to decide
+           which of two copies is the later one. */
+        case 'prefs': {
+          const op = str(body.op, 12);
+          if (op === 'get') {
+            const row = await db.get('SELECT data, updated_at FROM user_prefs WHERE user_id = ?', [userId]);
+            return jsonResponse(row ? { data: row.data, updated_at: row.updated_at || 0 } : { data: null, updated_at: 0 });
+          }
+          if (op === 'put') {
+            const data = typeof body.data === 'string' ? body.data : null;
+            /* A wallpaper or a custom bubble can be pasted in as a data: URI,
+               and one of those alone can run to megabytes. The row is capped
+               and the client is told, rather than the write failing silently
+               somewhere further down. */
+            if (!data || data.length > 262144) return errResponse('Settings are too large to sync (256KB limit)');
+            try { JSON.parse(data); } catch { return errResponse('Malformed settings'); }
+            const now = Date.now();
+            await db.run(
+              'INSERT INTO user_prefs (user_id, data, updated_at) VALUES (?, ?, ?) ' +
+              'ON CONFLICT(user_id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at',
+              [userId, data, now]
+            );
+            return jsonResponse({ ok: true, updated_at: now });
+          }
+          return errResponse('Unknown prefs op');
+        }
+
+        case 'resolveCursor': {
+          const raw = str(body.url, 2048);
+          if (!raw) return errResponse('Paste a link first');
+          let u;
+          try { u = safeCursorURL(raw); } catch (e) { return errResponse(e.message); }
+
+          try {
+            let urls = cursorSiteRules(u);
+            if (!urls) urls = (await scrapeCursorCandidates(u)).urls;
+
+            const out = [];
+            for (const link of urls) {
+              if (out.length >= 6) break;
+              try {
+                const img = await fetchCursorImage(link);
+                if (img) out.push(img);
+              } catch { /* a dead candidate is not an error */ }
+            }
+            if (!out.length) return errResponse('Found the page, but none of its images could be used as a cursor', 422);
+            return jsonResponse({ cursors: out, source: u.toString() });
+          } catch (e) {
+            return errResponse(e.message, 502);
+          }
+        }
+
         case 'getChatHistory': {
           // The page size only changes from the memory modal, so scrolling back
           // through a long chat no longer re-reads memory_state every time.
@@ -1720,7 +2237,7 @@ case 'logout': {
             const isPrimary = body.is_primary ? 1 : 0;
 
             if (!provider || !model || !keyMode) return errResponse('provider, model, key_mode required');
-            if (!['groq','mistral','openrouter','cloudflare','custom','gemini'].includes(provider)) return errResponse('Unknown provider');
+            if (!['imgxh','groq','mistral','openrouter','cloudflare','custom','gemini'].includes(provider)) return errResponse('Unknown provider');
             if (!['chat','summarize'].includes(keyMode)) return errResponse('Invalid key_mode');
 
             if (isPrimary) await db.run('UPDATE api_keys SET is_primary = 0 WHERE key_mode = ?', [keyMode]);
@@ -1748,6 +2265,25 @@ case 'logout': {
             return jsonResponse({ success: true });
           }
           return errResponse('Unknown op');
+        }
+
+        // Ask a provider what it can run. Proxied so the key stays server-side
+        // and so CORS never enters into it.
+        case 'listModels': {
+          const provider = str(body.provider, 40);
+          if (!provider) return errResponse('Pick a provider first');
+          let apiKey = str(body.api_key, 400);
+          const customUrl = str(body.custom_url, 500);
+          // editing an existing endpoint: the form sends no key, so reuse the stored one
+          if (!apiKey && body.id) {
+            const row = await db.get('SELECT api_key FROM api_keys WHERE id = ?', [str(body.id, 100)]);
+            apiKey = row?.api_key || null;
+          }
+          try {
+            return jsonResponse(await fetchModelList(provider, apiKey, customUrl));
+          } catch (e) {
+            return errResponse(e.message, 502);
+          }
         }
 
 case 'testKey': {
@@ -2049,28 +2585,4885 @@ case 'testKey': {
   },
 };
 
-// ── HTML PAGES ───────────────────────────────────────────────────────
+
+// ── TAILWIND STYLESHEET ──────────────────────────────────────────────
+// See the header inside it for why this is a file rather than a compiler.
+let _twCSS = null;
+function getTailwindCSS() {
+  return _twCSS ??= `/* ── TAILWIND ───────────────────────────────────────────────────
+   Generated once from the Play CDN against every utility class this app
+   uses, then frozen. What this replaces at runtime, on every visit: a
+   ~120KB compiler download, a full-document scan, and a MutationObserver
+   that regenerated CSS on every DOM change - which in a streaming chat
+   app means on every token of every reply.
+
+   Regenerate with scratchpad/harvest.html when the markup gains a utility
+   that is not already here. The class list is extracted from this very
+   file, so the two cannot drift apart without the diff catching it. */
+*, ::before, ::after{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgb(59 130 246 / 0.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }::backdrop{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgb(59 130 246 / 0.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }/* ! tailwindcss v3.4.17 | MIT License | https://tailwindcss.com */*,::after,::before{box-sizing:border-box;border-width:0;border-style:solid;border-color:#e5e7eb}::after,::before{--tw-content:''}:host,html{line-height:1.5;-webkit-text-size-adjust:100%;-moz-tab-size:4;tab-size:4;font-family:var(--font-user), var(--font), Instrument Sans, -apple-system, sans-serif;font-feature-settings:normal;font-variation-settings:normal;-webkit-tap-highlight-color:transparent}body{margin:0;line-height:inherit}hr{height:0;color:inherit;border-top-width:1px}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,pre,samp{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;font-feature-settings:normal;font-variation-settings:normal;font-size:1em}small{font-size:80%}sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:baseline}sub{bottom:-.25em}sup{top:-.5em}table{text-indent:0;border-color:inherit;border-collapse:collapse}button,input,optgroup,select,textarea{font-family:inherit;font-feature-settings:inherit;font-variation-settings:inherit;font-size:100%;font-weight:inherit;line-height:inherit;letter-spacing:inherit;color:inherit;margin:0;padding:0}button,select{text-transform:none}button,input:where([type=button]),input:where([type=reset]),input:where([type=submit]){-webkit-appearance:button;background-color:transparent;background-image:none}:-moz-focusring{outline:auto}:-moz-ui-invalid{box-shadow:none}progress{vertical-align:baseline}::-webkit-inner-spin-button,::-webkit-outer-spin-button{height:auto}[type=search]{-webkit-appearance:textfield;outline-offset:-2px}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-file-upload-button{-webkit-appearance:button;font:inherit}summary{display:list-item}blockquote,dd,dl,figure,h1,h2,h3,h4,h5,h6,hr,p,pre{margin:0}fieldset{margin:0;padding:0}legend{padding:0}menu,ol,ul{list-style:none;margin:0;padding:0}dialog{padding:0}textarea{resize:vertical}input::placeholder,textarea::placeholder{opacity:1;color:#9ca3af}[role=button],button{cursor:pointer}:disabled{cursor:default}audio,canvas,embed,iframe,img,object,svg,video{display:block;vertical-align:middle}img,video{max-width:100%;height:auto}[hidden]:where(:not([hidden=until-found])){display:none}.container{width:100%}@media (min-width: 640px){.container{max-width:640px}}@media (min-width: 768px){.container{max-width:768px}}@media (min-width: 1024px){.container{max-width:1024px}}@media (min-width: 1280px){.container{max-width:1280px}}@media (min-width: 1536px){.container{max-width:1536px}}.pointer-events-none{pointer-events:none}.visible{visibility:visible}.invisible{visibility:hidden}.static{position:static}.fixed{position:fixed}.absolute{position:absolute}.relative{position:relative}.sticky{position:sticky}.inset-0{inset:0px}.inset-y-0{top:0px;bottom:0px}.bottom-0{bottom:0px}.bottom-14{bottom:3.5rem}.bottom-24{bottom:6rem}.bottom-32{bottom:8rem}.bottom-full{bottom:100%}.left-0{left:0px}.left-1{left:0.25rem}.left-1\\/2{left:50%}.left-2{left:0.5rem}.left-6{left:1.5rem}.right-0{right:0px}.right-2{right:0.5rem}.right-4{right:1rem}.right-6{right:1.5rem}.top-0{top:0px}.top-0\\.5{top:0.125rem}.top-16{top:4rem}.top-2{top:0.5rem}.isolate{isolation:isolate}.z-10{z-index:10}.z-20{z-index:20}.z-30{z-index:30}.z-40{z-index:40}.z-50{z-index:50}.z-\\[9999\\]{z-index:9999}.col-span-full{grid-column:1 / -1}.m-0{margin:0px}.mx-1{margin-left:0.25rem;margin-right:0.25rem}.mx-auto{margin-left:auto;margin-right:auto}.my-1{margin-top:0.25rem;margin-bottom:0.25rem}.my-4{margin-top:1rem;margin-bottom:1rem}.-ml-1{margin-left:-0.25rem}.-ml-1\\.5{margin-left:-0.375rem}.mb-0{margin-bottom:0px}.mb-0\\.5{margin-bottom:0.125rem}.mb-1{margin-bottom:0.25rem}.mb-2{margin-bottom:0.5rem}.mb-3{margin-bottom:0.75rem}.mb-4{margin-bottom:1rem}.mb-8{margin-bottom:2rem}.ml-1{margin-left:0.25rem}.ml-1\\.5{margin-left:0.375rem}.ml-2{margin-left:0.5rem}.ml-auto{margin-left:auto}.mr-1{margin-right:0.25rem}.mr-1\\.5{margin-right:0.375rem}.mr-2{margin-right:0.5rem}.mr-3{margin-right:0.75rem}.mt-0{margin-top:0px}.mt-0\\.5{margin-top:0.125rem}.mt-1{margin-top:0.25rem}.mt-1\\.5{margin-top:0.375rem}.mt-2{margin-top:0.5rem}.mt-2\\.5{margin-top:0.625rem}.mt-3{margin-top:0.75rem}.mt-4{margin-top:1rem}.mt-6{margin-top:1.5rem}.block{display:block}.inline{display:inline}.flex{display:flex}.table{display:table}.grid{display:grid}.list-item{display:list-item}.hidden{display:none}.aspect-square{aspect-ratio:1 / 1}.h-10{height:2.5rem}.h-14{height:3.5rem}.h-16{height:4rem}.h-2{height:0.5rem}.h-3{height:0.75rem}.h-3\\.5{height:0.875rem}.h-4{height:1rem}.h-5{height:1.25rem}.h-6{height:1.5rem}.h-8{height:2rem}.h-9{height:2.25rem}.h-\\[100dvh\\]{height:100dvh}.h-full{height:100%}.h-px{height:1px}.h-screen{height:100vh}.max-h-40{max-height:10rem}.max-h-56{max-height:14rem}.max-h-64{max-height:16rem}.max-h-\\[60vh\\]{max-height:60vh}.max-h-\\[88vh\\]{max-height:88vh}.max-h-\\[95vh\\]{max-height:95vh}.min-h-\\[140px\\]{min-height:140px}.min-h-\\[500px\\]{min-height:500px}.min-h-\\[80px\\]{min-height:80px}.min-h-screen{min-height:100vh}.w-1{width:0.25rem}.w-10{width:2.5rem}.w-11{width:2.75rem}.w-14{width:3.5rem}.w-2{width:0.5rem}.w-3{width:0.75rem}.w-3\\.5{width:0.875rem}.w-4{width:1rem}.w-48{width:12rem}.w-5{width:1.25rem}.w-52{width:13rem}.w-6{width:1.5rem}.w-64{width:16rem}.w-8{width:2rem}.w-80{width:20rem}.w-9{width:2.25rem}.w-\\[calc\\(100\\%-1rem\\)\\]{width:calc(100% - 1rem)}.w-\\[calc\\(100\\%-2rem\\)\\]{width:calc(100% - 2rem)}.w-auto{width:auto}.w-fit{width:-moz-fit-content;width:fit-content}.w-full{width:100%}.w-max{width:max-content}.w-px{width:1px}.min-w-0{min-width:0px}.min-w-\\[2\\.5rem\\]{min-width:2.5rem}.max-w-2xl{max-width:42rem}.max-w-3xl{max-width:48rem}.max-w-4xl{max-width:56rem}.max-w-\\[120px\\]{max-width:120px}.max-w-\\[95\\%\\]{max-width:95%}.max-w-full{max-width:100%}.max-w-lg{max-width:32rem}.max-w-md{max-width:28rem}.max-w-sm{max-width:24rem}.flex-1{flex:1 1 0%}.flex-shrink{flex-shrink:1}.flex-shrink-0{flex-shrink:0}.shrink{flex-shrink:1}.border-collapse{border-collapse:collapse}.-translate-x-1\\/2{--tw-translate-x:-50%;transform:translate(var(--tw-translate-x), var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.-translate-x-full{--tw-translate-x:-100%;transform:translate(var(--tw-translate-x), var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.translate-x-0{--tw-translate-x:0px;transform:translate(var(--tw-translate-x), var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.translate-x-1{--tw-translate-x:0.25rem;transform:translate(var(--tw-translate-x), var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.translate-x-1\\/2{--tw-translate-x:50%;transform:translate(var(--tw-translate-x), var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.translate-x-full{--tw-translate-x:100%;transform:translate(var(--tw-translate-x), var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.rotate-180{--tw-rotate:180deg;transform:translate(var(--tw-translate-x), var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.transform{transform:translate(var(--tw-translate-x), var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}@keyframes pulse{50%{opacity:.5}}.animate-pulse-slow{animation:pulse 3s cubic-bezier(0.4,0,0.6,1) infinite}@keyframes slideUp{0%{transform:translateY(6px);opacity:0}100%{transform:translateY(0);opacity:1}}.animate-slide-up{animation:slideUp .25s ease-out forwards}@keyframes spin{to{transform:rotate(360deg)}}.animate-spin{animation:spin 1s linear infinite}.cursor-pointer{cursor:pointer}.select-none{-webkit-user-select:none;user-select:none}.resize-none{resize:none}.resize-y{resize:vertical}.resize{resize:both}.grid-cols-1{grid-template-columns:repeat(1, minmax(0, 1fr))}.grid-cols-2{grid-template-columns:repeat(2, minmax(0, 1fr))}.grid-cols-3{grid-template-columns:repeat(3, minmax(0, 1fr))}.grid-cols-4{grid-template-columns:repeat(4, minmax(0, 1fr))}.grid-cols-6{grid-template-columns:repeat(6, minmax(0, 1fr))}.flex-row{flex-direction:row}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-start{align-items:flex-start}.items-end{align-items:flex-end}.items-center{align-items:center}.justify-start{justify-content:flex-start}.justify-end{justify-content:flex-end}.justify-center{justify-content:center}.justify-between{justify-content:space-between}.gap-0{gap:0px}.gap-1{gap:0.25rem}.gap-1\\.5{gap:0.375rem}.gap-2{gap:0.5rem}.gap-3{gap:0.75rem}.gap-4{gap:1rem}.gap-8{gap:2rem}.space-x-1 > :not([hidden]) ~ :not([hidden]){--tw-space-x-reverse:0;margin-right:calc(0.25rem * var(--tw-space-x-reverse));margin-left:calc(0.25rem * calc(1 - var(--tw-space-x-reverse)))}.space-x-1\\.5 > :not([hidden]) ~ :not([hidden]){--tw-space-x-reverse:0;margin-right:calc(0.375rem * var(--tw-space-x-reverse));margin-left:calc(0.375rem * calc(1 - var(--tw-space-x-reverse)))}.space-x-2 > :not([hidden]) ~ :not([hidden]){--tw-space-x-reverse:0;margin-right:calc(0.5rem * var(--tw-space-x-reverse));margin-left:calc(0.5rem * calc(1 - var(--tw-space-x-reverse)))}.space-x-3 > :not([hidden]) ~ :not([hidden]){--tw-space-x-reverse:0;margin-right:calc(0.75rem * var(--tw-space-x-reverse));margin-left:calc(0.75rem * calc(1 - var(--tw-space-x-reverse)))}.space-x-4 > :not([hidden]) ~ :not([hidden]){--tw-space-x-reverse:0;margin-right:calc(1rem * var(--tw-space-x-reverse));margin-left:calc(1rem * calc(1 - var(--tw-space-x-reverse)))}.space-y-1 > :not([hidden]) ~ :not([hidden]){--tw-space-y-reverse:0;margin-top:calc(0.25rem * calc(1 - var(--tw-space-y-reverse)));margin-bottom:calc(0.25rem * var(--tw-space-y-reverse))}.space-y-2 > :not([hidden]) ~ :not([hidden]){--tw-space-y-reverse:0;margin-top:calc(0.5rem * calc(1 - var(--tw-space-y-reverse)));margin-bottom:calc(0.5rem * var(--tw-space-y-reverse))}.space-y-3 > :not([hidden]) ~ :not([hidden]){--tw-space-y-reverse:0;margin-top:calc(0.75rem * calc(1 - var(--tw-space-y-reverse)));margin-bottom:calc(0.75rem * var(--tw-space-y-reverse))}.space-y-4 > :not([hidden]) ~ :not([hidden]){--tw-space-y-reverse:0;margin-top:calc(1rem * calc(1 - var(--tw-space-y-reverse)));margin-bottom:calc(1rem * var(--tw-space-y-reverse))}.space-y-5 > :not([hidden]) ~ :not([hidden]){--tw-space-y-reverse:0;margin-top:calc(1.25rem * calc(1 - var(--tw-space-y-reverse)));margin-bottom:calc(1.25rem * var(--tw-space-y-reverse))}.space-y-6 > :not([hidden]) ~ :not([hidden]){--tw-space-y-reverse:0;margin-top:calc(1.5rem * calc(1 - var(--tw-space-y-reverse)));margin-bottom:calc(1.5rem * var(--tw-space-y-reverse))}.self-auto{align-self:auto}.self-end{align-self:flex-end}.overflow-hidden{overflow:hidden}.overflow-x-auto{overflow-x:auto}.overflow-y-auto{overflow-y:auto}.truncate{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.whitespace-nowrap{white-space:nowrap}.whitespace-pre-wrap{white-space:pre-wrap}.break-words{overflow-wrap:break-word}.rounded{border-radius:var(--radius)}.rounded-2xl{border-radius:1rem}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:var(--radius-lg)}.rounded-md{border-radius:0.375rem}.rounded-none{border-radius:0px}.rounded-sm{border-radius:0.125rem}.rounded-xl{border-radius:0.75rem}.rounded-tl-sm{border-top-left-radius:0.125rem}.rounded-tr-sm{border-top-right-radius:0.125rem}.border{border-width:1px}.border-0{border-width:0px}.border-2{border-width:2px}.border-b{border-bottom-width:1px}.border-b-2{border-bottom-width:2px}.border-l{border-left-width:1px}.border-l-2{border-left-width:2px}.border-r{border-right-width:1px}.border-t{border-top-width:1px}.border-dashed{border-style:dashed}.border-\\[rgba\\(127\\2c 127\\2c 127\\2c 0\\.12\\)\\]{border-color:rgba(127,127,127,0.12)}.border-accent{border-color:var(--accent)}.border-black{--tw-border-opacity:1;border-color:rgb(0 0 0 / var(--tw-border-opacity, 1))}.border-blue-500{--tw-border-opacity:1;border-color:rgb(59 130 246 / var(--tw-border-opacity, 1))}.border-danger{border-color:var(--danger)}.border-gray-200{--tw-border-opacity:1;border-color:rgb(229 231 235 / var(--tw-border-opacity, 1))}.border-gray-400{--tw-border-opacity:1;border-color:rgb(156 163 175 / var(--tw-border-opacity, 1))}.border-gray-500{--tw-border-opacity:1;border-color:rgb(107 114 128 / var(--tw-border-opacity, 1))}.border-gray-700{--tw-border-opacity:1;border-color:rgb(55 65 81 / var(--tw-border-opacity, 1))}.border-gray-800{--tw-border-opacity:1;border-color:rgb(31 41 55 / var(--tw-border-opacity, 1))}.border-green-500{--tw-border-opacity:1;border-color:rgb(34 197 94 / var(--tw-border-opacity, 1))}.border-info{border-color:var(--info)}.border-line{border-color:var(--border)}.border-line-2{border-color:var(--border-strong)}.border-purple-400{--tw-border-opacity:1;border-color:rgb(192 132 252 / var(--tw-border-opacity, 1))}.border-transparent{border-color:transparent}.border-white{--tw-border-opacity:1;border-color:rgb(255 255 255 / var(--tw-border-opacity, 1))}.bg-\\[rgba\\(127\\2c 127\\2c 127\\2c 0\\.05\\)\\]{background-color:rgba(127,127,127,0.05)}.bg-\\[rgba\\(127\\2c 127\\2c 127\\2c 0\\.08\\)\\]{background-color:rgba(127,127,127,0.08)}.bg-accent{background-color:var(--accent)}.bg-accent-soft{background-color:var(--accent-soft)}.bg-amber-100{--tw-bg-opacity:1;background-color:rgb(254 243 199 / var(--tw-bg-opacity, 1))}.bg-amber-900{--tw-bg-opacity:1;background-color:rgb(120 53 15 / var(--tw-bg-opacity, 1))}.bg-black{--tw-bg-opacity:1;background-color:rgb(0 0 0 / var(--tw-bg-opacity, 1))}.bg-blue-100{--tw-bg-opacity:1;background-color:rgb(219 234 254 / var(--tw-bg-opacity, 1))}.bg-blue-600{--tw-bg-opacity:1;background-color:rgb(37 99 235 / var(--tw-bg-opacity, 1))}.bg-danger{background-color:var(--danger)}.bg-danger-soft{background-color:color-mix(in srgb, var(--danger) 12%, transparent)}.bg-gray-200{--tw-bg-opacity:1;background-color:rgb(229 231 235 / var(--tw-bg-opacity, 1))}.bg-gray-300{--tw-bg-opacity:1;background-color:rgb(209 213 219 / var(--tw-bg-opacity, 1))}.bg-gray-400{--tw-bg-opacity:1;background-color:rgb(156 163 175 / var(--tw-bg-opacity, 1))}.bg-gray-50{--tw-bg-opacity:1;background-color:rgb(249 250 251 / var(--tw-bg-opacity, 1))}.bg-gray-800{--tw-bg-opacity:1;background-color:rgb(31 41 55 / var(--tw-bg-opacity, 1))}.bg-green-100{--tw-bg-opacity:1;background-color:rgb(220 252 231 / var(--tw-bg-opacity, 1))}.bg-green-500{--tw-bg-opacity:1;background-color:rgb(34 197 94 / var(--tw-bg-opacity, 1))}.bg-green-900{--tw-bg-opacity:1;background-color:rgb(20 83 45 / var(--tw-bg-opacity, 1))}.bg-red-50{--tw-bg-opacity:1;background-color:rgb(254 242 242 / var(--tw-bg-opacity, 1))}.bg-red-700{--tw-bg-opacity:1;background-color:rgb(185 28 28 / var(--tw-bg-opacity, 1))}.bg-red-900{--tw-bg-opacity:1;background-color:rgb(127 29 29 / var(--tw-bg-opacity, 1))}.bg-success{background-color:var(--success)}.bg-success-soft{background-color:color-mix(in srgb, var(--success) 12%, transparent)}.bg-surface{background-color:var(--surface)}.bg-surface-2{background-color:var(--surface-2)}.bg-surface-3{background-color:var(--surface-2)}.bg-transparent{background-color:transparent}.bg-white{--tw-bg-opacity:1;background-color:rgb(255 255 255 / var(--tw-bg-opacity, 1))}.object-cover{object-fit:cover}.p-0{padding:0px}.p-0\\.5{padding:0.125rem}.p-1{padding:0.25rem}.p-1\\.5{padding:0.375rem}.p-2{padding:0.5rem}.p-2\\.5{padding:0.625rem}.p-3{padding:0.75rem}.p-4{padding:1rem}.p-5{padding:1.25rem}.p-6{padding:1.5rem}.p-8{padding:2rem}.px-1{padding-left:0.25rem;padding-right:0.25rem}.px-1\\.5{padding-left:0.375rem;padding-right:0.375rem}.px-2{padding-left:0.5rem;padding-right:0.5rem}.px-2\\.5{padding-left:0.625rem;padding-right:0.625rem}.px-3{padding-left:0.75rem;padding-right:0.75rem}.px-4{padding-left:1rem;padding-right:1rem}.px-5{padding-left:1.25rem;padding-right:1.25rem}.px-6{padding-left:1.5rem;padding-right:1.5rem}.py-0{padding-top:0px;padding-bottom:0px}.py-0\\.5{padding-top:0.125rem;padding-bottom:0.125rem}.py-1{padding-top:0.25rem;padding-bottom:0.25rem}.py-1\\.5{padding-top:0.375rem;padding-bottom:0.375rem}.py-2{padding-top:0.5rem;padding-bottom:0.5rem}.py-2\\.5{padding-top:0.625rem;padding-bottom:0.625rem}.py-3{padding-top:0.75rem;padding-bottom:0.75rem}.py-4{padding-top:1rem;padding-bottom:1rem}.pb-1{padding-bottom:0.25rem}.pb-2{padding-bottom:0.5rem}.pb-6{padding-bottom:1.5rem}.pl-1{padding-left:0.25rem}.pl-3{padding-left:0.75rem}.pr-12{padding-right:3rem}.pr-20{padding-right:5rem}.pt-1{padding-top:0.25rem}.pt-2{padding-top:0.5rem}.pt-3{padding-top:0.75rem}.pt-4{padding-top:1rem}.text-left{text-align:left}.text-center{text-align:center}.font-mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace}.font-read{font-family:var(--font-read), serif}.font-sans{font-family:var(--font-user), var(--font), Instrument Sans, -apple-system, sans-serif}.text-2xl{font-size:1.5rem;line-height:2rem}.text-\\[10px\\]{font-size:10px}.text-\\[11px\\]{font-size:11px}.text-\\[13px\\]{font-size:13px}.text-\\[9px\\]{font-size:9px}.text-base{font-size:1rem;line-height:1.5rem}.text-lg{font-size:1.125rem;line-height:1.75rem}.text-sm{font-size:0.875rem;line-height:1.25rem}.text-xl{font-size:1.25rem;line-height:1.75rem}.text-xs{font-size:0.75rem;line-height:1rem}.font-bold{font-weight:700}.font-medium{font-weight:500}.font-normal{font-weight:400}.font-semibold{font-weight:600}.uppercase{text-transform:uppercase}.lowercase{text-transform:lowercase}.leading-relaxed{line-height:1.625}.leading-snug{line-height:1.375}.leading-tight{line-height:1.25}.tracking-tight{letter-spacing:-0.025em}.tracking-wide{letter-spacing:0.025em}.tracking-wider{letter-spacing:0.05em}.text-accent{color:var(--accent)}.text-accent-2{color:var(--accent-2)}.text-amber-600{--tw-text-opacity:1;color:rgb(217 119 6 / var(--tw-text-opacity, 1))}.text-black{--tw-text-opacity:1;color:rgb(0 0 0 / var(--tw-text-opacity, 1))}.text-blue-600{--tw-text-opacity:1;color:rgb(37 99 235 / var(--tw-text-opacity, 1))}.text-blue-700{--tw-text-opacity:1;color:rgb(29 78 216 / var(--tw-text-opacity, 1))}.text-body{color:var(--text)}.text-danger{color:var(--danger)}.text-dim{color:var(--text-dim)}.text-gray-200{--tw-text-opacity:1;color:rgb(229 231 235 / var(--tw-text-opacity, 1))}.text-gray-400{--tw-text-opacity:1;color:rgb(156 163 175 / var(--tw-text-opacity, 1))}.text-gray-500{--tw-text-opacity:1;color:rgb(107 114 128 / var(--tw-text-opacity, 1))}.text-green-100{--tw-text-opacity:1;color:rgb(220 252 231 / var(--tw-text-opacity, 1))}.text-green-500{--tw-text-opacity:1;color:rgb(34 197 94 / var(--tw-text-opacity, 1))}.text-green-600{--tw-text-opacity:1;color:rgb(22 163 74 / var(--tw-text-opacity, 1))}.text-green-800{--tw-text-opacity:1;color:rgb(22 101 52 / var(--tw-text-opacity, 1))}.text-info{color:var(--info)}.text-main{color:var(--text)}.text-onaccent{color:var(--accent-text)}.text-red-500{--tw-text-opacity:1;color:rgb(239 68 68 / var(--tw-text-opacity, 1))}.text-success{color:var(--success)}.text-warn{color:var(--warn)}.text-white{--tw-text-opacity:1;color:rgb(255 255 255 / var(--tw-text-opacity, 1))}.underline{-webkit-text-decoration-line:underline;text-decoration-line:underline}.line-through{-webkit-text-decoration-line:line-through;text-decoration-line:line-through}.accent-accent{accent-color:var(--accent)}.opacity-0{opacity:0}.opacity-100{opacity:1}.opacity-30{opacity:0.3}.opacity-40{opacity:0.4}.opacity-50{opacity:0.5}.opacity-70{opacity:0.7}.opacity-80{opacity:0.8}.shadow{--tw-shadow:var(--shadow);--tw-shadow-colored:var(--shadow);box-shadow:var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)}.shadow-2xl{--tw-shadow:0 25px 50px -12px rgb(0 0 0 / 0.25);--tw-shadow-colored:0 25px 50px -12px var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)}.shadow-\\[0_0_8px_rgba\\(34\\2c 197\\2c 94\\2c 0\\.6\\)\\]{--tw-shadow:0 0 8px rgba(34,197,94,0.6);--tw-shadow-colored:0 0 8px var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)}.shadow-lg{--tw-shadow:var(--shadow-lg);--tw-shadow-colored:var(--shadow-lg);box-shadow:var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)}.shadow-none{--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;box-shadow:var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)}.shadow-sm{--tw-shadow:0 1px 2px 0 rgb(0 0 0 / 0.05);--tw-shadow-colored:0 1px 2px 0 var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)}.shadow-xl{--tw-shadow:0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);--tw-shadow-colored:0 20px 25px -5px var(--tw-shadow-color), 0 8px 10px -6px var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)}.outline-none{outline:2px solid transparent;outline-offset:2px}.outline{outline-style:solid}.ring{--tw-ring-offset-shadow:var(--tw-ring-inset) 0 0 0 var(--tw-ring-offset-width) var(--tw-ring-offset-color);--tw-ring-shadow:var(--tw-ring-inset) 0 0 0 calc(3px + var(--tw-ring-offset-width)) var(--tw-ring-color);box-shadow:var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow, 0 0 #0000)}.ring-1{--tw-ring-offset-shadow:var(--tw-ring-inset) 0 0 0 var(--tw-ring-offset-width) var(--tw-ring-offset-color);--tw-ring-shadow:var(--tw-ring-inset) 0 0 0 calc(1px + var(--tw-ring-offset-width)) var(--tw-ring-color);box-shadow:var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow, 0 0 #0000)}.ring-black{--tw-ring-opacity:1;--tw-ring-color:rgb(0 0 0 / var(--tw-ring-opacity, 1))}.ring-white{--tw-ring-opacity:1;--tw-ring-color:rgb(255 255 255 / var(--tw-ring-opacity, 1))}.blur{--tw-blur:blur(8px);filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.backdrop-blur-md{--tw-backdrop-blur:blur(12px);-webkit-backdrop-filter:var(--tw-backdrop-blur) var(--tw-backdrop-brightness) var(--tw-backdrop-contrast) var(--tw-backdrop-grayscale) var(--tw-backdrop-hue-rotate) var(--tw-backdrop-invert) var(--tw-backdrop-opacity) var(--tw-backdrop-saturate) var(--tw-backdrop-sepia);backdrop-filter:var(--tw-backdrop-blur) var(--tw-backdrop-brightness) var(--tw-backdrop-contrast) var(--tw-backdrop-grayscale) var(--tw-backdrop-hue-rotate) var(--tw-backdrop-invert) var(--tw-backdrop-opacity) var(--tw-backdrop-saturate) var(--tw-backdrop-sepia)}.backdrop-blur-sm{--tw-backdrop-blur:blur(4px);-webkit-backdrop-filter:var(--tw-backdrop-blur) var(--tw-backdrop-brightness) var(--tw-backdrop-contrast) var(--tw-backdrop-grayscale) var(--tw-backdrop-hue-rotate) var(--tw-backdrop-invert) var(--tw-backdrop-opacity) var(--tw-backdrop-saturate) var(--tw-backdrop-sepia);backdrop-filter:var(--tw-backdrop-blur) var(--tw-backdrop-brightness) var(--tw-backdrop-contrast) var(--tw-backdrop-grayscale) var(--tw-backdrop-hue-rotate) var(--tw-backdrop-invert) var(--tw-backdrop-opacity) var(--tw-backdrop-saturate) var(--tw-backdrop-sepia)}.backdrop-filter{-webkit-backdrop-filter:var(--tw-backdrop-blur) var(--tw-backdrop-brightness) var(--tw-backdrop-contrast) var(--tw-backdrop-grayscale) var(--tw-backdrop-hue-rotate) var(--tw-backdrop-invert) var(--tw-backdrop-opacity) var(--tw-backdrop-saturate) var(--tw-backdrop-sepia);backdrop-filter:var(--tw-backdrop-blur) var(--tw-backdrop-brightness) var(--tw-backdrop-contrast) var(--tw-backdrop-grayscale) var(--tw-backdrop-hue-rotate) var(--tw-backdrop-invert) var(--tw-backdrop-opacity) var(--tw-backdrop-saturate) var(--tw-backdrop-sepia)}.transition{transition-property:color, background-color, border-color, fill, stroke, opacity, box-shadow, transform, filter, -webkit-text-decoration-color, -webkit-backdrop-filter;transition-property:color, background-color, border-color, text-decoration-color, fill, stroke, opacity, box-shadow, transform, filter, backdrop-filter;transition-property:color, background-color, border-color, text-decoration-color, fill, stroke, opacity, box-shadow, transform, filter, backdrop-filter, -webkit-text-decoration-color, -webkit-backdrop-filter;transition-timing-function:cubic-bezier(0.4, 0, 0.2, 1);transition-duration:150ms}.transition-\\[background-color\\2c border-color\\2c color\\2c box-shadow\\2c scale\\]{transition-property:background-color,border-color,color,box-shadow,scale;transition-timing-function:cubic-bezier(0.4, 0, 0.2, 1);transition-duration:150ms}.transition-colors{transition-property:color, background-color, border-color, fill, stroke, -webkit-text-decoration-color;transition-property:color, background-color, border-color, text-decoration-color, fill, stroke;transition-property:color, background-color, border-color, text-decoration-color, fill, stroke, -webkit-text-decoration-color;transition-timing-function:cubic-bezier(0.4, 0, 0.2, 1);transition-duration:150ms}.transition-opacity{transition-property:opacity;transition-timing-function:cubic-bezier(0.4, 0, 0.2, 1);transition-duration:150ms}.transition-transform{transition-property:transform;transition-timing-function:cubic-bezier(0.4, 0, 0.2, 1);transition-duration:150ms}.duration-200{transition-duration:200ms}.duration-300{transition-duration:300ms}.ease-in-out{transition-timing-function:cubic-bezier(0.4, 0, 0.2, 1)}.ease-out{transition-timing-function:cubic-bezier(0, 0, 0.2, 1)}.last\\:border-0:last-child{border-width:0px}.hover\\:border-accent:hover{border-color:var(--accent)}.hover\\:border-gray-400:hover{--tw-border-opacity:1;border-color:rgb(156 163 175 / var(--tw-border-opacity, 1))}.hover\\:border-green-500:hover{--tw-border-opacity:1;border-color:rgb(34 197 94 / var(--tw-border-opacity, 1))}.hover\\:border-info:hover{border-color:var(--info)}.hover\\:border-line-2:hover{border-color:var(--border-strong)}.hover\\:border-purple-400:hover{--tw-border-opacity:1;border-color:rgb(192 132 252 / var(--tw-border-opacity, 1))}.hover\\:bg-danger-soft:hover{background-color:color-mix(in srgb, var(--danger) 12%, transparent)}.hover\\:bg-red-700:hover{--tw-bg-opacity:1;background-color:rgb(185 28 28 / var(--tw-bg-opacity, 1))}.hover\\:bg-surface:hover{background-color:var(--surface)}.hover\\:bg-surface-2:hover{background-color:var(--surface-2)}.hover\\:bg-surface-3:hover{background-color:var(--surface-2)}.hover\\:text-accent-2:hover{color:var(--accent-2)}.hover\\:text-body:hover{color:var(--text)}.hover\\:text-danger:hover{color:var(--danger)}.hover\\:text-dim:hover{color:var(--text-dim)}.hover\\:text-gray-500:hover{--tw-text-opacity:1;color:rgb(107 114 128 / var(--tw-text-opacity, 1))}.hover\\:text-green-500:hover{--tw-text-opacity:1;color:rgb(34 197 94 / var(--tw-text-opacity, 1))}.hover\\:text-info:hover{color:var(--info)}.hover\\:text-main:hover{color:var(--text)}.hover\\:text-success:hover{color:var(--success)}.hover\\:underline:hover{-webkit-text-decoration-line:underline;text-decoration-line:underline}.hover\\:opacity-100:hover{opacity:1}.hover\\:opacity-80:hover{opacity:0.8}.focus\\:border-accent:focus{border-color:var(--accent)}.focus\\:border-black:focus{--tw-border-opacity:1;border-color:rgb(0 0 0 / var(--tw-border-opacity, 1))}.focus\\:border-danger:focus{border-color:var(--danger)}.focus\\:border-info:focus{border-color:var(--info)}.focus\\:outline-none:focus{outline:2px solid transparent;outline-offset:2px}.disabled\\:opacity-30:disabled{opacity:0.3}.group:hover .group-hover\\:opacity-100{opacity:1}.dark\\:border-gray-700:is(.dark *){--tw-border-opacity:1;border-color:rgb(55 65 81 / var(--tw-border-opacity, 1))}.dark\\:border-gray-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(31 41 55 / var(--tw-border-opacity, 1))}.dark\\:border-white:is(.dark *){--tw-border-opacity:1;border-color:rgb(255 255 255 / var(--tw-border-opacity, 1))}.dark\\:bg-\\[\\#0a0a0a\\]:is(.dark *){--tw-bg-opacity:1;background-color:rgb(10 10 10 / var(--tw-bg-opacity, 1))}.dark\\:bg-\\[\\#111\\]:is(.dark *){--tw-bg-opacity:1;background-color:rgb(17 17 17 / var(--tw-bg-opacity, 1))}.dark\\:bg-amber-900\\/30:is(.dark *){background-color:rgb(120 53 15 / 0.3)}.dark\\:bg-gray-800:is(.dark *){--tw-bg-opacity:1;background-color:rgb(31 41 55 / var(--tw-bg-opacity, 1))}.dark\\:bg-green-900\\/30:is(.dark *){background-color:rgb(20 83 45 / 0.3)}.dark\\:bg-red-900\\/20:is(.dark *){background-color:rgb(127 29 29 / 0.2)}.dark\\:bg-white:is(.dark *){--tw-bg-opacity:1;background-color:rgb(255 255 255 / var(--tw-bg-opacity, 1))}.dark\\:text-black:is(.dark *){--tw-text-opacity:1;color:rgb(0 0 0 / var(--tw-text-opacity, 1))}.dark\\:text-gray-200:is(.dark *){--tw-text-opacity:1;color:rgb(229 231 235 / var(--tw-text-opacity, 1))}.dark\\:text-green-100:is(.dark *){--tw-text-opacity:1;color:rgb(220 252 231 / var(--tw-text-opacity, 1))}.dark\\:text-white:is(.dark *){--tw-text-opacity:1;color:rgb(255 255 255 / var(--tw-text-opacity, 1))}.dark\\:hover\\:border-gray-500:hover:is(.dark *){--tw-border-opacity:1;border-color:rgb(107 114 128 / var(--tw-border-opacity, 1))}.dark\\:focus\\:border-white:focus:is(.dark *){--tw-border-opacity:1;border-color:rgb(255 255 255 / var(--tw-border-opacity, 1))}@media (min-width: 640px){.sm\\:left-6{left:1.5rem}.sm\\:inline{display:inline}.sm\\:hidden{display:none}.sm\\:h-3\\.5{height:0.875rem}.sm\\:w-3\\.5{width:0.875rem}.sm\\:w-52{width:13rem}.sm\\:w-80{width:20rem}.sm\\:w-auto{width:auto}.sm\\:max-w-\\[200px\\]{max-width:200px}.sm\\:grid-cols-2{grid-template-columns:repeat(2, minmax(0, 1fr))}.sm\\:grid-cols-3{grid-template-columns:repeat(3, minmax(0, 1fr))}.sm\\:grid-cols-6{grid-template-columns:repeat(6, minmax(0, 1fr))}.sm\\:flex-row{flex-direction:row}.sm\\:items-center{align-items:center}.sm\\:justify-between{justify-content:space-between}.sm\\:gap-0{gap:0px}.sm\\:space-x-2 > :not([hidden]) ~ :not([hidden]){--tw-space-x-reverse:0;margin-right:calc(0.5rem * var(--tw-space-x-reverse));margin-left:calc(0.5rem * calc(1 - var(--tw-space-x-reverse)))}.sm\\:space-x-3 > :not([hidden]) ~ :not([hidden]){--tw-space-x-reverse:0;margin-right:calc(0.75rem * var(--tw-space-x-reverse));margin-left:calc(0.75rem * calc(1 - var(--tw-space-x-reverse)))}.sm\\:self-auto{align-self:auto}.sm\\:p-0{padding:0px}.sm\\:p-1{padding:0.25rem}.sm\\:p-2{padding:0.5rem}.sm\\:p-4{padding:1rem}.sm\\:p-6{padding:1.5rem}.sm\\:px-3{padding-left:0.75rem;padding-right:0.75rem}.sm\\:px-6{padding-left:1.5rem;padding-right:1.5rem}.sm\\:pb-6{padding-bottom:1.5rem}.sm\\:pt-4{padding-top:1rem}.sm\\:text-lg{font-size:1.125rem;line-height:1.75rem}.sm\\:text-sm{font-size:0.875rem;line-height:1.25rem}.sm\\:text-xs{font-size:0.75rem;line-height:1rem}.sm\\:opacity-0{opacity:0}.sm\\:shadow-none{--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;box-shadow:var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)}}@media (min-width: 768px){.md\\:relative{position:relative}.md\\:bottom-24{bottom:6rem}.md\\:right-6{right:1.5rem}.md\\:hidden{display:none}.md\\:w-1\\/2{width:50%}.md\\:max-w-\\[80\\%\\]{max-width:80%}.md\\:max-w-\\[85\\%\\]{max-width:85%}.md\\:translate-x-0{--tw-translate-x:0px;transform:translate(var(--tw-translate-x), var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.md\\:grid-cols-3{grid-template-columns:repeat(3, minmax(0, 1fr))}.md\\:flex-row{flex-direction:row}.md\\:gap-8{gap:2rem}.md\\:space-x-4 > :not([hidden]) ~ :not([hidden]){--tw-space-x-reverse:0;margin-right:calc(1rem * var(--tw-space-x-reverse));margin-left:calc(1rem * calc(1 - var(--tw-space-x-reverse)))}.md\\:p-8{padding:2rem}.md\\:text-sm{font-size:0.875rem;line-height:1.25rem}}`;
+}
+
+// ── BUBBLE STYLESHEET ────────────────────────────────────────────────
+// Its own asset rather than part of the shell: 69KB is half the shell again,
+// and only people who chose a bubble ever pay for it.
+let _bubbleCSS = null;
+function getBubbleCSS() {
+  return _bubbleCSS ??= `/* ── CHAT BUBBLES ───────────────────────────────────────────────────────
+   Designs ported from the C.AI userscript plus four sets authored for this
+   app. Each is wrapped in @scope ([data-bubble="N"]).
+
+   @scope rather than a descendant selector because the picker renders LIVE
+   previews: a preview card carries its own [data-bubble] while <html> carries
+   the chosen one, and both would match. Scope proximity settles it in favour
+   of the nearest scope root; specificity alone would tie and hand it to
+   whichever design happened to be later in this file.
+
+   A night variant is authored as \`.dark .cai-msg\` and rewritten here to
+   :is(:scope.dark,.dark :scope), because inside @scope a selector is relative
+   to :scope - and .dark sits ON the scope root (both are on <html>), not
+   inside it, so the plain form matches nothing.
+
+   Every rule also beats Tailwind's utilities on specificity rather than source
+   order.
+
+   Colours the originals hardcoded are exposed as --b1..--bN with the authored
+   value as the fallback, so a design looks exactly as drawn until the user
+   changes something. Padding stays with the markup: these were written for a
+   different message layout and their own padding does not fit this one. */
+/* The reader's own bubble. It has no entry in the manifest because its whole
+   appearance is their settings: a linked picture or video behind a colour wash
+   they choose, over a fill and a radius they choose. */
+@scope ([data-bubble="custom"]){
+  .msg-content{
+    isolation:isolate;
+    position:relative;
+    overflow:visible;
+    background:var(--bub-custom-fill,#ffffff);
+    color:var(--bub-custom-text,#16181c);
+    border-radius:var(--bub-custom-radius,16px);
+  }
+  .msg-content[data-side="ai"]{ border-bottom-left-radius:5px }
+  .msg-content[data-side="user"]{ border-bottom-right-radius:5px }
+}
+
+@scope ([data-bubble]){
+  .msg-content{
+    border-color:transparent;
+    box-shadow:none;
+    font-family:var(--bub-font,inherit);
+  }
+  /* code, tables and quotes inside a message follow the bubble, not the app */
+  .msg-content th, .msg-content td{ border-color:currentColor }
+}
+
+/* 1 iOS Light */
+@scope ([data-bubble="1"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#e5e5ea);--cai-tx:var(--bub-ai-tx,#000000)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#0b93f6);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx);}
+.msg-content[data-side="ai"]{border-radius: 18px 18px 18px 4px;}
+.msg-content[data-side="user"]{border-radius: 18px 18px 4px 18px;}
+}
+
+/* 2 iOS Dark Blue */
+@scope ([data-bubble="2"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#0b93f6);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#e5e5ea);--cai-tx:var(--bub-user-tx,#000000)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx);}
+.msg-content[data-side="ai"]{border-radius: 18px 18px 18px 4px;}
+.msg-content[data-side="user"]{border-radius: 18px 18px 4px 18px;}
+}
+
+/* 3 WhatsApp */
+@scope ([data-bubble="3"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#000000)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#dcf8c6);--cai-tx:var(--bub-user-tx,#000000)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); box-shadow: 0 1px 1px rgba(0,0,0,0.1); position: relative; overflow: visible !important;}
+.msg-content[data-side="ai"]{border-radius: 0 8px 8px 8px;}
+.msg-content[data-side="ai"]::before{content:""; position:absolute; top:0; right:100%; width:0; height:0; border-top: 10px solid var(--cai-bg); border-left: 10px solid transparent;}
+.msg-content[data-side="user"]{border-radius: 8px 0 8px 8px;}
+.msg-content[data-side="user"]::before{content:""; position:absolute; top:0; left:100%; width:0; height:0; border-top: 10px solid var(--cai-bg); border-right: 10px solid transparent;}
+}
+
+/* 4 Android/SMS */
+@scope ([data-bubble="4"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#000000)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#0084ff);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); box-shadow: 0 1px 2px rgba(0,0,0,0.1);}
+.msg-content[data-side="ai"]{border-radius: 12px 12px 12px 0;}
+.msg-content[data-side="user"]{border-radius: 18px;}
+}
+
+/* 5 Messenger */
+@scope ([data-bubble="5"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f1f0f0);--cai-tx:var(--bub-ai-tx,#000000)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#0084ff);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx);}
+.msg-content[data-side="ai"]{border-radius: 20px; border: 1px solid #ddd;}
+.msg-content[data-side="user"]{border-radius: 18px;}
+}
+
+/* 6 Dark Mode */
+@scope ([data-bubble="6"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#333333);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#555555);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx);}
+.msg-content[data-side="ai"]{border-radius: 18px 18px 18px 4px;}
+.msg-content[data-side="user"]{border-radius: 18px 18px 4px 18px;}
+}
+
+/* 7 Wireframe */
+@scope ([data-bubble="7"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f1f0f0);--cai-tx:var(--bub-ai-tx,#000000)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#000000)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 20px; border: 1px solid #ddd;}
+}
+
+/* 8 WeChat Green */
+@scope ([data-bubble="8"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#000000)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#95ec69);--cai-tx:var(--bub-user-tx,#000000)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 4px; position: relative; overflow: visible !important;}
+.msg-content[data-side="ai"]::before{content:""; position:absolute; top:12px; right:100%; width:0; height:0; border-style: solid; border-width: 5px 6px 5px 0; border-color: transparent var(--cai-bg) transparent transparent;}
+.msg-content[data-side="user"]::before{content:""; position:absolute; top:12px; left:100%; width:0; height:0; border-style: solid; border-width: 5px 0 5px 6px; border-color: transparent transparent transparent var(--cai-bg);}
+}
+
+/* 9 Discord Blurple */
+@scope ([data-bubble="9"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#5865F2);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#5865F2);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 8px;}
+}
+
+/* 10 Dating App Pink */
+@scope ([data-bubble="10"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#FF3366);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#FF3366);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx);}
+.msg-content[data-side="ai"]{border-radius: 20px 20px 0 20px;}
+.msg-content[data-side="user"]{border-radius: 20px 20px 20px 0;}
+}
+
+/* 11 Sunset */
+@keyframes b11-an11-sheen{0%, 100% { box-shadow: inset 120px 0 100px -60px rgba(255,255,255,0.20); } 50% { box-shadow: inset -120px 0 100px -60px rgba(255,255,255,0.20); }}
+@scope ([data-bubble="11"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{color: var(--cai-tx) !important;}
+.msg-content *{color: var(--cai-tx) !important;}
+.msg-content[data-side="ai"]{background: linear-gradient(135deg, var(--b1,#ff9a9e), var(--b2,#fecfef)) !important; border-radius: 18px 18px 18px 4px;}
+.msg-content[data-side="user"]{background: linear-gradient(135deg, var(--b2,#fecfef), var(--b1,#ff9a9e)) !important; border-radius: 18px 18px 4px 18px;}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{animation: b11-an11-sheen 26s ease-in-out infinite;}
+}
+
+/* 12 Ocean */
+@keyframes b12-an12-sheen{0%, 100% { box-shadow: inset 120px 0 100px -60px rgba(255,255,255,0.20); } 50% { box-shadow: inset -120px 0 100px -60px rgba(255,255,255,0.20); }}
+@scope ([data-bubble="12"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{color: var(--cai-tx) !important;}
+.msg-content *{color: var(--cai-tx) !important;}
+.msg-content[data-side="ai"]{background: linear-gradient(135deg, var(--b1,#a1c4fd), var(--b2,#c2e9fb)) !important; border-radius: 18px 18px 18px 4px;}
+.msg-content[data-side="user"]{background: linear-gradient(135deg, var(--b2,#c2e9fb), var(--b1,#a1c4fd)) !important; border-radius: 18px 18px 4px 18px;}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{animation: b12-an12-sheen 22s ease-in-out infinite;}
+}
+
+/* 13 Mango */
+@keyframes b13-an13-sheen{0%, 100% { box-shadow: inset 120px 0 100px -60px rgba(255,255,255,0.18); } 50% { box-shadow: inset -120px 0 100px -60px rgba(255,255,255,0.18); }}
+@scope ([data-bubble="13"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{color: var(--cai-tx) !important;}
+.msg-content *{color: var(--cai-tx) !important;}
+.msg-content[data-side="ai"]{background: linear-gradient(135deg, var(--b1,#f6d365), var(--b2,#fda085)) !important; border-radius: 18px 18px 18px 4px;}
+.msg-content[data-side="user"]{background: linear-gradient(135deg, var(--b2,#fda085), var(--b1,#f6d365)) !important; border-radius: 18px 18px 4px 18px;}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{animation: b13-an13-sheen 29s ease-in-out infinite;}
+}
+
+/* 14 Mint */
+@keyframes b14-an14-sheen{0%, 100% { box-shadow: inset 120px 0 100px -60px rgba(255,255,255,0.20); } 50% { box-shadow: inset -120px 0 100px -60px rgba(255,255,255,0.20); }}
+@scope ([data-bubble="14"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{color: var(--cai-tx) !important;}
+.msg-content *{color: var(--cai-tx) !important;}
+.msg-content[data-side="ai"]{background: linear-gradient(135deg, var(--b1,#84fab0), var(--b2,#8fd3f4)) !important; border-radius: 18px 18px 18px 4px;}
+.msg-content[data-side="user"]{background: linear-gradient(135deg, var(--b2,#8fd3f4), var(--b1,#84fab0)) !important; border-radius: 18px 18px 4px 18px;}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{animation: b14-an14-sheen 24s ease-in-out infinite;}
+}
+
+/* 15 Lavender */
+@keyframes b15-an15-sheen{0%, 100% { box-shadow: inset 120px 0 100px -60px rgba(255,255,255,0.20); } 50% { box-shadow: inset -120px 0 100px -60px rgba(255,255,255,0.20); }}
+@scope ([data-bubble="15"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{color: var(--cai-tx) !important;}
+.msg-content *{color: var(--cai-tx) !important;}
+.msg-content[data-side="ai"]{background: linear-gradient(135deg, var(--b1,#a18cd1), var(--b2,#fbc2eb)) !important; border-radius: 18px 18px 18px 4px;}
+.msg-content[data-side="user"]{background: linear-gradient(135deg, var(--b2,#fbc2eb), var(--b1,#a18cd1)) !important; border-radius: 18px 18px 4px 18px;}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{animation: b15-an15-sheen 31s ease-in-out infinite;}
+}
+
+/* 16 Cyber */
+@keyframes b16-an16-sheen{0%, 100% { box-shadow: inset 120px 0 100px -60px rgba(255,255,255,0.22); } 50% { box-shadow: inset -120px 0 100px -60px rgba(255,255,255,0.22); }}
+@scope ([data-bubble="16"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{color: var(--cai-tx) !important;}
+.msg-content *{color: var(--cai-tx) !important;}
+.msg-content[data-side="ai"]{background: linear-gradient(135deg, var(--b1,#ff0844), var(--b2,#ffb199)) !important; border-radius: 18px 18px 18px 4px;}
+.msg-content[data-side="user"]{background: linear-gradient(135deg, var(--b2,#ffb199), var(--b1,#ff0844)) !important; border-radius: 18px 18px 4px 18px;}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{animation: b16-an16-sheen 20s ease-in-out infinite;}
+}
+
+/* 17 Twilight */
+@keyframes b17-an17-sheen{0%, 100% { box-shadow: inset 120px 0 100px -60px rgba(255,255,255,0.24); } 50% { box-shadow: inset -120px 0 100px -60px rgba(255,255,255,0.24); }}
+@scope ([data-bubble="17"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{color: var(--cai-tx) !important;}
+.msg-content *{color: var(--cai-tx) !important;}
+.msg-content[data-side="ai"]{background: linear-gradient(135deg, var(--b1,#30cfd0), var(--b2,#330867)) !important; border-radius: 18px 18px 18px 4px;}
+.msg-content[data-side="user"]{background: linear-gradient(135deg, var(--b2,#330867), var(--b1,#30cfd0)) !important; border-radius: 18px 18px 4px 18px;}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{animation: b17-an17-sheen 33s ease-in-out infinite;}
+}
+
+/* 18 Breeze */
+@keyframes b18-an18-sheen{0%, 100% { box-shadow: inset 120px 0 100px -60px rgba(255,255,255,0.17); } 50% { box-shadow: inset -120px 0 100px -60px rgba(255,255,255,0.17); }}
+@scope ([data-bubble="18"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{color: var(--cai-tx) !important;}
+.msg-content *{color: var(--cai-tx) !important;}
+.msg-content[data-side="ai"]{background: linear-gradient(135deg, var(--b1,#4facfe), var(--b2,#00f2fe)) !important; border-radius: 18px 18px 18px 4px;}
+.msg-content[data-side="user"]{background: linear-gradient(135deg, var(--b2,#00f2fe), var(--b1,#4facfe)) !important; border-radius: 18px 18px 4px 18px;}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{animation: b18-an18-sheen 23s ease-in-out infinite;}
+}
+
+/* 19 Forest */
+@keyframes b19-an19-sheen{0%, 100% { box-shadow: inset 120px 0 100px -60px rgba(255,255,255,0.18); } 50% { box-shadow: inset -120px 0 100px -60px rgba(255,255,255,0.18); }}
+@scope ([data-bubble="19"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{color: var(--cai-tx) !important;}
+.msg-content *{color: var(--cai-tx) !important;}
+.msg-content[data-side="ai"]{background: linear-gradient(135deg, var(--b1,#43e97b), var(--b2,#38f9d7)) !important; border-radius: 18px 18px 18px 4px;}
+.msg-content[data-side="user"]{background: linear-gradient(135deg, var(--b2,#38f9d7), var(--b1,#43e97b)) !important; border-radius: 18px 18px 4px 18px;}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{animation: b19-an19-sheen 27s ease-in-out infinite;}
+}
+
+/* 20 Lemonade */
+@keyframes b20-an20-sheen{0%, 100% { box-shadow: inset 120px 0 100px -60px rgba(255,255,255,0.18); } 50% { box-shadow: inset -120px 0 100px -60px rgba(255,255,255,0.18); }}
+@scope ([data-bubble="20"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{color: var(--cai-tx) !important;}
+.msg-content *{color: var(--cai-tx) !important;}
+.msg-content[data-side="ai"]{background: linear-gradient(135deg, var(--b1,#fa709a), var(--b2,#fee140)) !important; border-radius: 18px 18px 18px 4px;}
+.msg-content[data-side="user"]{background: linear-gradient(135deg, var(--b2,#fee140), var(--b1,#fa709a)) !important; border-radius: 18px 18px 4px 18px;}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{animation: b20-an20-sheen 25s ease-in-out infinite;}
+}
+
+/* 21 Neumorphic Light */
+@scope ([data-bubble="21"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: var(--b1,#e0e5ec) !important; color: var(--cai-tx) !important; border-radius: 16px; box-shadow: 5px 5px 10px #b8bcc2, -5px -5px 10px #ffffff !important;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 22 Neumorphic Dark */
+@scope ([data-bubble="22"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#dddddd)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#dddddd)}
+.msg-content{background: var(--b1,#2b2b2b) !important; color: var(--cai-tx) !important; border-radius: 16px; box-shadow: 4px 4px 8px #1a1a1a, -4px -4px 8px #3c3c3c !important;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 23 Neumorphic Inset */
+@scope ([data-bubble="23"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: var(--b1,#e0e5ec) !important; color: var(--cai-tx) !important; border-radius: 16px; box-shadow: inset 4px 4px 8px #b8bcc2, inset -4px -4px 8px #ffffff !important;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 24 Floating White */
+@scope ([data-bubble="24"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 16px; box-shadow: 0 10px 20px rgba(0,0,0,0.15) !important; transform: translateY(-2px);}
+}
+
+/* 25 Sharp Shadow Light */
+@scope ([data-bubble="25"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border: 2px solid #000; border-radius: 12px; box-shadow: 4px 4px 0 #000 !important;}
+}
+
+/* 26 Sharp Shadow Gold */
+@scope ([data-bubble="26"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffd700);--cai-tx:var(--bub-ai-tx,#000000)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffd700);--cai-tx:var(--bub-user-tx,#000000)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border: 2px solid #000; border-radius: 12px; box-shadow: 4px 4px 0 #000 !important;}
+}
+
+/* 27 Clay Pink */
+@scope ([data-bubble="27"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#000000)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#000000)}
+.msg-content{background: var(--b1,#ffb6c1) !important; color: var(--cai-tx) !important; border-radius: 24px; box-shadow: inset -4px -4px 8px rgba(0,0,0,0.1), inset 4px 4px 8px rgba(255,255,255,0.8) !important;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 28 Clay Blue */
+@scope ([data-bubble="28"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#000000)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#000000)}
+.msg-content{background: var(--b1,#87ceeb) !important; color: var(--cai-tx) !important; border-radius: 24px; box-shadow: inset -4px -4px 8px rgba(0,0,0,0.1), inset 4px 4px 8px rgba(255,255,255,0.8) !important;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 29 Left Connected */
+@scope ([data-bubble="29"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f3f4f6);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#f3f4f6);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx);}
+.msg-content[data-side="ai"]{border-radius: 0 16px 16px 16px; border-left: 4px solid #3b82f6; box-shadow: 2px 2px 10px rgba(0,0,0,0.05);}
+.msg-content[data-side="user"]{border-radius: 16px 0 16px 16px; border-right: 4px solid #ef4444; box-shadow: -2px 2px 10px rgba(0,0,0,0.05);}
+}
+
+/* 30 Right Connected */
+@scope ([data-bubble="30"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f3f4f6);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#f3f4f6);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx);}
+.msg-content[data-side="ai"]{border-radius: 16px 0 16px 16px; border-right: 4px solid #ef4444; box-shadow: -2px 2px 10px rgba(0,0,0,0.05);}
+.msg-content[data-side="user"]{border-radius: 0 16px 16px 16px; border-left: 4px solid #3b82f6; box-shadow: 2px 2px 10px rgba(0,0,0,0.05);}
+}
+
+/* 31 Cotton Candy */
+@scope ([data-bubble="31"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#4c1d95)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#4c1d95)}
+.msg-content{background: linear-gradient(135deg, var(--b1,#fbcfe8) 0%, var(--b2,#bfdbfe) 100%) !important; color: var(--cai-tx) !important; border-radius: 24px; box-shadow: 0 4px 15px rgba(191,219,254,0.5) !important; font-weight: 500;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 32 Strawberry Milk */
+@scope ([data-bubble="32"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fdf2f8);--cai-tx:var(--bub-ai-tx,#831843)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#fdf2f8);--cai-tx:var(--bub-user-tx,#831843)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border: 3px solid #f9a8d4; font-weight: 500;}
+.msg-content[data-side="ai"]{border-radius: 24px 24px 24px 8px;}
+.msg-content[data-side="user"]{border-radius: 24px 24px 8px 24px;}
+}
+
+/* 33 Blushing Cheeks */
+@scope ([data-bubble="33"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 24px; position: relative; overflow: hidden; box-shadow: 0 4px 10px rgba(0,0,0,0.05);}
+.msg-content::before,.msg-content::after{content: ""; position: absolute; bottom: -15px; width: 50px; height: 50px; background: #f9a8d4; border-radius: 50%; filter: blur(12px); opacity: 0.6; z-index: 0; pointer-events: none;}
+.msg-content::before{left: -15px;}
+.msg-content::after{right: -15px;}
+}
+
+/* 34 Squishy Mochi */
+@scope ([data-bubble="34"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#dcfce7);--cai-tx:var(--bub-ai-tx,#14532d)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#dcfce7);--cai-tx:var(--bub-user-tx,#14532d)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 30px; box-shadow: inset -4px -4px 10px rgba(20,83,45,0.1), inset 4px 4px 10px rgba(255,255,255,0.9) !important; font-weight: 500;}
+}
+
+/* 35 Lemon Dashed */
+@scope ([data-bubble="35"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fef9c3);--cai-tx:var(--bub-ai-tx,#854d0e)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#fef9c3);--cai-tx:var(--bub-user-tx,#854d0e)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 20px; border: 2px dashed #fde047;}
+}
+
+/* 36 Scalloped Lace */
+@scope ([data-bubble="36"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#e0e7ff);--cai-tx:var(--bub-ai-tx,#312e81)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#e0e7ff);--cai-tx:var(--bub-user-tx,#312e81)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 0 0 16px 16px; margin-top: 12px; position: relative; overflow: visible !important;}
+.msg-content::before{content:""; position:absolute; top:-10px; left:0; right:0; height:10px; background-image: radial-gradient(circle at 50% 100%, var(--cai-bg) 6px, transparent 6px); background-size: 12px 10px; background-repeat: repeat-x;}
+}
+
+/* 37 Bubblegum Gloss */
+@scope ([data-bubble="37"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#831843)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#831843)}
+.msg-content{background: var(--b1,#fbcfe8) !important; color: var(--cai-tx) !important; border-radius: 30px; box-shadow: inset 0 8px 10px rgba(255,255,255,0.8), 0 4px 10px rgba(249,168,212,0.4) !important;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 38 Caramel Pudding */
+@scope ([data-bubble="38"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fef08a);--cai-tx:var(--bub-ai-tx,#713f12)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#fef08a);--cai-tx:var(--bub-user-tx,#713f12)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 12px 12px 24px 24px; border-top: 14px solid #78350f; position: relative; overflow: visible !important;}
+.msg-content::before{content:""; position:absolute; top:-14px; left:16px; width:12px; height:22px; background:#78350f; border-radius:10px;}
+.msg-content::after{content:""; position:absolute; top:-14px; right:24px; width:14px; height:28px; background:#78350f; border-radius:10px;}
+}
+
+/* 39 Fluffy Cloud */
+@scope ([data-bubble="39"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 24px; margin-top: 16px; box-shadow: 0 4px 10px rgba(0,0,0,0.05); position: relative; overflow: visible !important;}
+.msg-content::before,.msg-content::after{content: ""; position: absolute; background: var(--cai-bg); border-radius: 50%; z-index: -1;}
+.msg-content::before{top: -14px; left: 24px; width: 32px; height: 32px;}
+.msg-content::after{top: -18px; left: 50px; width: 44px; height: 44px;}
+.msg-content{box-shadow: none !important; filter: drop-shadow(0 3px 6px rgba(0,0,0,0.10));}
+}
+
+/* 40 Sweet Confetti */
+@keyframes b40-an40-settle{0% { background-position: 0 0; } 100% { background-position: -150px 45px; }}
+@scope ([data-bubble="40"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 20px; background-image: radial-gradient(circle at 15px 15px, #f9a8d4 3px, transparent 4px), radial-gradient(circle at 45px 30px, #818cf8 3px, transparent 4px), radial-gradient(circle at 75px 12px, #fde047 3px, transparent 4px), radial-gradient(circle at 105px 25px, #6ee7b7 3px, transparent 4px), radial-gradient(circle at 135px 15px, #fca5a5 3px, transparent 4px); background-size: 150px 45px; border: 2px solid #f3f4f6;}
+.msg-content{animation: b40-an40-settle 32s linear infinite;}
+}
+
+/* 41 Royal Crown */
+@scope ([data-bubble="41"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 16px; border: 1px solid #ffd700; margin-top:15px; position:relative; overflow: visible !important;}
+.msg-content::after{content:var(--bub-glyph,"👑"); position:absolute; top:-18px; right:-10px; font-size:var(--bub-glyph-size,24px);color:var(--bub-glyph-color,inherit);}
+}
+
+/* 42 Heart Ribbon */
+@scope ([data-bubble="42"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 16px; border: 1px solid #ff69b4; position:relative; overflow: visible !important;}
+.msg-content::after{content:var(--bub-glyph,"💖"); position:absolute; bottom:-10px; right:-10px; font-size:var(--bub-glyph-size,20px);color:var(--bub-glyph-color,inherit);}
+}
+
+/* 43 Unread Dot */
+@scope ([data-bubble="43"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#e5e5ea);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#e5e5ea);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 16px; position:relative; overflow: visible !important;}
+.msg-content::after{content:""; position:absolute; top:-5px; right:-5px; width:12px; height:12px; background:red; border-radius:50%; border:2px solid #f3f4f6;}
+}
+
+/* 44 Quoted Message */
+@scope ([data-bubble="44"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 16px; overflow:hidden; position:relative; z-index:1;}
+.msg-content::before{content:"\\""; position:absolute; top:-10px; left:5px; font-size:60px; color:rgba(0,0,0,0.05); font-family:serif; z-index:-1;}
+}
+
+/* 45 Pinned Note */
+@scope ([data-bubble="45"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fffbd5);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#fffbd5);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 4px; box-shadow: 2px 2px 5px rgba(0,0,0,0.1); position:relative; margin-top:15px; overflow: visible !important;}
+.msg-content::before{content:var(--bub-glyph,"📌"); position:absolute; top:-12px; left:50%; transform:translateX(-50%); font-size:var(--bub-glyph-size,20px);color:var(--bub-glyph-color,inherit);}
+}
+
+/* 46 VIP Star */
+@scope ([data-bubble="46"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#1a1a1a);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#1a1a1a);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 16px; position:relative; overflow: visible !important;}
+.msg-content::after{content:var(--bub-glyph,"✨"); position:absolute; top:-10px; left:-10px; font-size:var(--bub-glyph-size,20px);color:var(--bub-glyph-color,inherit);}
+}
+
+/* 47 Spring Flower */
+@scope ([data-bubble="47"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#e0f7fa);--cai-tx:var(--bub-ai-tx,#006064)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#e0f7fa);--cai-tx:var(--bub-user-tx,#006064)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 16px; position:relative; overflow: visible !important;}
+.msg-content::after{content:var(--bub-glyph,"🌸"); position:absolute; bottom:-10px; left:-10px; font-size:var(--bub-glyph-size,24px);color:var(--bub-glyph-color,inherit);}
+}
+
+/* 48 Sparkles */
+@scope ([data-bubble="48"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 16px; border: 2px dashed #a855f7; position:relative; overflow: visible !important;}
+.msg-content::before{content:var(--bub-glyph,"✦"); position:absolute; top:-8px; right:-5px; color:#a855f7; font-size:var(--bub-glyph-size,18px);}
+.msg-content::after{content:var(--bub-glyph,"✦"); position:absolute; bottom:-8px; left:-5px; color:#a855f7; font-size:var(--bub-glyph-size,18px);}
+}
+
+/* 49 Music Note */
+@keyframes b49-caiBounce{0%, 100% { transform: translateY(0); } 50% { transform: translateY(-5px); }}
+@scope ([data-bubble="49"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fdf2f8);--cai-tx:var(--bub-ai-tx,#831843)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#fdf2f8);--cai-tx:var(--bub-user-tx,#831843)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 16px; position:relative; overflow: visible !important;}
+.msg-content::after{content:var(--bub-glyph,"🎵"); position:absolute; top:-12px; right:10px; font-size:var(--bub-glyph-size,18px); animation: b49-caiBounce 2s infinite;color:var(--bub-glyph-color,inherit);}
+}
+
+/* 50 Sleeping Zzz */
+@scope ([data-bubble="50"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#1e1b4b);--cai-tx:var(--bub-ai-tx,#c7d2fe)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#1e1b4b);--cai-tx:var(--bub-user-tx,#c7d2fe)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 16px; position:relative; overflow: visible !important;}
+.msg-content::after{content:var(--bub-glyph,"💤"); position:absolute; top:-15px; right:-5px; font-size:var(--bub-glyph-size,16px); color:#fff;}
+}
+
+/* 51 Polka Dots */
+@scope ([data-bubble="51"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: radial-gradient(var(--b1,#cbd5e1) 15%, transparent 16%) 0 0, radial-gradient(var(--b1,#cbd5e1) 15%, transparent 16%) 8px 8px !important; background-size: 16px 16px !important; background-color: var(--b2,#f8fafc) !important; color: var(--cai-tx) !important; border-radius: 16px;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 52 Candy Stripes */
+@scope ([data-bubble="52"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#991b1b)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#991b1b)}
+.msg-content{background: repeating-linear-gradient(45deg, var(--b1,#fecaca), var(--b1,#fecaca) 10px, var(--b2,#fff) 10px, var(--b2,#fff) 20px) !important; color: var(--cai-tx) !important; border-radius: 16px; font-weight: 500;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 53 Graph Paper */
+@scope ([data-bubble="53"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: linear-gradient(90deg, var(--b2,rgba(0,0,0,0.05)) 1px, transparent 1px), linear-gradient(var(--b2,rgba(0,0,0,0.05)) 1px, transparent 1px) !important; background-size: 10px 10px !important; background-color: var(--b1,#fff) !important; color: var(--cai-tx) !important; border-radius: 16px;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 54 Sunburst */
+@scope ([data-bubble="54"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: repeating-conic-gradient(var(--b1,#e2e8f0) 0% 25%, var(--b2,#fff) 0% 50%) !important; background-size: 20px 20px !important; color: var(--cai-tx) !important; border-radius: 16px;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 55 Blue Chevron */
+@scope ([data-bubble="55"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#1e3a8a)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#1e3a8a)}
+.msg-content{background: repeating-linear-gradient(-45deg, var(--b1,#bfdbfe), var(--b1,#bfdbfe) 5px, var(--b2,#fff) 5px, var(--b2,#fff) 10px) !important; color: var(--cai-tx) !important; border-radius: 16px;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 56 Yellow Zigzag */
+@scope ([data-bubble="56"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#854d0e)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#854d0e)}
+.msg-content{background: repeating-linear-gradient(0deg, var(--b1,#fef08a), var(--b1,#fef08a) 2px, var(--b2,#fff) 2px, var(--b2,#fff) 6px) !important; color: var(--cai-tx) !important; border-radius: 16px;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 57 Purple Waves */
+@scope ([data-bubble="57"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#4c1d95)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#4c1d95)}
+.msg-content{background: radial-gradient(circle at 100% 50%, transparent 20%, var(--b1,#e9d5ff) 21%, var(--b1,#e9d5ff) 34%, transparent 35%, transparent), radial-gradient(circle at 0% 50%, transparent 20%, var(--b1,#e9d5ff) 21%, var(--b1,#e9d5ff) 34%, transparent 35%, transparent) 0 -25px !important; background-size: 30px 40px !important; background-color: var(--b2,#fff) !important; color: var(--cai-tx) !important; border-radius: 16px;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 58 TV Static Noise */
+@scope ([data-bubble="58"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E") !important; color: var(--cai-tx) !important; border-radius: 16px; text-shadow: 1px 1px 2px #000; background-color: var(--b1,#444) !important;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 59 Tartan Plaid */
+@scope ([data-bubble="59"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: repeating-linear-gradient(90deg, transparent, transparent 20px, var(--b2,rgba(255,0,0,0.1)) 20px, var(--b2,rgba(255,0,0,0.1)) 22px), repeating-linear-gradient(0deg, transparent, transparent 20px, var(--b3,rgba(0,0,255,0.1)) 20px, var(--b3,rgba(0,0,255,0.1)) 22px) !important; background-color: var(--b1,#fff) !important; color: var(--cai-tx) !important; border-radius: 16px;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 60 Honey Dots */
+@scope ([data-bubble="60"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#b45309)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#b45309)}
+.msg-content{background: radial-gradient(circle, transparent 20%, var(--b1,#fff) 20%, var(--b1,#fff) 80%, transparent 80%, transparent), radial-gradient(circle, transparent 20%, var(--b1,#fff) 20%, var(--b1,#fff) 80%, transparent 80%, transparent) 25px 25px, linear-gradient(var(--b2,#fcd34d) 4px, transparent 4px) 0 -2px, linear-gradient(90deg, var(--b2,#fcd34d) 4px, var(--b1,#fff) 4px) !important; background-size: 50px 50px, 50px 50px, 25px 25px, 25px 25px !important; color: var(--cai-tx) !important; border-radius: 16px;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 61 Comic Book */
+@scope ([data-bubble="61"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#000000)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#000000)}
+.msg-content{--cai-sp:var(--bub-sp,#ff3366)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border: 3px solid #000; border-radius: 16px; box-shadow: 3px 3px 0 var(--cai-sp) !important;}
+}
+
+/* 62 Dashed Border */
+@scope ([data-bubble="62"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,transparent);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,transparent);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{--cai-sp:var(--bub-sp,#888888)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border: 2px dashed var(--cai-sp); border-radius: 16px;}
+}
+
+/* 63 Dotted Border */
+@scope ([data-bubble="63"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{--cai-sp:var(--bub-sp,#3b82f6)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border: 3px dotted var(--cai-sp); border-radius: 16px;}
+}
+
+/* 64 Double Line */
+@scope ([data-bubble="64"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{--cai-sp:var(--bub-sp,#10b981)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border: 4px double var(--cai-sp); border-radius: 16px;}
+}
+
+/* 65 Leaf Cut */
+@scope ([data-bubble="65"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#34d399);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#34d399);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx);}
+.msg-content[data-side="ai"]{border-radius: 0 24px 0 24px;}
+.msg-content[data-side="user"]{border-radius: 24px 0 24px 0;}
+}
+
+/* 66 Pill Shape */
+@scope ([data-bubble="66"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f472b6);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#f472b6);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 50px; text-align: center;}
+}
+
+/* 67 Sharp Box */
+@scope ([data-bubble="67"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#333333);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#333333);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 0;}
+}
+
+/* 68 Movie Ticket */
+@scope ([data-bubble="68"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 8px; mask-image: radial-gradient(circle at 100% 50%, transparent 6px, black 7px), radial-gradient(circle at 0% 50%, transparent 6px, black 7px); mask-size: 51% 100%; mask-position: right, left; mask-repeat: no-repeat; -webkit-mask-image: radial-gradient(circle at 100% 50%, transparent 6px, black 7px), radial-gradient(circle at 0% 50%, transparent 6px, black 7px); -webkit-mask-size: 51% 100%; -webkit-mask-position: right, left; -webkit-mask-repeat: no-repeat; border-left: 2px dashed #ccc; border-right: 2px dashed #ccc;}
+}
+
+/* 69 Folded Paper Corner */
+@scope ([data-bubble="69"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fbbf24);--cai-tx:var(--bub-ai-tx,#000000)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#fbbf24);--cai-tx:var(--bub-user-tx,#000000)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 8px; position: relative;}
+.msg-content[data-side="ai"]{border-top-left-radius: 0;}
+.msg-content[data-side="ai"]::before{content:""; position:absolute; top:0; left:0; width:0; height:0; border-width: 0 0 20px 20px; border-style: solid; border-color: transparent transparent var(--cai-bg) rgba(0,0,0,0.15); box-shadow: 2px 2px 2px rgba(0,0,0,0.1); border-bottom-right-radius: 4px;}
+.msg-content[data-side="user"]{border-top-right-radius: 0;}
+.msg-content[data-side="user"]::before{content:""; position:absolute; top:0; right:0; width:0; height:0; border-width: 0 20px 20px 0; border-style: solid; border-color: transparent transparent var(--cai-bg) rgba(0,0,0,0.15); box-shadow: -2px 2px 2px rgba(0,0,0,0.1); border-bottom-left-radius: 4px;}
+}
+
+/* 70 Hexagon Cut */
+@scope ([data-bubble="70"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#8b5cf6);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#8b5cf6);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); clip-path: polygon(10% 0, 100% 0, 100% 80%, 90% 100%, 0 100%, 0 20%); border-radius: 4px;}
+}
+
+/* 71 Frosted Glass */
+@scope ([data-bubble="71"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: var(--b1,rgba(255,255,255,0.4)) !important; backdrop-filter: blur(10px) !important; -webkit-backdrop-filter: blur(10px) !important; border: 1px solid var(--b2,rgba(255,255,255,0.5)); color: var(--cai-tx) !important; border-radius: 16px; box-shadow: 0 4px 6px rgba(0,0,0,0.05);}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 72 Tinted Dark Glass */
+@scope ([data-bubble="72"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: var(--b1,rgba(0,0,0,0.6)) !important; backdrop-filter: blur(8px) !important; -webkit-backdrop-filter: blur(8px) !important; color: var(--cai-tx) !important; border-radius: 16px; border: 1px solid var(--b2,rgba(255,255,255,0.1));}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 73 Metallic Silver */
+@keyframes b73-an73-polish{0%, 100% { box-shadow: inset 0 1px 0 #ffffff, inset 150px 0 90px -70px rgba(255,255,255,0.65); } 50% { box-shadow: inset 0 1px 0 #ffffff, inset -150px 0 90px -70px rgba(255,255,255,0.65); }}
+@scope ([data-bubble="73"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: linear-gradient(to bottom, var(--b1,#f5f5f5), var(--b2,#e0e0e0)) !important; color: var(--cai-tx) !important; border-radius: 16px; border: 1px solid var(--b3,#ccc); box-shadow: inset 0 1px 0 #fff;}
+.msg-content *{color: var(--cai-tx) !important;}
+.msg-content{animation: b73-an73-polish 21s ease-in-out infinite;}
+}
+
+/* 74 Gold Foil */
+@scope ([data-bubble="74"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#4a3300)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#4a3300)}
+.msg-content{background: linear-gradient(135deg, var(--b1,#bf953f), var(--b2,#fcf6ba), var(--b3,#b38728), var(--b4,#fbf5b7), var(--b5,#aa771c)) !important; color: var(--cai-tx) !important; border-radius: 16px; font-weight: 600; box-shadow: 0 4px 10px rgba(170,119,28,0.3) !important;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 75 Wooden Board */
+@scope ([data-bubble="75"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#5c3a21)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#5c3a21)}
+.msg-content{background: var(--b1,#deb887) !important; color: var(--cai-tx) !important; border-radius: 16px; background-image: repeating-linear-gradient(45deg, transparent, transparent 10px, var(--b3,rgba(0,0,0,0.05)) 10px, var(--b3,rgba(0,0,0,0.05)) 20px) !important; border: 2px solid var(--b2,#8b4513);}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 76 Chalkboard */
+@scope ([data-bubble="76"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: var(--b1,#2f4f4f) !important; color: var(--cai-tx) !important; border-radius: 8px; border: 4px solid var(--b2,#8b4513); box-shadow: inset 0 0 10px rgba(0,0,0,0.5);}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 77 Notepad Paper */
+@scope ([data-bubble="77"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#000000)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#000000)}
+.msg-content{background: var(--b1,#fffacd) !important; color: var(--cai-tx) !important; border-radius: 4px; background-image: linear-gradient(var(--b2,#87ceeb) 1px, transparent 1px) !important; background-size: 100% 20px !important; line-height: 20px; padding-top: 14px; box-shadow: 2px 2px 5px rgba(0,0,0,0.1); border-left: 2px solid var(--b3,#ff7f50);}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 78 Brown Leather */
+@scope ([data-bubble="78"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#8b4513);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#8b4513);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 12px; border: 2px dashed #deb887; box-shadow: 0 0 0 4px var(--cai-bg); margin: 4px;}
+}
+
+/* 79 Blue Denim */
+@scope ([data-bubble="79"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#1e3a8a);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#1e3a8a);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 12px; border: 2px dashed #f59e0b; box-shadow: 0 0 0 4px var(--cai-bg); margin: 4px;}
+}
+
+/* 80 Holographic Foil */
+@keyframes b80-caiHolo{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
+@scope ([data-bubble="80"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: linear-gradient(124deg, var(--b1,#ff2400), var(--b2,#e81d1d), var(--b3,#e8b71d), var(--b4,#e3e81d), var(--b5,#1de840), var(--b6,#1ddde8), var(--b7,#2b1de8), var(--b8,#dd00f3), var(--b8,#dd00f3)) !important; background-size: 400% 400% !important; animation: b80-caiHolo 5s ease infinite; color: var(--cai-tx) !important; border-radius: 16px; font-weight: bold; text-shadow: 1px 1px 2px #000;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 81 8-Bit Box */
+@scope ([data-bubble="81"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#000000);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#000000);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); font-size: 18px; border: 4px solid #fff; box-shadow: inset -4px -4px 0 #888, inset 4px 4px 0 #ccc; border-radius: 0;}
+}
+
+/* 82 Cyberpunk Polygon */
+@scope ([data-bubble="82"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fdf100);--cai-tx:var(--bub-ai-tx,#000000)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#fdf100);--cai-tx:var(--bub-user-tx,#000000)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); font-weight: bold; clip-path: polygon(0 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%); border-left: 4px solid #00f0ff;}
+}
+
+/* 83 Vaporwave */
+@keyframes b83-an83-scan{0%, 100% { box-shadow: inset 0 90px 80px -70px rgba(255,255,255,0.22); } 50% { box-shadow: inset 0 -90px 80px -70px rgba(255,255,255,0.22); }}
+@scope ([data-bubble="83"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: linear-gradient(180deg, var(--b1,#ff71ce) 0%, var(--b2,#01cdfe) 100%) !important; color: var(--cai-tx) !important; border-radius: 0; border: 2px solid var(--b3,#05ffa1); text-shadow: 2px 2px #b967ff; font-family: "Times New Roman", serif !important;}
+.msg-content *{color: var(--cai-tx) !important; font-family: "Times New Roman", serif !important;}
+.msg-content{animation: b83-an83-scan 19s ease-in-out infinite;}
+}
+
+/* 84 Terminal Green */
+@scope ([data-bubble="84"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#000000);--cai-tx:var(--bub-ai-tx,#00ff00)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#000000);--cai-tx:var(--bub-user-tx,#00ff00)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); font-size: 18px; border-radius: 4px; border: 1px solid #0f0;}
+}
+
+/* 85 Retro Arcade */
+@scope ([data-bubble="85"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#111827);--cai-tx:var(--bub-ai-tx,#fde047)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#111827);--cai-tx:var(--bub-user-tx,#fde047)}
+.msg-content{--cai-sp:var(--bub-sp,#ec4899)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); font-size: 18px; border: 2px solid var(--cai-sp); box-shadow: 4px 4px 0 var(--cai-sp) !important; border-radius: 8px; text-transform: uppercase;}
+}
+
+/* 86 Matrix Code */
+@scope ([data-bubble="86"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#000000);--cai-tx:var(--bub-ai-tx,#00ff00)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#000000);--cai-tx:var(--bub-user-tx,#00ff00)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); overflow: hidden; position: relative; border-radius: 8px;}
+.msg-content::before{content:"1010101010"; position:absolute; top:0; left:0; color:rgba(0,255,0,0.1); font-size:40px; word-wrap:break-word; line-height:0.8; z-index:0;}
+.msg-content *{position:relative; z-index:1;}
+}
+
+/* 87 CRT Scanlines */
+@scope ([data-bubble="87"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#222222);--cai-tx:var(--bub-ai-tx,#88ff88)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#222222);--cai-tx:var(--bub-user-tx,#88ff88)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); font-size:18px; border-radius: 10px; background-image: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.2) 2px, rgba(0,0,0,0.2) 4px); box-shadow: inset 0 0 10px #000;}
+}
+
+/* 88 Neon Magenta */
+@scope ([data-bubble="88"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#111111);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#111111);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{--cai-sp:var(--bub-sp,#ff00ff)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 16px; border: 2px solid var(--cai-sp); box-shadow: 0 0 10px var(--cai-sp), inset 0 0 10px var(--cai-sp) !important; text-shadow: 0 0 5px var(--cai-sp);}
+}
+
+/* 89 Neon Cyan */
+@scope ([data-bubble="89"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#111111);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#111111);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{--cai-sp:var(--bub-sp,#00ffff)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 16px; border: 2px solid var(--cai-sp); box-shadow: 0 0 10px var(--cai-sp), inset 0 0 10px var(--cai-sp) !important; text-shadow: 0 0 5px var(--cai-sp);}
+}
+
+/* 90 Windows 95 Classic */
+@scope ([data-bubble="90"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#c0c0c0);--cai-tx:var(--bub-ai-tx,#000000)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#c0c0c0);--cai-tx:var(--bub-user-tx,#000000)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 0; border-top: 2px solid #fff; border-left: 2px solid #fff; border-right: 2px solid #888; border-bottom: 2px solid #888; font-size: 18px;}
+}
+
+/* 91 Cosmic Space */
+@keyframes b91-an91-nebula{0%, 100% { box-shadow: inset 150px 40px 110px -100px rgba(148,163,184,0.24); } 50% { box-shadow: inset -150px -40px 110px -100px rgba(148,163,184,0.24); }}
+@scope ([data-bubble="91"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#e2e8f0)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#e2e8f0)}
+.msg-content{background: var(--b1,#0f172a) !important; color: var(--cai-tx) !important; border-radius: 16px; background-image: radial-gradient(white, var(--b3,rgba(255,255,255,.2)) 2px, transparent 4px), radial-gradient(white, var(--b4,rgba(255,255,255,.15)) 1px, transparent 3px) !important; background-size: 30px 30px, 20px 20px !important; background-position: 0 0, 15px 15px !important; border: 1px solid var(--b2,#334155);}
+.msg-content *{color: var(--cai-tx) !important;}
+.msg-content{animation: b91-an91-nebula 35s ease-in-out infinite;}
+}
+
+/* 92 Aurora Borealis */
+@keyframes b92-caiAurora{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
+@scope ([data-bubble="92"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: linear-gradient(270deg, var(--b1,#10b981), var(--b2,#3b82f6), var(--b3,#8b5cf6)) !important; background-size: 600% 600% !important; animation: b92-caiAurora 6s ease infinite; color: var(--cai-tx) !important; border-radius: 16px;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 93 Pulse Glow */
+@keyframes b93-caiPulse{0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--cai-sp) 70%, transparent); } 70% { box-shadow: 0 0 0 10px transparent; } 100% { box-shadow: 0 0 0 0 transparent; }}
+@scope ([data-bubble="93"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#c084fc);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#c084fc);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{--cai-sp:var(--bub-sp,#c084fc)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 16px; animation: b93-caiPulse 2s infinite;}
+}
+
+/* 94 Shake on Hover */
+@keyframes b94-caiShake{10%, 90% { transform: translate3d(-1px, 0, 0); } 20%, 80% { transform: translate3d(2px, 0, 0); } 30%, 50%, 70% { transform: translate3d(-4px, 0, 0); } 40%, 60% { transform: translate3d(4px, 0, 0); }}
+@scope ([data-bubble="94"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fcd34d);--cai-tx:var(--bub-ai-tx,#78350f)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#fcd34d);--cai-tx:var(--bub-user-tx,#78350f)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 16px; transition: transform 0.2s;}
+.msg-content:hover{animation: b94-caiShake 0.5s cubic-bezier(.36,.07,.19,.97) both;}
+}
+
+/* 95 Rainbow Text */
+@scope ([data-bubble="95"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,transparent)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,transparent)}
+.msg-content{background: var(--b1,#111) !important; border-radius: 16px; font-weight: bold; border: 1px solid var(--b2,#333);}
+.msg-content p,.msg-content span,.msg-content div,.msg-content textarea{background: linear-gradient(to right, red, orange, yellow, green, blue, indigo, violet) !important; -webkit-background-clip: text !important; background-clip: text !important; -webkit-text-fill-color: transparent !important; color: transparent !important;}
+}
+
+/* 96 Color Shifting */
+@keyframes b96-caiColorShift{0%{filter:hue-rotate(0deg)}100%{filter:hue-rotate(360deg)}}
+@scope ([data-bubble="96"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: var(--b1,#3b82f6) !important; color: var(--cai-tx) !important; border-radius: 16px; animation: b96-caiColorShift 5s infinite alternate;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 97 Neon Pulse Border */
+@keyframes b97-caiSmoothNeon{0% { box-shadow: 0 0 5px var(--cai-sp), inset 0 0 5px var(--cai-sp); border-color: var(--cai-sp); } 100% { box-shadow: 0 0 20px color-mix(in srgb, var(--cai-sp) 80%, white), 0 0 10px color-mix(in srgb, var(--cai-sp) 80%, white), inset 0 0 10px color-mix(in srgb, var(--cai-sp) 80%, white); border-color: color-mix(in srgb, var(--cai-sp) 80%, white); color: #fff; text-shadow: 0 0 8px #fff, 0 0 15px color-mix(in srgb, var(--cai-sp) 80%, white); }}
+@scope ([data-bubble="97"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#000000);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#000000);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{--cai-sp:var(--bub-sp,#a855f7)}
+.msg-content{background: var(--cai-bg); color: var(--cai-tx); border-radius: 16px; border: 2px solid var(--cai-sp); box-shadow: 0 0 10px var(--cai-sp), inset 0 0 10px var(--cai-sp) !important; animation: b97-caiSmoothNeon 2s ease-in-out infinite alternate; text-shadow: 0 0 5px #fff, 0 0 10px var(--cai-sp);}
+}
+
+/* 98 Liquid Gold */
+@keyframes b98-caiShine{0% { left: -100%; } 20% { left: 200%; } 100% { left: 200%; }}
+@scope ([data-bubble="98"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#ffffff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{background: linear-gradient(135deg, var(--b1,#f6d365) 0%, var(--b2,#fda085) 100%) !important; color: var(--cai-tx) !important; border-radius: 16px; position: relative; overflow: hidden; border: none;}
+.msg-content::after{content:""; position:absolute; top:0; left:-100%; width:50%; height:100%; background: linear-gradient(to right, transparent, var(--b3,rgba(255,255,255,0.4)), transparent); transform: skewX(-20deg); animation: b98-caiShine 3s infinite;}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 99 Party Confetti */
+@keyframes b99-an99-sway{0%, 100% { transform: scale(1.3) rotate(0deg); } 50% { transform: scale(1.3) rotate(7deg); }}
+@scope ([data-bubble="99"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#333333)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#333333)}
+.msg-content{background: var(--b1,#fff) !important; color: var(--cai-tx) !important; border-radius: 16px; position: relative; overflow: hidden;}
+.msg-content::before{content:""; position:absolute; top:0; left:0; right:0; bottom:0; background-image: radial-gradient(circle, var(--b2,#ff0000) 2px, transparent 2px), radial-gradient(circle, var(--b3,#00ff00) 2px, transparent 2px), radial-gradient(circle, var(--b4,#0000ff) 2px, transparent 2px) !important; background-size: 20px 20px !important; background-position: 0 0, 10px 10px, 5px 15px !important; opacity: 0.3; z-index: 0;}
+.msg-content *{color: var(--cai-tx) !important; position: relative; z-index: 1;}
+.msg-content::before{transform-origin: 50% 50%; animation: b99-an99-sway 34s ease-in-out infinite;}
+}
+
+/* 100 Ultimate Diamond VIP */
+@keyframes b100-caiFloat{0%, 100% { transform: translateY(0); } 50% { transform: translateY(-5px); }}
+@scope ([data-bubble="100"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffffff);--cai-tx:var(--bub-ai-tx,#ffd700)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffffff);--cai-tx:var(--bub-user-tx,#ffd700)}
+.msg-content{background: linear-gradient(45deg, var(--b1,#111), var(--b2,#333)) !important; color: var(--cai-tx) !important; border-radius: 20px; border: 2px solid var(--b3,#ffd700); box-shadow: 0 0 15px #ffd700 !important; text-transform: uppercase; font-weight: 900; letter-spacing: 1px; position: relative; overflow: visible !important;}
+.msg-content::before{content:var(--bub-glyph,"💎"); position:absolute; top:-15px; left:-10px; font-size:var(--bub-glyph-size,24px); animation: b100-caiFloat 2s infinite;color:var(--bub-glyph-color,inherit);}
+.msg-content::after{content:var(--bub-glyph2,"👑"); position:absolute; bottom:-15px; right:-10px; font-size:var(--bub-glyph-size,24px); animation: b100-caiFloat 2s infinite reverse;color:var(--bub-glyph-color,inherit);}
+.msg-content *{color: var(--cai-tx) !important;}
+}
+
+/* 101 Peaches */
+@scope ([data-bubble="101"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fff5f5);--cai-tx:var(--bub-ai-tx,#9a3412)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#fff5f5);--cai-tx:var(--bub-user-tx,#9a3412)}
+.msg-content{color: var(--cai-tx); border-radius: 18px; border: 1px solid #ffedd5; box-shadow: 0 4px 10px rgba(0,0,0,0.05);}
+}
+
+/* 102 Cherry Blossoms */
+@scope ([data-bubble="102"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fdf2f8);--cai-tx:var(--bub-ai-tx,#831843)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#fdf2f8);--cai-tx:var(--bub-user-tx,#831843)}
+.msg-content{color: var(--cai-tx); border-radius: 18px; border: 1px solid #fce7f3; box-shadow: 0 4px 10px rgba(0,0,0,0.05);}
+}
+
+/* 103 Strawberries */
+@scope ([data-bubble="103"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fef2f2);--cai-tx:var(--bub-ai-tx,#7f1d1d)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#fef2f2);--cai-tx:var(--bub-user-tx,#7f1d1d)}
+.msg-content{color: var(--cai-tx); border-radius: 18px; border: 1px solid #fee2e2; box-shadow: 0 4px 10px rgba(0,0,0,0.05);}
+}
+
+/* 104 Puppies */
+@scope ([data-bubble="104"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fffbeb);--cai-tx:var(--bub-ai-tx,#78350f)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#fffbeb);--cai-tx:var(--bub-user-tx,#78350f)}
+.msg-content{color: var(--cai-tx); border-radius: 18px; border: 1px solid #fef3c7; box-shadow: 0 4px 10px rgba(0,0,0,0.05);}
+}
+
+/* 105 Sparkles */
+@scope ([data-bubble="105"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fafafa);--cai-tx:var(--bub-ai-tx,#111111)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#fafafa);--cai-tx:var(--bub-user-tx,#111111)}
+.msg-content{color: var(--cai-tx); border-radius: 18px; border: 1px solid #f3f4f6; box-shadow: 0 4px 10px rgba(0,0,0,0.05);}
+}
+
+/* 106 Avocados */
+@scope ([data-bubble="106"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f0fdf4);--cai-tx:var(--bub-ai-tx,#14532d)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#f0fdf4);--cai-tx:var(--bub-user-tx,#14532d)}
+.msg-content{color: var(--cai-tx); border-radius: 18px; border: 1px solid #dcfce7; box-shadow: 0 4px 10px rgba(0,0,0,0.05);}
+}
+
+/* 107 Ghosts */
+@scope ([data-bubble="107"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f8fafc);--cai-tx:var(--bub-ai-tx,#334155)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#f8fafc);--cai-tx:var(--bub-user-tx,#334155)}
+.msg-content{color: var(--cai-tx); border-radius: 18px; border: 1px solid #e2e8f0; box-shadow: 0 4px 10px rgba(0,0,0,0.05);}
+}
+
+/* 108 Clouds */
+@scope ([data-bubble="108"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#eff6ff);--cai-tx:var(--bub-ai-tx,#1e3a8a)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#eff6ff);--cai-tx:var(--bub-user-tx,#1e3a8a)}
+.msg-content{color: var(--cai-tx); border-radius: 18px; border: 1px solid #dbeafe; box-shadow: 0 4px 10px rgba(0,0,0,0.05);}
+}
+
+/* 109 Money Stack */
+@scope ([data-bubble="109"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ecfdf5);--cai-tx:var(--bub-ai-tx,#064e3b)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ecfdf5);--cai-tx:var(--bub-user-tx,#064e3b)}
+.msg-content{color: var(--cai-tx); border-radius: 18px; border: 1px solid #d1fae5; box-shadow: 0 4px 10px rgba(0,0,0,0.05);}
+}
+
+/* 110 Dark Skulls */
+@scope ([data-bubble="110"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#0f172a);--cai-tx:var(--bub-ai-tx,#f8fafc)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#0f172a);--cai-tx:var(--bub-user-tx,#f8fafc)}
+.msg-content{color: var(--cai-tx); border-radius: 18px; border: 1px solid #334155; box-shadow: 0 4px 10px rgba(0,0,0,0.05);}
+}
+
+/* 201 Aurora Veil */
+@keyframes b201-a201veil{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
+@scope ([data-bubble="201"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#0b1020);--cai-tx:var(--bub-ai-tx,#eaf2ff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#151d38);--cai-tx:var(--bub-user-tx,#eaf2ff)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b4,rgba(150,200,255,0.16));box-shadow:0 8px 24px rgba(4,10,30,0.45)}
+.msg-content::before{content:"";position:absolute;inset:-20%;z-index:-1;background:linear-gradient(112deg,var(--b5,rgba(0,255,190,0)) 8%,var(--b6,rgba(0,255,190,0.42)) 26%,var(--b7,rgba(90,130,255,0.38)) 44%,var(--b8,rgba(255,96,205,0.34)) 62%,var(--b5,rgba(0,255,190,0)) 86%);background-size:240% 100%;background-repeat:no-repeat;filter:blur(12px);animation:b201-a201veil 15s ease-in-out infinite}
+.msg-content::after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(180deg,var(--b9,rgba(255,255,255,0.10)),var(--b10,rgba(255,255,255,0)) 55%)}
+.msg-content[data-side="ai"]{background:var(--b1,#0b1020);color:var(--b2,#eaf2ff);border-radius:18px 18px 18px 4px}
+.msg-content[data-side="user"]{background:var(--b3,#151d38);color:var(--b2,#eaf2ff);border-radius:18px 18px 4px 18px}
+}
+
+/* 202 Liquid Glass */
+@keyframes b202-a202sheen{0%{background-position:0% 0}50%{background-position:100% 0}100%{background-position:0% 0}}
+@scope ([data-bubble="202"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#1f2937);--cai-tx:var(--bub-ai-tx,#f3f4f6)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#1d4ed8);--cai-tx:var(--bub-user-tx,#ffffff)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;background:var(--cai-bg);color:var(--cai-tx);border:1px solid rgba(255,255,255,0.24);box-shadow:0 10px 28px rgba(0,0,0,0.26),inset 0 1px 0 rgba(255,255,255,0.38);backdrop-filter:blur(12px) saturate(150%)}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-1;background:linear-gradient(118deg,rgba(255,255,255,0) 36%,rgba(255,255,255,0.42) 50%,rgba(255,255,255,0) 64%);background-size:300% 100%;background-repeat:no-repeat;animation:b202-a202sheen 8s ease-in-out infinite}
+.msg-content::after{content:"";position:absolute;inset:0;pointer-events:none;background:radial-gradient(130% 90% at 18% -10%,rgba(255,255,255,0.30),rgba(255,255,255,0) 62%)}
+.msg-content[data-side="ai"]{border-radius:20px 20px 20px 6px}
+.msg-content[data-side="user"]{border-radius:20px 20px 6px 20px}
+}
+
+/* 203 Halo Ring */
+@keyframes b203-a203halo{0%{filter:hue-rotate(0deg)}100%{filter:hue-rotate(360deg)}}
+@scope ([data-bubble="203"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#12142a);--cai-tx:var(--bub-ai-tx,#e9ecff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#1a1d3a);--cai-tx:var(--bub-user-tx,#e9ecff)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;box-shadow:0 0 20px rgba(122,92,255,0.32)}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-2;border-radius:inherit;background:conic-gradient(from 0deg,var(--b1,#7cf9ff),var(--b2,#8a5cff),var(--b3,#ff5ce1),var(--b4,#ffc46b),var(--b1,#7cf9ff));animation:b203-a203halo 7s linear infinite}
+.msg-content::after{content:"";position:absolute;inset:2px;z-index:-1;border-radius:inherit;background:inherit}
+.msg-content[data-side="ai"]{background:var(--b5,#12142a);color:var(--b6,#e9ecff);border-radius:18px 18px 18px 4px}
+.msg-content[data-side="user"]{background:var(--b7,#1a1d3a);color:var(--b6,#e9ecff);border-radius:18px 18px 4px 18px}
+}
+
+/* 204 Neon Pulse */
+@keyframes b204-a204neon{0%{box-shadow:0 0 6px rgba(255,74,196,0.35),0 0 14px rgba(94,234,255,0.16)}50%{box-shadow:0 0 16px rgba(255,74,196,0.75),0 0 34px rgba(94,234,255,0.38)}100%{box-shadow:0 0 6px rgba(255,74,196,0.35),0 0 14px rgba(94,234,255,0.16)}}
+@scope ([data-bubble="204"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#0a0a12);--cai-tx:var(--bub-ai-tx,#ffeaf8)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#0f1020);--cai-tx:var(--bub-user-tx,#eafcff)}
+.msg-content{position:relative;border:1.5px solid var(--b5,rgba(255,74,196,0.7));text-shadow:0 0 8px rgba(255,74,196,0.45);animation:b204-a204neon 2.8s ease-in-out infinite}
+.msg-content::after{content:"";position:absolute;inset:0;pointer-events:none;border-radius:inherit;box-shadow:inset 0 0 16px rgba(255,74,196,0.28),inset 0 0 40px rgba(94,234,255,0.12)}
+.msg-content[data-side="ai"]{background:var(--b1,#0a0a12);color:var(--b2,#ffeaf8);border-radius:18px 18px 18px 4px}
+.msg-content[data-side="user"]{background:var(--b3,#0f1020);color:var(--b4,#eafcff);border-radius:18px 18px 4px 18px}
+}
+
+/* 205 Silk Sheen */
+@keyframes b205-a205silk{0%{background-position:0 0}50%{background-position:100% 0}100%{background-position:0 0}}
+@keyframes b205-a205glow{0%{background-position:-30% 0}50%{background-position:130% 0}100%{background-position:-30% 0}}
+@scope ([data-bubble="205"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#2a1436);--cai-tx:var(--bub-ai-tx,#f5ecff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#3a1c4a);--cai-tx:var(--bub-user-tx,#f5ecff)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;background:var(--cai-bg);color:var(--cai-tx);box-shadow:0 6px 18px rgba(0,0,0,0.22),inset 0 0 30px rgba(255,255,255,0.06)}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-1;background:repeating-linear-gradient(104deg,rgba(255,255,255,0) 0 10px,rgba(255,255,255,0.07) 16px,rgba(255,255,255,0) 30px,rgba(255,255,255,0.05) 42px,rgba(255,255,255,0) 56px);background-size:200% 100%;animation:b205-a205silk 13s ease-in-out infinite}
+.msg-content::after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(100deg,rgba(255,255,255,0) 40%,rgba(255,255,255,0.16) 50%,rgba(255,255,255,0) 60%);background-size:260% 100%;background-repeat:no-repeat;animation:b205-a205glow 9s ease-in-out infinite}
+.msg-content[data-side="ai"]{border-radius:16px 16px 16px 5px}
+.msg-content[data-side="user"]{border-radius:16px 16px 5px 16px}
+}
+
+/* 206 Starfield */
+@keyframes b206-a206drift{0%{background-position:0 0,0 0,0 0}100%{background-position:-120px 0,-150px 0,-190px 0}}
+@keyframes b206-a206neb{0%{opacity:0.78}50%{opacity:1}100%{opacity:0.78}}
+@scope ([data-bubble="206"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#070b1a);--cai-tx:var(--bub-ai-tx,#e6ecff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#0d1330);--cai-tx:var(--bub-user-tx,#e6ecff)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b7,rgba(120,150,220,0.18));box-shadow:0 8px 22px rgba(2,6,20,0.5)}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-1;background-image:radial-gradient(1.6px 1.6px at 18px 22px,var(--b1,#ffffff),var(--b8,rgba(255,255,255,0))),radial-gradient(1.2px 1.2px at 54px 68px,var(--b2,#cfe0ff),var(--b9,rgba(207,224,255,0))),radial-gradient(1px 1px at 96px 34px,var(--b3,#ffe9c9),var(--b10,rgba(255,233,201,0)));background-size:120px 90px,150px 110px,190px 130px;animation:b206-a206drift 40s linear infinite}
+.msg-content::after{content:"";position:absolute;inset:0;z-index:-1;background:radial-gradient(120% 70% at 70% 20%,var(--b11,rgba(90,120,255,0.22)),var(--b12,rgba(90,120,255,0)) 60%),radial-gradient(90% 60% at 20% 90%,var(--b13,rgba(190,80,255,0.18)),var(--b14,rgba(190,80,255,0)) 60%);animation:b206-a206neb 18s ease-in-out infinite}
+.msg-content[data-side="ai"]{background:var(--b4,#070b1a);color:var(--b5,#e6ecff);border-radius:18px 18px 18px 4px}
+.msg-content[data-side="user"]{background:var(--b6,#0d1330);color:var(--b5,#e6ecff);border-radius:18px 18px 4px 18px}
+}
+
+/* 207 Ember Glow */
+@keyframes b207-a207rise{0%{background-position:0 0,0 0,0 0}100%{background-position:0 -100px,0 -130px,0 -160px}}
+@keyframes b207-a207heat{0%{opacity:0.8}50%{opacity:1}100%{opacity:0.8}}
+@scope ([data-bubble="207"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#150e08);--cai-tx:var(--bub-ai-tx,#ffe9d2)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#1e130a);--cai-tx:var(--bub-user-tx,#ffe9d2)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b4,rgba(255,140,60,0.22));box-shadow:0 8px 20px rgba(20,8,0,0.45)}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-1;background-image:radial-gradient(2px 2px at 14px 80px,var(--b5,rgba(255,176,74,0.95)),var(--b6,rgba(255,176,74,0))),radial-gradient(1.6px 1.6px at 46px 30px,var(--b7,rgba(255,108,42,0.9)),var(--b8,rgba(255,108,42,0))),radial-gradient(1.2px 1.2px at 74px 58px,var(--b9,rgba(255,222,150,0.8)),var(--b10,rgba(255,222,150,0)));background-size:70px 100px,90px 130px,110px 160px;animation:b207-a207rise 22s linear infinite}
+.msg-content::after{content:"";position:absolute;inset:0;z-index:-1;background:radial-gradient(120% 80% at 50% 118%,var(--b11,rgba(255,110,30,0.42)),var(--b12,rgba(255,110,30,0)) 62%);animation:b207-a207heat 4.5s ease-in-out infinite}
+.msg-content[data-side="ai"]{background:var(--b1,#150e08);color:var(--b2,#ffe9d2);border-radius:18px 18px 18px 4px}
+.msg-content[data-side="user"]{background:var(--b3,#1e130a);color:var(--b2,#ffe9d2);border-radius:18px 18px 4px 18px}
+}
+
+/* 208 Rain Glass */
+@keyframes b208-a208rain{0%{background-position:0 -64px}100%{background-position:0 0}}
+@keyframes b208-a208mist{0%{background-position:9px -96px}100%{background-position:9px 0}}
+@scope ([data-bubble="208"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#0d1725);--cai-tx:var(--bub-ai-tx,#e6f1ff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#122033);--cai-tx:var(--bub-user-tx,#e6f1ff)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b4,rgba(170,205,255,0.2));box-shadow:0 8px 22px rgba(4,10,24,0.45),inset 0 0 26px rgba(120,170,255,0.08)}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-1;background-image:linear-gradient(96deg,var(--b5,rgba(190,220,255,0)) 44%,var(--b6,rgba(190,220,255,0.5)) 50%,var(--b5,rgba(190,220,255,0)) 56%);background-size:16px 64px;animation:b208-a208rain 1.9s linear infinite}
+.msg-content::after{content:"";position:absolute;inset:0;z-index:-1;background-image:linear-gradient(96deg,var(--b7,rgba(210,235,255,0)) 46%,var(--b8,rgba(210,235,255,0.28)) 50%,var(--b7,rgba(210,235,255,0)) 54%);background-size:26px 96px;filter:blur(0.6px);animation:b208-a208mist 3.4s linear infinite}
+.msg-content[data-side="ai"]{background:var(--b1,#0d1725);color:var(--b2,#e6f1ff);border-radius:18px 18px 18px 4px}
+.msg-content[data-side="user"]{background:var(--b3,#122033);color:var(--b2,#e6f1ff);border-radius:18px 18px 4px 18px}
+}
+
+/* 209 Snowfall */
+@keyframes b209-a209fall{0%{background-position:0 0,0 0}100%{background-position:0 76px,0 104px}}
+@keyframes b209-a209sway{0%{background-position:0 0}50%{background-position:14px 60px}100%{background-position:0 120px}}
+@scope ([data-bubble="209"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#cfe0f2);--cai-tx:var(--bub-ai-tx,#14273f)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#dbe8f6);--cai-tx:var(--bub-user-tx,#14273f)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b5,rgba(255,255,255,0.85));box-shadow:0 6px 18px rgba(40,70,110,0.18)}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-1;background-image:radial-gradient(2px 2px at 20px 14px,var(--b1,#ffffff),var(--b6,rgba(255,255,255,0))),radial-gradient(1.5px 1.5px at 62px 46px,var(--b1,#ffffff),var(--b6,rgba(255,255,255,0)));background-size:88px 76px,124px 104px;animation:b209-a209fall 14s linear infinite}
+.msg-content::after{content:"";position:absolute;inset:0;z-index:-1;background-image:radial-gradient(2.6px 2.6px at 40px 30px,var(--b7,rgba(255,255,255,0.9)),var(--b6,rgba(255,255,255,0)));background-size:150px 120px;filter:blur(0.5px);animation:b209-a209sway 9s ease-in-out infinite}
+.msg-content[data-side="ai"]{background:var(--b2,#cfe0f2);color:var(--b3,#14273f);border-radius:18px 18px 18px 4px}
+.msg-content[data-side="user"]{background:var(--b4,#dbe8f6);color:var(--b3,#14273f);border-radius:18px 18px 4px 18px}
+}
+
+/* 210 Lava Lamp */
+@keyframes b210-a210lava{0%{transform:translate3d(0,0,0) scale(1)}50%{transform:translate3d(6px,-10px,0) scale(1.12)}100%{transform:translate3d(0,0,0) scale(1)}}
+@keyframes b210-a210blob{0%{transform:translate3d(0,8px,0)}50%{transform:translate3d(-10px,-8px,0)}100%{transform:translate3d(0,8px,0)}}
+@scope ([data-bubble="210"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#170d2a);--cai-tx:var(--bub-ai-tx,#ffe7f2)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#1f1236);--cai-tx:var(--bub-user-tx,#ffe7f2)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b7,rgba(255,120,80,0.18));box-shadow:0 10px 26px rgba(10,4,24,0.5)}
+.msg-content::before{content:"";position:absolute;inset:-10%;z-index:-1;background:radial-gradient(38% 46% at 26% 108%,var(--b1,#ff6a3d),var(--b8,rgba(255,106,61,0)) 68%),radial-gradient(30% 40% at 74% -12%,var(--b2,#ff2e83),var(--b9,rgba(255,46,131,0)) 68%);filter:blur(8px);animation:b210-a210lava 18s ease-in-out infinite}
+.msg-content::after{content:"";position:absolute;inset:-10%;z-index:-1;background:radial-gradient(26% 34% at 52% 60%,var(--b3,#ffb347),var(--b10,rgba(255,179,71,0)) 70%);filter:blur(10px);animation:b210-a210blob 13s ease-in-out infinite}
+.msg-content[data-side="ai"]{background:var(--b4,#170d2a);color:var(--b5,#ffe7f2);border-radius:22px 22px 22px 6px}
+.msg-content[data-side="user"]{background:var(--b6,#1f1236);color:var(--b5,#ffe7f2);border-radius:22px 22px 6px 22px}
+}
+
+/* 211 Plasma Core */
+@keyframes b211-a211plasma{0%{background-position:0% 0%,100% 0%,50% 100%}33%{background-position:100% 50%,0% 80%,0% 0%}66%{background-position:40% 100%,60% 20%,100% 60%}100%{background-position:0% 0%,100% 0%,50% 100%}}
+@scope ([data-bubble="211"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#080d1c);--cai-tx:var(--bub-ai-tx,#e8f3ff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#0d1428);--cai-tx:var(--bub-user-tx,#e8f3ff)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b4,rgba(120,180,255,0.18));box-shadow:0 8px 24px rgba(2,8,24,0.5)}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-1;background-image:radial-gradient(60% 90% at 20% 30%,var(--b5,rgba(0,229,255,0.5)),var(--b6,rgba(0,229,255,0)) 62%),radial-gradient(55% 85% at 78% 24%,var(--b7,rgba(122,92,255,0.5)),var(--b8,rgba(122,92,255,0)) 62%),radial-gradient(65% 95% at 50% 96%,var(--b9,rgba(255,62,165,0.45)),var(--b10,rgba(255,62,165,0)) 64%);background-size:180% 180%,200% 200%,220% 220%;filter:blur(6px) saturate(140%);animation:b211-a211plasma 20s ease-in-out infinite}
+.msg-content::after{content:"";position:absolute;inset:0;pointer-events:none;background:radial-gradient(120% 100% at 50% 0%,var(--b11,rgba(255,255,255,0.10)),var(--b12,rgba(255,255,255,0)) 60%)}
+.msg-content[data-side="ai"]{background:var(--b1,#080d1c);color:var(--b2,#e8f3ff);border-radius:18px 18px 18px 4px}
+.msg-content[data-side="user"]{background:var(--b3,#0d1428);color:var(--b2,#e8f3ff);border-radius:18px 18px 4px 18px}
+}
+
+/* 212 Oil Slick */
+@keyframes b212-a212slick{0%{background-position:0% 50%;filter:blur(16px) saturate(130%) hue-rotate(0deg)}50%{background-position:100% 50%;filter:blur(16px) saturate(130%) hue-rotate(180deg)}100%{background-position:0% 50%;filter:blur(16px) saturate(130%) hue-rotate(360deg)}}
+@scope ([data-bubble="212"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#12141a);--cai-tx:var(--bub-ai-tx,#eef2f7)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#181b23);--cai-tx:var(--bub-user-tx,#eef2f7)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b9,rgba(180,200,220,0.16));box-shadow:0 8px 22px rgba(0,0,0,0.45)}
+.msg-content::before{content:"";position:absolute;inset:-15%;z-index:-1;background:conic-gradient(from 200deg at 34% 42%,var(--b1,#00ffd5),var(--b2,#7b5cff),var(--b3,#ff4fd8),var(--b4,#ffd166),var(--b5,#3dff8b),var(--b1,#00ffd5));background-size:220% 220%;opacity:0.42;mix-blend-mode:screen;animation:b212-a212slick 16s ease-in-out infinite}
+.msg-content::after{content:"";position:absolute;inset:0;z-index:-1;background:linear-gradient(180deg,var(--b10,rgba(255,255,255,0.12)),var(--b11,rgba(0,0,0,0.28)));mix-blend-mode:overlay}
+.msg-content[data-side="ai"]{background:var(--b6,#12141a);color:var(--b7,#eef2f7);border-radius:18px 18px 18px 4px}
+.msg-content[data-side="user"]{background:var(--b8,#181b23);color:var(--b7,#eef2f7);border-radius:18px 18px 4px 18px}
+}
+
+/* 213 Holo Foil */
+@keyframes b213-a213foil{0%{background-position:0 0,0 0}50%{background-position:0 0,100% 0}100%{background-position:0 0,0 0}}
+@keyframes b213-a213glint{0%{background-position:-40% 0}55%{background-position:140% 0}100%{background-position:140% 0}}
+@scope ([data-bubble="213"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#0b0b12);--cai-tx:var(--bub-ai-tx,#f6f7ff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#12121c);--cai-tx:var(--bub-user-tx,#f6f7ff)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b9,rgba(255,255,255,0.2));box-shadow:0 8px 22px rgba(0,0,0,0.4)}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-1;background-image:linear-gradient(180deg,var(--b10,rgba(8,8,16,0.55)),var(--b10,rgba(8,8,16,0.55))),repeating-linear-gradient(68deg,var(--b1,#ff5f6d) 0 16px,var(--b2,#ffc371) 16px 32px,var(--b3,#3ee6c4) 32px 48px,var(--b4,#4d8bff) 48px 64px,var(--b5,#b06bff) 64px 80px);background-size:100% 100%,300% 100%;animation:b213-a213foil 12s ease-in-out infinite}
+.msg-content::after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(102deg,var(--b11,rgba(255,255,255,0)) 42%,var(--b12,rgba(255,255,255,0.4)) 50%,var(--b11,rgba(255,255,255,0)) 58%);background-size:280% 100%;background-repeat:no-repeat;animation:b213-a213glint 6s ease-in-out infinite}
+.msg-content[data-side="ai"]{background:var(--b6,#0b0b12);color:var(--b7,#f6f7ff);border-radius:18px 18px 18px 4px}
+.msg-content[data-side="user"]{background:var(--b8,#12121c);color:var(--b7,#f6f7ff);border-radius:18px 18px 4px 18px}
+}
+
+/* 214 CRT Drift */
+@keyframes b214-a214scan{0%{background-position:0 0}100%{background-position:0 3px}}
+@keyframes b214-a214roll{0%{background-position:0 -140%}100%{background-position:0 240%}}
+@scope ([data-bubble="214"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#04120a);--cai-tx:var(--bub-ai-tx,#b8ffd0)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#07180e);--cai-tx:var(--bub-user-tx,#b8ffd0)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b4,rgba(120,255,170,0.22));box-shadow:0 0 18px rgba(0,255,140,0.12),inset 0 0 30px rgba(0,255,140,0.08);text-shadow:0 0 6px rgba(120,255,170,0.5)}
+.msg-content::before{content:"";position:absolute;inset:0;pointer-events:none;background-image:repeating-linear-gradient(180deg,var(--b5,rgba(0,0,0,0.42)) 0 1px,var(--b6,rgba(0,0,0,0)) 1px 3px);background-size:100% 3px;opacity:0.8;animation:b214-a214scan 3s linear infinite}
+.msg-content::after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(180deg,var(--b7,rgba(180,255,210,0)) 42%,var(--b8,rgba(180,255,210,0.16)) 50%,var(--b7,rgba(180,255,210,0)) 58%);background-repeat:no-repeat;background-size:100% 220%;animation:b214-a214roll 7s linear infinite}
+.msg-content[data-side="ai"]{background:var(--b1,#04120a);color:var(--b2,#b8ffd0);border-radius:6px 6px 6px 2px}
+.msg-content[data-side="user"]{background:var(--b3,#07180e);color:var(--b2,#b8ffd0);border-radius:6px 6px 2px 6px}
+}
+
+/* 215 Glitch Slice */
+@keyframes b215-a215slice{0%{opacity:0;transform:translate3d(0,0,0)}7%{opacity:0.9;transform:translate3d(-3px,0,0)}14%{opacity:0.7;transform:translate3d(4px,0,0);clip-path:inset(20% 0 68% 0)}21%{opacity:0}100%{opacity:0}}
+@keyframes b215-a215shift{0%{opacity:0}10%{opacity:0.8;transform:translate3d(5px,0,0)}17%{opacity:0.6;transform:translate3d(-4px,0,0);clip-path:inset(30% 0 58% 0)}24%{opacity:0}100%{opacity:0}}
+@scope ([data-bubble="215"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#0d0d16);--cai-tx:var(--bub-ai-tx,#f1f2ff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#14141f);--cai-tx:var(--bub-user-tx,#f1f2ff)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b4,rgba(255,255,255,0.14));box-shadow:0 8px 20px rgba(0,0,0,0.45)}
+.msg-content::before{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(90deg,var(--b5,rgba(0,255,240,0.35)),var(--b6,rgba(0,255,240,0.05)));mix-blend-mode:screen;clip-path:inset(42% 0 46% 0);opacity:0;animation:b215-a215slice 7s steps(1,end) infinite}
+.msg-content::after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(270deg,var(--b7,rgba(255,0,140,0.35)),var(--b8,rgba(255,0,140,0.05)));mix-blend-mode:screen;clip-path:inset(64% 0 22% 0);opacity:0;animation:b215-a215shift 7s steps(1,end) infinite}
+.msg-content[data-side="ai"]{background:var(--b1,#0d0d16);color:var(--b2,#f1f2ff);border-radius:10px 10px 10px 3px}
+.msg-content[data-side="user"]{background:var(--b3,#14141f);color:var(--b2,#f1f2ff);border-radius:10px 10px 3px 10px}
+}
+
+/* 216 Matrix Rain */
+@keyframes b216-a216rain{0%{background-position:0 0,0 0}100%{background-position:0 150px,0 190px}}
+@scope ([data-bubble="216"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#020a05);--cai-tx:var(--bub-ai-tx,#a8ffc6)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#04120a);--cai-tx:var(--bub-user-tx,#a8ffc6)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b4,rgba(0,255,120,0.22));box-shadow:0 8px 20px rgba(0,10,4,0.5);text-shadow:0 0 7px rgba(0,255,120,0.35)}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-1;background-image:radial-gradient(3px 40px at 8px 60px,var(--b5,rgba(150,255,190,0.75)),var(--b6,rgba(0,255,120,0)) 72%),radial-gradient(2px 30px at 30px 20px,var(--b7,rgba(0,255,120,0.6)),var(--b6,rgba(0,255,120,0)) 72%);background-size:44px 150px,66px 190px;animation:b216-a216rain 6s linear infinite}
+.msg-content::after{content:"";position:absolute;inset:0;z-index:-1;background:linear-gradient(180deg,var(--b8,rgba(0,255,120,0.14)),var(--b6,rgba(0,255,120,0)) 45%)}
+.msg-content[data-side="ai"]{background:var(--b1,#020a05);color:var(--b2,#a8ffc6);border-radius:8px 8px 8px 2px}
+.msg-content[data-side="user"]{background:var(--b3,#04120a);color:var(--b2,#a8ffc6);border-radius:8px 8px 2px 8px}
+}
+
+/* 217 Vapor Grid */
+@keyframes b217-a217grid{0%{background-position:0 0,0 0}100%{background-position:0 16px,0 0}}
+@scope ([data-bubble="217"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#0d0524);--cai-tx:var(--bub-ai-tx,#ffe9fb)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#150a30);--cai-tx:var(--bub-user-tx,#ffe9fb)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b9,rgba(255,110,199,0.25));box-shadow:0 8px 24px rgba(20,4,40,0.5)}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-2;background:linear-gradient(180deg,var(--b1,#2b1055) 0%,var(--b2,#6d2a8f) 38%,var(--b3,#ff6ec7) 56%,var(--b4,#ffb35c) 60%,var(--b5,#170a33) 61%,var(--b6,#0d0524) 100%)}
+.msg-content::after{content:"";position:absolute;inset:58% 0 0 0;z-index:-1;background-image:repeating-linear-gradient(180deg,var(--b10,rgba(255,110,199,0.55)) 0 1px,var(--b11,rgba(255,110,199,0)) 1px 16px),repeating-linear-gradient(90deg,var(--b12,rgba(120,220,255,0.35)) 0 1px,var(--b13,rgba(120,220,255,0)) 1px 34px);background-size:100% 16px,100% 100%;animation:b217-a217grid 3.2s linear infinite}
+.msg-content[data-side="ai"]{background:var(--b6,#0d0524);color:var(--b7,#ffe9fb);border-radius:16px 16px 16px 4px}
+.msg-content[data-side="user"]{background:var(--b8,#150a30);color:var(--b7,#ffe9fb);border-radius:16px 16px 4px 16px}
+}
+
+/* 218 Abyss Glow */
+@keyframes b218-a218current{0%{background-position:0% 0%,0% 0%}50%{background-position:20% 12%,-16% -10%}100%{background-position:0% 0%,0% 0%}}
+@keyframes b218-a218plankton{0%{opacity:0.35}50%{opacity:1}100%{opacity:0.35}}
+@scope ([data-bubble="218"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#04141c);--cai-tx:var(--bub-ai-tx,#cdf6ff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#062029);--cai-tx:var(--bub-user-tx,#cdf6ff)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b4,rgba(60,200,220,0.18));box-shadow:0 10px 28px rgba(0,10,18,0.55),inset 0 0 34px rgba(0,120,140,0.22)}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-1;background:radial-gradient(40% 60% at 22% 78%,var(--b5,rgba(0,230,200,0.35)),var(--b6,rgba(0,230,200,0)) 70%),radial-gradient(35% 55% at 76% 26%,var(--b7,rgba(70,140,255,0.3)),var(--b8,rgba(70,140,255,0)) 70%);filter:blur(4px);animation:b218-a218current 17s ease-in-out infinite}
+.msg-content::after{content:"";position:absolute;inset:0;z-index:-1;background-image:radial-gradient(1.8px 1.8px at 24px 30px,var(--b9,rgba(150,255,240,0.9)),var(--b10,rgba(150,255,240,0))),radial-gradient(1.4px 1.4px at 70px 74px,var(--b11,rgba(120,220,255,0.8)),var(--b12,rgba(120,220,255,0)));background-size:104px 96px,138px 126px;animation:b218-a218plankton 5.5s ease-in-out infinite}
+.msg-content[data-side="ai"]{background:var(--b1,#04141c);color:var(--b2,#cdf6ff);border-radius:20px 20px 20px 5px}
+.msg-content[data-side="user"]{background:var(--b3,#062029);color:var(--b2,#cdf6ff);border-radius:20px 20px 5px 20px}
+}
+
+/* 219 Moon Ripple */
+@keyframes b219-a219ripple{0%{background-size:0% 0%;opacity:0.9}100%{background-size:280% 280%;opacity:0}}
+@keyframes b219-a219wake{0%{background-size:0% 0%;opacity:0.8}100%{background-size:300% 300%;opacity:0}}
+@scope ([data-bubble="219"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#e9eff8);--cai-tx:var(--bub-ai-tx,#182a45)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#f2f5fb);--cai-tx:var(--bub-user-tx,#182a45)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b4,rgba(120,150,200,0.35));box-shadow:0 6px 18px rgba(40,60,100,0.16)}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-1;background:radial-gradient(circle,var(--b5,rgba(74,116,196,0)) 38%,var(--b6,rgba(74,116,196,0.3)) 50%,var(--b5,rgba(74,116,196,0)) 62%);background-repeat:no-repeat;background-position:50% 50%;animation:b219-a219ripple 6s ease-out infinite}
+.msg-content::after{content:"";position:absolute;inset:0;z-index:-1;background:radial-gradient(circle,var(--b7,rgba(120,90,200,0)) 38%,var(--b8,rgba(120,90,200,0.24)) 50%,var(--b7,rgba(120,90,200,0)) 62%);background-repeat:no-repeat;background-position:50% 50%;animation:b219-a219wake 6s ease-out 3s infinite}
+.msg-content[data-side="ai"]{background:var(--b1,#e9eff8);color:var(--b2,#182a45);border-radius:18px 18px 18px 4px}
+.msg-content[data-side="user"]{background:var(--b3,#f2f5fb);color:var(--b2,#182a45);border-radius:18px 18px 4px 18px}
+}
+
+/* 220 Tide Line */
+@keyframes b220-a220tide{0%{background-position:0 0}100%{background-position:180px 0}}
+@scope ([data-bubble="220"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#07202e);--cai-tx:var(--bub-ai-tx,#d9f4ff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#0a2b3d);--cai-tx:var(--bub-user-tx,#d9f4ff)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b4,rgba(110,200,220,0.22));box-shadow:0 8px 22px rgba(2,16,24,0.45)}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-2;background:linear-gradient(180deg,var(--b5,rgba(10,60,84,0)) 0%,var(--b6,rgba(14,90,120,0.55)) 100%)}
+.msg-content::after{content:"";position:absolute;inset:34% 0 0 0;z-index:-1;background-image:url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%20120%2024%22%3E%3Cpath%20d=%22M0%2012q15%20-10%2030%200t30%200t30%200t30%200V24H0Z%22%20fill=%22%23ffffff%22/%3E%3C/svg%3E);background-size:180px 100%;background-repeat:repeat-x;opacity:0.16;animation:b220-a220tide 9s linear infinite}
+.msg-content[data-side="ai"]{background:var(--b1,#07202e);color:var(--b2,#d9f4ff);border-radius:18px 18px 18px 4px}
+.msg-content[data-side="user"]{background:var(--b3,#0a2b3d);color:var(--b2,#d9f4ff);border-radius:18px 18px 4px 18px}
+}
+
+/* 221 Gold Glint */
+@keyframes b221-a221foil{0%{background-position:0% 0}50%{background-position:100% 0}100%{background-position:0% 0}}
+@keyframes b221-a221sparkle{0%{opacity:0.25}50%{opacity:1}100%{opacity:0.25}}
+@scope ([data-bubble="221"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#241804);--cai-tx:var(--bub-ai-tx,#ffe9b0)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#2e2008);--cai-tx:var(--bub-user-tx,#ffe9b0)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b4,rgba(214,168,74,0.5));box-shadow:0 8px 22px rgba(20,12,0,0.45),inset 0 1px 0 rgba(255,232,168,0.3)}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-1;background:linear-gradient(120deg,var(--b5,rgba(120,84,20,0.35)) 0%,var(--b6,rgba(214,168,74,0.35)) 34%,var(--b7,rgba(255,240,190,0.5)) 48%,var(--b6,rgba(214,168,74,0.35)) 62%,var(--b5,rgba(120,84,20,0.35)) 100%);background-size:260% 100%;background-repeat:no-repeat;animation:b221-a221foil 10s ease-in-out infinite}
+.msg-content::after{content:"";position:absolute;inset:0;pointer-events:none;background-image:radial-gradient(1.6px 1.6px at 22px 16px,var(--b8,rgba(255,246,214,0.95)),var(--b9,rgba(255,246,214,0))),radial-gradient(1.2px 1.2px at 74px 52px,var(--b10,rgba(255,236,180,0.9)),var(--b11,rgba(255,236,180,0)));background-size:110px 70px,160px 94px;animation:b221-a221sparkle 4.6s ease-in-out infinite}
+.msg-content[data-side="ai"]{background:var(--b1,#241804);color:var(--b2,#ffe9b0);border-radius:16px 16px 16px 4px}
+.msg-content[data-side="user"]{background:var(--b3,#2e2008);color:var(--b2,#ffe9b0);border-radius:16px 16px 4px 16px}
+}
+
+/* 222 Frost Breath */
+@keyframes b222-a222breath{0%{opacity:0.6;background-size:100% 100%,100% 100%}50%{opacity:1;background-size:130% 130%,124% 124%}100%{opacity:0.6;background-size:100% 100%,100% 100%}}
+@keyframes b222-a222crystal{0%{background-position:0 0,0 0}100%{background-position:120px 84px,-166px 112px}}
+@scope ([data-bubble="222"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#dfeaf6);--cai-tx:var(--bub-ai-tx,#16283d)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#eaf2fa);--cai-tx:var(--bub-user-tx,#16283d)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b4,rgba(255,255,255,0.9));box-shadow:0 6px 18px rgba(60,90,130,0.16),inset 0 0 26px rgba(255,255,255,0.8)}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-1;background:radial-gradient(45% 70% at 24% 20%,var(--b5,rgba(255,255,255,0.95)),var(--b6,rgba(255,255,255,0)) 70%),radial-gradient(50% 75% at 78% 82%,var(--b7,rgba(198,230,255,0.9)),var(--b8,rgba(198,230,255,0)) 72%);animation:b222-a222breath 9s ease-in-out infinite}
+.msg-content::after{content:"";position:absolute;inset:0;z-index:-1;background-image:radial-gradient(1.6px 1.6px at 30px 22px,var(--b5,rgba(255,255,255,0.95)),var(--b6,rgba(255,255,255,0))),radial-gradient(1.2px 1.2px at 82px 60px,var(--b9,rgba(160,205,240,0.8)),var(--b10,rgba(160,205,240,0)));background-size:120px 84px,166px 112px;animation:b222-a222crystal 20s linear infinite}
+.msg-content[data-side="ai"]{background:var(--b1,#dfeaf6);color:var(--b2,#16283d);border-radius:20px 20px 20px 5px}
+.msg-content[data-side="user"]{background:var(--b3,#eaf2fa);color:var(--b2,#16283d);border-radius:20px 20px 5px 20px}
+}
+
+/* 223 Comet Trail */
+@keyframes b223-a223comet{0%{background-position:-60% 0}42%{background-position:150% 0}100%{background-position:150% 0}}
+@scope ([data-bubble="223"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#06070f);--cai-tx:var(--bub-ai-tx,#eaefff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#0b0d1c);--cai-tx:var(--bub-user-tx,#eaefff)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b4,rgba(150,180,255,0.18));box-shadow:0 8px 24px rgba(2,4,16,0.55)}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-1;background:radial-gradient(120% 90% at 78% 12%,var(--b5,rgba(70,110,255,0.25)),var(--b6,rgba(70,110,255,0)) 62%),radial-gradient(90% 70% at 16% 88%,var(--b7,rgba(180,70,255,0.2)),var(--b8,rgba(180,70,255,0)) 60%)}
+.msg-content::after{content:"";position:absolute;inset:0;z-index:-1;background:linear-gradient(104deg,var(--b9,rgba(255,255,255,0)) 30%,var(--b10,rgba(150,200,255,0.22)) 44%,var(--b11,rgba(230,245,255,0.85)) 49%,var(--b9,rgba(255,255,255,0)) 51%);background-size:300% 100%;background-repeat:no-repeat;filter:blur(1px);animation:b223-a223comet 9s cubic-bezier(0.3,0,0.2,1) infinite}
+.msg-content[data-side="ai"]{background:var(--b1,#06070f);color:var(--b2,#eaefff);border-radius:18px 18px 18px 4px}
+.msg-content[data-side="user"]{background:var(--b3,#0b0d1c);color:var(--b2,#eaefff);border-radius:18px 18px 4px 18px}
+}
+
+/* 224 Heartbeat */
+@keyframes b224-a224beat{0%{box-shadow:0 0 8px rgba(255,64,120,0.25)}10%{box-shadow:0 0 22px rgba(255,64,120,0.6)}20%{box-shadow:0 0 10px rgba(255,64,120,0.28)}30%{box-shadow:0 0 26px rgba(255,64,120,0.7)}44%{box-shadow:0 0 8px rgba(255,64,120,0.25)}100%{box-shadow:0 0 8px rgba(255,64,120,0.25)}}
+@keyframes b224-a224inner{0%{opacity:0.55}10%{opacity:0.9}20%{opacity:0.6}30%{opacity:1}44%{opacity:0.55}100%{opacity:0.55}}
+@scope ([data-bubble="224"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#360f22);--cai-tx:var(--bub-ai-tx,#ffd9e6)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#42152b);--cai-tx:var(--bub-user-tx,#ffd9e6)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b4,rgba(255,120,160,0.28));animation:b224-a224beat 2.2s ease-in-out infinite}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-1;background:radial-gradient(70% 90% at 50% 110%,var(--b5,rgba(255,64,120,0.4)),var(--b6,rgba(255,64,120,0)) 68%);animation:b224-a224inner 2.2s ease-in-out infinite}
+.msg-content[data-side="ai"]{background:var(--b1,#360f22);color:var(--b2,#ffd9e6);border-radius:20px 20px 20px 5px}
+.msg-content[data-side="user"]{background:var(--b3,#42152b);color:var(--b2,#ffd9e6);border-radius:20px 20px 5px 20px}
+}
+
+/* 225 Petal Fall */
+@keyframes b225-a225petal{0%{background-position:0 0,0 0}100%{background-position:26px 96px,-30px 128px}}
+@keyframes b225-a225drift{0%{background-position:0 0}50%{background-position:-22px 75px}100%{background-position:0 150px}}
+@scope ([data-bubble="225"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fbe9ef);--cai-tx:var(--bub-ai-tx,#4a1030)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#fdf1f5);--cai-tx:var(--bub-user-tx,#4a1030)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b4,rgba(240,170,200,0.55));box-shadow:0 6px 18px rgba(120,50,90,0.12)}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-1;background-image:radial-gradient(4px 7px at 24px 18px,var(--b5,rgba(246,130,175,0.55)),var(--b6,rgba(246,130,175,0)) 72%),radial-gradient(3px 6px at 78px 62px,var(--b7,rgba(255,170,200,0.6)),var(--b8,rgba(255,170,200,0)) 72%);background-size:118px 96px,152px 128px;animation:b225-a225petal 13s linear infinite}
+.msg-content::after{content:"";position:absolute;inset:0;z-index:-1;background-image:radial-gradient(5px 8px at 52px 40px,var(--b9,rgba(232,110,160,0.4)),var(--b10,rgba(232,110,160,0)) 74%);background-size:190px 150px;filter:blur(0.4px);animation:b225-a225drift 17s linear infinite}
+.msg-content[data-side="ai"]{background:var(--b1,#fbe9ef);color:var(--b2,#4a1030);border-radius:20px 20px 20px 5px}
+.msg-content[data-side="user"]{background:var(--b3,#fdf1f5);color:var(--b2,#4a1030);border-radius:20px 20px 5px 20px}
+}
+
+/* 226 Caustics */
+@keyframes b226-a226caustic{0%{background-position:0 0,0 0}50%{background-position:26px -18px,-22px 20px}100%{background-position:0 0,0 0}}
+@keyframes b226-a226shaft{0%{opacity:0.6}50%{opacity:1}100%{opacity:0.6}}
+@scope ([data-bubble="226"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#04222b);--cai-tx:var(--bub-ai-tx,#d7fbff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#062c36);--cai-tx:var(--bub-user-tx,#d7fbff)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b4,rgba(120,235,240,0.2));box-shadow:0 8px 24px rgba(0,14,20,0.5),inset 0 0 30px rgba(0,140,160,0.2)}
+.msg-content::before{content:"";position:absolute;inset:-10%;z-index:-1;background-image:repeating-radial-gradient(circle at 28% 18%,var(--b5,rgba(150,255,245,0.16)) 0 5px,var(--b6,rgba(150,255,245,0)) 5px 19px),repeating-radial-gradient(circle at 72% 84%,var(--b7,rgba(120,220,255,0.14)) 0 6px,var(--b8,rgba(120,220,255,0)) 6px 23px);filter:blur(3px);mix-blend-mode:screen;animation:b226-a226caustic 14s ease-in-out infinite}
+.msg-content::after{content:"";position:absolute;inset:0;z-index:-1;background:linear-gradient(190deg,var(--b9,rgba(190,255,255,0.16)) 0%,var(--b10,rgba(190,255,255,0)) 46%);animation:b226-a226shaft 9s ease-in-out infinite}
+.msg-content[data-side="ai"]{background:var(--b1,#04222b);color:var(--b2,#d7fbff);border-radius:18px 18px 18px 4px}
+.msg-content[data-side="user"]{background:var(--b3,#062c36);color:var(--b2,#d7fbff);border-radius:18px 18px 4px 18px}
+}
+
+/* 227 Candy Gloss */
+@keyframes b227-a227gloss{0%{background-position:-30% 0}50%{background-position:120% 0}100%{background-position:-30% 0}}
+@scope ([data-bubble="227"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#6d0f3f);--cai-tx:var(--bub-ai-tx,#ffe6f2)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#8a1450);--cai-tx:var(--bub-user-tx,#ffe6f2)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b4,rgba(255,255,255,0.28));box-shadow:0 8px 22px rgba(60,0,30,0.35),inset 0 -6px 14px rgba(0,0,0,0.22),inset 0 2px 0 rgba(255,255,255,0.45)}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-1;background:linear-gradient(180deg,var(--b5,rgba(255,255,255,0.42)) 0%,var(--b6,rgba(255,255,255,0.08)) 44%,var(--b7,rgba(0,0,0,0.16)) 100%)}
+.msg-content::after{content:"";position:absolute;inset:0;pointer-events:none;background:radial-gradient(38% 60% at 22% 18%,var(--b8,rgba(255,255,255,0.55)),var(--b9,rgba(255,255,255,0)) 70%);background-repeat:no-repeat;background-size:170% 100%;mix-blend-mode:screen;animation:b227-a227gloss 7s ease-in-out infinite}
+.msg-content[data-side="ai"]{background:var(--b1,#6d0f3f);color:var(--b2,#ffe6f2);border-radius:22px 22px 22px 6px}
+.msg-content[data-side="user"]{background:var(--b3,#8a1450);color:var(--b2,#ffe6f2);border-radius:22px 22px 6px 22px}
+}
+
+/* 228 Jelly Wobble */
+@keyframes b228-a228jelly{0%{border-radius:44% 56% 62% 38%/46% 40% 60% 54%}33%{border-radius:60% 40% 38% 62%/58% 62% 38% 42%}66%{border-radius:38% 62% 54% 46%/40% 52% 48% 60%}100%{border-radius:44% 56% 62% 38%/46% 40% 60% 54%}}
+@scope ([data-bubble="228"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#0f2a24);--cai-tx:var(--bub-ai-tx,#d9fff2)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#123328);--cai-tx:var(--bub-user-tx,#d9fff2)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b4,rgba(120,255,215,0.22));box-shadow:0 8px 20px rgba(0,20,16,0.4);transition:box-shadow 0.35s ease}
+.msg-content::before{content:"";position:absolute;inset:-6%;z-index:-1;background:radial-gradient(60% 80% at 40% 30%,var(--b5,rgba(80,255,200,0.35)),var(--b6,rgba(80,255,200,0)) 70%),radial-gradient(70% 90% at 70% 80%,var(--b7,rgba(60,190,255,0.3)),var(--b8,rgba(60,190,255,0)) 72%);border-radius:44% 56% 62% 38%/46% 40% 60% 54%;animation:b228-a228jelly 8s ease-in-out infinite}
+.msg-content::after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(180deg,var(--b9,rgba(255,255,255,0.16)),var(--b10,rgba(255,255,255,0)) 40%)}
+.msg-content:hover{box-shadow:0 10px 30px rgba(0,255,190,0.28)}
+.msg-content[data-side="ai"]{background:var(--b1,#0f2a24);color:var(--b2,#d9fff2);border-radius:24px 24px 24px 8px}
+.msg-content[data-side="user"]{background:var(--b3,#123328);color:var(--b2,#d9fff2);border-radius:24px 24px 8px 24px}
+}
+
+/* 229 Sonar Ping */
+@keyframes b229-a229ping{0%{box-shadow:0 0 0 0 currentColor;opacity:0.4}70%{box-shadow:0 0 0 16px currentColor;opacity:0}100%{box-shadow:0 0 0 16px currentColor;opacity:0}}
+@keyframes b229-a229echo{0%{box-shadow:0 0 0 0 currentColor;opacity:0.28}70%{box-shadow:0 0 0 22px currentColor;opacity:0}100%{box-shadow:0 0 0 22px currentColor;opacity:0}}
+@scope ([data-bubble="229"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#0f172a);--cai-tx:var(--bub-ai-tx,#e2e8f0)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#134e4a);--cai-tx:var(--bub-user-tx,#ccfbf1)}
+.msg-content{position:relative;isolation:isolate;background:var(--cai-bg);color:var(--cai-tx);border:1px solid rgba(255,255,255,0.16);box-shadow:0 6px 18px rgba(0,0,0,0.25)}
+.msg-content::before{content:"";position:absolute;inset:0;pointer-events:none;border-radius:inherit;box-shadow:0 0 0 0 currentColor;opacity:0;animation:b229-a229ping 3.6s ease-out infinite}
+.msg-content::after{content:"";position:absolute;inset:0;pointer-events:none;border-radius:inherit;box-shadow:0 0 0 0 currentColor;opacity:0;animation:b229-a229echo 3.6s ease-out 1.8s infinite}
+.msg-content[data-side="ai"]{border-radius:18px 18px 18px 4px}
+.msg-content[data-side="user"]{border-radius:18px 18px 4px 18px}
+}
+
+/* 230 Firefly Meadow */
+@keyframes b230-a230fly{0%{background-position:0 0,0 0,0 0}100%{background-position:112px -90px,-148px 116px,182px 140px}}
+@keyframes b230-a230glow{0%{opacity:0.35}50%{opacity:1}100%{opacity:0.35}}
+@scope ([data-bubble="230"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#0c1a0e);--cai-tx:var(--bub-ai-tx,#e9ffe4)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#102213);--cai-tx:var(--bub-user-tx,#e9ffe4)}
+.msg-content{position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--b4,rgba(160,220,120,0.18));box-shadow:0 8px 22px rgba(4,14,6,0.5)}
+.msg-content::before{content:"";position:absolute;inset:0;z-index:-1;background:radial-gradient(120% 80% at 50% 120%,var(--b5,rgba(90,200,110,0.28)),var(--b6,rgba(90,200,110,0)) 66%),radial-gradient(80% 60% at 14% 10%,var(--b7,rgba(40,90,60,0.5)),var(--b8,rgba(40,90,60,0)) 70%)}
+.msg-content::after{content:"";position:absolute;inset:0;z-index:-1;background-image:radial-gradient(2.4px 2.4px at 26px 34px,var(--b9,rgba(255,238,140,0.95)),var(--b10,rgba(255,238,140,0))),radial-gradient(1.8px 1.8px at 82px 18px,var(--b11,rgba(214,255,150,0.85)),var(--b12,rgba(214,255,150,0))),radial-gradient(2px 2px at 54px 70px,var(--b13,rgba(255,224,120,0.8)),var(--b14,rgba(255,224,120,0)));background-size:112px 90px,148px 116px,182px 140px;filter:blur(0.4px);animation:b230-a230fly 26s linear infinite,b230-a230glow 4.2s ease-in-out infinite}
+.msg-content[data-side="ai"]{background:var(--b1,#0c1a0e);color:var(--b2,#e9ffe4);border-radius:20px 20px 20px 5px}
+.msg-content[data-side="user"]{background:var(--b3,#102213);color:var(--b2,#e9ffe4);border-radius:20px 20px 5px 20px}
+}
+
+/* 231 Celadon */
+@scope ([data-bubble="231"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#dfeae2);--cai-tx:var(--bub-ai-tx,#17352c)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#cfe0d6);--cai-tx:var(--bub-user-tx,#17352c)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#17352c); border:1px solid var(--b10,rgba(23,53,44,.18)); box-shadow:inset 0 1px 0 rgba(255,255,255,.92), inset 0 -8px 16px -8px rgba(23,53,44,.3), 0 2px 5px rgba(23,53,44,.15)}
+.msg-content[data-side="ai"]{border-radius:17px 17px 17px 5px; background:repeating-linear-gradient(63deg,var(--b11,rgba(23,53,44,0)) 0 16px,var(--b12,rgba(23,53,44,.11)) 16px 17px,var(--b11,rgba(23,53,44,0)) 17px 39px), repeating-linear-gradient(-41deg,var(--b11,rgba(23,53,44,0)) 0 21px,var(--b13,rgba(23,53,44,.09)) 21px 22px,var(--b11,rgba(23,53,44,0)) 22px 53px), radial-gradient(130% 100% at 28% 0,var(--b2,#f4faf6) 0,var(--b3,#e2ece5) 55%,var(--b4,#cfe0d5) 100%), var(--b5,#dfeae2)}
+.msg-content[data-side="user"]{border-radius:17px 17px 5px 17px; background:repeating-linear-gradient(63deg,var(--b11,rgba(23,53,44,0)) 0 16px,var(--b14,rgba(23,53,44,.13)) 16px 17px,var(--b11,rgba(23,53,44,0)) 17px 39px), repeating-linear-gradient(-41deg,var(--b11,rgba(23,53,44,0)) 0 21px,var(--b15,rgba(23,53,44,.1)) 21px 22px,var(--b11,rgba(23,53,44,0)) 22px 53px), radial-gradient(130% 100% at 72% 0,var(--b6,#e6f1ea) 0,var(--b7,#d3e4d9) 55%,var(--b8,#bdd6c8) 100%), var(--b9,#cfe0d6)}
+}
+
+/* 232 Qinghua */
+@keyframes b232-an232-motif{0% { background-position: 0 0, 0 0; } 100% { background-position: 48px 48px, 0 0; }}
+@keyframes b232-an232-motifu{0% { background-position: 14px 10px, 0 0; } 100% { background-position: 62px 58px, 0 0; }}
+@scope ([data-bubble="232"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f4f7fb);--cai-tx:var(--bub-ai-tx,#12305a)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#e4edf8);--cai-tx:var(--bub-user-tx,#12305a)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#12305a); box-shadow:inset 0 0 0 1px rgba(30,73,140,.3), inset 0 0 0 4px rgba(255,255,255,.9), inset 0 0 0 5px rgba(30,73,140,.4), 0 2px 6px rgba(18,48,89,.18)}
+.msg-content[data-side="ai"]{border-radius:16px 16px 16px 5px; background:url(data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20width=%2748%27%20height=%2748%27%3E%3Cg%20fill=%27none%27%20stroke=%27%231e498c%27%20stroke-width=%271.3%27%20opacity=%27.38%27%3E%3Cpath%20d=%27M6%2026q9-15%2018%200t18%200%27/%3E%3Ccircle%20cx=%2724%27%20cy=%2712%27%20r=%274%27/%3E%3Ccircle%20cx=%2724%27%20cy=%2740%27%20r=%273%27/%3E%3C/g%3E%3C/svg%3E) 0 0/48px 48px, radial-gradient(130% 100% at 30% 0,var(--b2,#ffffff) 0,var(--b3,#f5f9fd) 58%,var(--b4,#e8f0fa) 100%), var(--b5,#f4f7fb)}
+.msg-content[data-side="user"]{border-radius:16px 16px 5px 16px; background:url(data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20width=%2748%27%20height=%2748%27%3E%3Cg%20fill=%27none%27%20stroke=%27%231e498c%27%20stroke-width=%271.3%27%20opacity=%27.38%27%3E%3Cpath%20d=%27M6%2026q9-15%2018%200t18%200%27/%3E%3Ccircle%20cx=%2724%27%20cy=%2712%27%20r=%274%27/%3E%3Ccircle%20cx=%2724%27%20cy=%2740%27%20r=%273%27/%3E%3C/g%3E%3C/svg%3E) 14px 10px/48px 48px, radial-gradient(130% 100% at 70% 0,var(--b6,#f8fbfe) 0,var(--b7,#eaf1fb) 58%,var(--b8,#dae6f5) 100%), var(--b9,#e4edf8)}
+.msg-content[data-side="ai"]{animation: b232-an232-motif 38s linear infinite;}
+.msg-content[data-side="user"]{animation: b232-an232-motifu 38s linear infinite;}
+}
+
+/* 233 Chu Sa */
+@scope ([data-bubble="233"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f7f2e6);--cai-tx:var(--bub-ai-tx,#39301f)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#efe7d3);--cai-tx:var(--bub-user-tx,#39301f)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#39301f); border:1px solid var(--b10,rgba(57,48,31,.2)); box-shadow:0 2px 5px rgba(57,48,31,.16), inset 0 0 26px rgba(160,120,60,.14)}
+.msg-content[data-side="ai"]{border-radius:14px 14px 14px 4px; background:repeating-linear-gradient(0deg,var(--b11,rgba(57,48,31,.06)) 0 1px,var(--b12,rgba(57,48,31,0)) 1px 5px), linear-gradient(170deg,var(--b2,#fbf7ee) 0,var(--b3,#f3ecda) 100%), var(--b4,#f7f2e6)}
+.msg-content[data-side="user"]{border-radius:14px 14px 4px 14px; background:repeating-linear-gradient(0deg,var(--b13,rgba(57,48,31,.07)) 0 1px,var(--b12,rgba(57,48,31,0)) 1px 5px), linear-gradient(170deg,var(--b5,#f4ecdb) 0,var(--b6,#e9dfc7) 100%), var(--b7,#efe7d3)}
+.msg-content::after{content:""; position:absolute; top:4px; right:4px; width:13px; height:13px; border-radius:2px; background:linear-gradient(90deg,var(--b14,rgba(255,240,233,0)) 45%,var(--b15,rgba(255,240,233,.9)) 45% 55%,var(--b14,rgba(255,240,233,0)) 55%), linear-gradient(0deg,var(--b14,rgba(255,240,233,0)) 45%,var(--b15,rgba(255,240,233,.9)) 45% 55%,var(--b14,rgba(255,240,233,0)) 55%), linear-gradient(180deg,var(--b8,#c73a30),var(--b9,#a3211c)); box-shadow:inset 0 0 0 1.5px rgba(255,240,233,.75), 0 1px 2px rgba(57,48,31,.3); opacity:.92; pointer-events:none}
+.msg-content[data-side="user"]::after{right:auto; left:4px}
+}
+
+/* 234 Sumi Mist */
+@keyframes b234-an234-wash{0%, 100% { background-size: 100% 100%, 100% 100%, 100% 100%, 100% 100%; } 50% { background-size: 112% 108%, 108% 112%, 104% 100%, 100% 100%; }}
+@keyframes b234-an234-mist{0%, 100% { transform: translateX(-5px) scale(1.04); opacity: 0.78; } 50% { transform: translateX(7px) scale(1.12); opacity: 1; }}
+@scope ([data-bubble="234"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f7f5f0);--cai-tx:var(--bub-ai-tx,#26262a)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#eae8e1);--cai-tx:var(--bub-user-tx,#26262a)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#26262a); border:1px solid var(--b8,rgba(38,38,42,.14)); box-shadow:0 2px 6px rgba(38,38,42,.13)}
+.msg-content[data-side="ai"]{border-radius:15px 15px 15px 4px; background:radial-gradient(88% 58% at 16% 116%,var(--b9,rgba(38,38,42,.34)) 0,var(--b10,rgba(38,38,42,.12)) 44%,var(--b11,rgba(38,38,42,0)) 72%), radial-gradient(66% 48% at 60% 126%,var(--b12,rgba(38,38,42,.26)) 0,var(--b13,rgba(38,38,42,.08)) 46%,var(--b11,rgba(38,38,42,0)) 74%), radial-gradient(130% 62% at 86% -26%,var(--b14,rgba(38,38,42,.13)) 0,var(--b11,rgba(38,38,42,0)) 64%), linear-gradient(180deg,var(--b2,#fbfaf7),var(--b3,#f2f0e9)), var(--b4,#f7f5f0)}
+.msg-content[data-side="user"]{border-radius:15px 15px 4px 15px; background:radial-gradient(88% 58% at 84% 116%,var(--b9,rgba(38,38,42,.34)) 0,var(--b10,rgba(38,38,42,.12)) 44%,var(--b11,rgba(38,38,42,0)) 72%), radial-gradient(66% 48% at 40% 126%,var(--b12,rgba(38,38,42,.26)) 0,var(--b13,rgba(38,38,42,.08)) 46%,var(--b11,rgba(38,38,42,0)) 74%), radial-gradient(130% 62% at 14% -26%,var(--b14,rgba(38,38,42,.13)) 0,var(--b11,rgba(38,38,42,0)) 64%), linear-gradient(180deg,var(--b5,#efeee7),var(--b6,#e3e1d9)), var(--b7,#eae8e1)}
+.msg-content::before{content:""; position:absolute; left:9%; top:-12px; width:44%; height:24px; background:radial-gradient(50% 50% at 50% 50%,var(--b12,rgba(38,38,42,.26)) 0,var(--b11,rgba(38,38,42,0)) 70%); filter:blur(3px); pointer-events:none}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{animation: b234-an234-wash 34s ease-in-out infinite;}
+.msg-content::before{animation: b234-an234-mist 27s ease-in-out infinite;}
+}
+
+/* 235 Bamboo Grove */
+@scope ([data-bubble="235"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#e9f2e0);--cai-tx:var(--bub-ai-tx,#1f3a19)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#dbe9cf);--cai-tx:var(--bub-user-tx,#1f3a19)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#1f3a19); border:1px solid var(--b12,rgba(31,58,25,.18)); box-shadow:inset 0 1px 0 rgba(255,255,255,.75), 0 2px 6px rgba(31,58,25,.15)}
+.msg-content[data-side="ai"]{border-radius:16px 16px 16px 5px; background:repeating-linear-gradient(0deg,var(--b13,rgba(31,58,25,0)) 0 44px,var(--b14,rgba(31,58,25,.2)) 44px 45px,var(--b15,rgba(255,255,255,.55)) 45px 47px,var(--b13,rgba(31,58,25,0)) 47px 92px), repeating-linear-gradient(90deg,var(--b16,rgba(31,58,25,.13)) 0 1px,var(--b13,rgba(31,58,25,0)) 1px 3px,var(--b17,rgba(255,255,255,.4)) 3px 5px,var(--b13,rgba(31,58,25,0)) 5px 26px), linear-gradient(90deg,var(--b2,#dbebc7) 0,var(--b3,#eff7e6) 32%,var(--b4,#e3efd4) 64%,var(--b5,#cfe3ba) 100%), var(--b6,#e9f2e0)}
+.msg-content[data-side="user"]{border-radius:16px 16px 5px 16px; background:repeating-linear-gradient(0deg,var(--b13,rgba(31,58,25,0)) 0 44px,var(--b18,rgba(31,58,25,.24)) 44px 45px,var(--b19,rgba(255,255,255,.5)) 45px 47px,var(--b13,rgba(31,58,25,0)) 47px 92px), repeating-linear-gradient(90deg,var(--b20,rgba(31,58,25,.15)) 0 1px,var(--b13,rgba(31,58,25,0)) 1px 3px,var(--b21,rgba(255,255,255,.36)) 3px 5px,var(--b13,rgba(31,58,25,0)) 5px 26px), linear-gradient(90deg,var(--b7,#cbe2b6) 0,var(--b8,#e2eed2) 32%,var(--b9,#d5e7c1) 64%,var(--b10,#c1d9a9) 100%), var(--b11,#dbe9cf)}
+}
+
+/* 236 Hoa Mai */
+@keyframes b236-an236-petals{0% { background-position: 6px 4px, 0 0; } 100% { background-position: 70px 68px, 0 0; }}
+@keyframes b236-an236-petalsu{0% { background-position: 30px 22px, 0 0; } 100% { background-position: 94px 86px, 0 0; }}
+@scope ([data-bubble="236"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fbf2f2);--cai-tx:var(--bub-ai-tx,#4a2130)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#f4e4e6);--cai-tx:var(--bub-user-tx,#4a2130)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#4a2130); border:1px solid var(--b12,rgba(74,33,48,.16)); box-shadow:0 2px 6px rgba(74,33,48,.14), inset 0 1px 0 rgba(255,255,255,.8)}
+.msg-content[data-side="ai"]{border-radius:17px 17px 17px 5px; background:url(data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20width=%2764%27%20height=%2764%27%3E%3Cg%20fill=%27%23d98aa8%27%20opacity=%27.45%27%3E%3Ccircle%20cx=%2732%27%20cy=%2722%27%20r=%275%27/%3E%3Ccircle%20cx=%2741%27%20cy=%2729%27%20r=%275%27/%3E%3Ccircle%20cx=%2738%27%20cy=%2740%27%20r=%275%27/%3E%3Ccircle%20cx=%2726%27%20cy=%2740%27%20r=%275%27/%3E%3Ccircle%20cx=%2723%27%20cy=%2729%27%20r=%275%27/%3E%3C/g%3E%3Ccircle%20cx=%2732%27%20cy=%2732%27%20r=%272.4%27%20fill=%27%23b8546f%27%20opacity=%27.55%27/%3E%3C/svg%3E) 6px 4px/64px 64px, linear-gradient(158deg,var(--b2,#fdf8f8) 0,var(--b3,#f9eef0) 60%,var(--b4,#f3e3e6) 100%), var(--b5,#fbf2f2)}
+.msg-content[data-side="user"]{border-radius:17px 17px 5px 17px; background:url(data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20width=%2764%27%20height=%2764%27%3E%3Cg%20fill=%27%23c4718f%27%20opacity=%27.45%27%3E%3Ccircle%20cx=%2732%27%20cy=%2722%27%20r=%275%27/%3E%3Ccircle%20cx=%2741%27%20cy=%2729%27%20r=%275%27/%3E%3Ccircle%20cx=%2738%27%20cy=%2740%27%20r=%275%27/%3E%3Ccircle%20cx=%2726%27%20cy=%2740%27%20r=%275%27/%3E%3Ccircle%20cx=%2723%27%20cy=%2729%27%20r=%275%27/%3E%3C/g%3E%3C/svg%3E) 30px 22px/64px 64px, linear-gradient(158deg,var(--b6,#f8eaec) 0,var(--b7,#f2e0e3) 60%,var(--b8,#ecd6da) 100%), var(--b9,#f4e4e6)}
+.msg-content::before{content:""; position:absolute; left:-6px; bottom:3px; width:44%; height:2px; background:linear-gradient(90deg,var(--b10,#5a3a2e),var(--b11,#8a6252) 55%,var(--b13,rgba(138,98,82,0))); transform:rotate(-7deg); transform-origin:left bottom; opacity:.42; pointer-events:none}
+.msg-content[data-side="user"]::before{left:auto; right:-6px; transform:rotate(7deg); transform-origin:right bottom; background:linear-gradient(270deg,var(--b10,#5a3a2e),var(--b11,#8a6252) 55%,var(--b13,rgba(138,98,82,0)))}
+.msg-content[data-side="ai"]{animation: b236-an236-petals 39s linear infinite;}
+.msg-content[data-side="user"]{animation: b236-an236-petalsu 39s linear infinite;}
+}
+
+/* 237 Sakura Drift */
+@keyframes b237-b237fall{from { background-position:0 0,0 0 } to { background-position:-90px 90px,0 0 }}
+@scope ([data-bubble="237"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fdf0f3);--cai-tx:var(--bub-ai-tx,#5b2a3a)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#f8e2e8);--cai-tx:var(--bub-user-tx,#5b2a3a)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#5b2a3a); border:1px solid var(--b10,rgba(91,42,58,.14)); box-shadow:0 2px 7px rgba(91,42,58,.14), inset 0 1px 0 rgba(255,255,255,.85); animation:b237-b237fall 26s linear infinite}
+.msg-content[data-side="ai"]{border-radius:19px 19px 19px 6px; background:url(data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20width=%2790%27%20height=%2790%27%3E%3Cg%20fill=%27%23f0a2ba%27%20opacity=%27.5%27%3E%3Cpath%20d=%27M14%2012c5-4%2010-1%209%205c-1%205-6%206-10%203c-3-2-2-6%201-8z%27/%3E%3Cpath%20d=%27M60%2040c5-4%2010-1%209%205c-1%205-6%206-10%203c-3-2-2-6%201-8z%27/%3E%3Cpath%20d=%27M32%2068c4-3%208-1%207%204c-1%204-5%205-8%202c-2-1-1-5%201-6z%27/%3E%3C/g%3E%3C/svg%3E) 0 0/90px 90px, linear-gradient(160deg,var(--b2,#fffafb) 0,var(--b3,#fdf1f4) 55%,var(--b4,#f9e6eb) 100%), var(--b5,#fdf0f3)}
+.msg-content[data-side="user"]{border-radius:19px 19px 6px 19px; background:url(data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20width=%2790%27%20height=%2790%27%3E%3Cg%20fill=%27%23dd8ba4%27%20opacity=%27.5%27%3E%3Cpath%20d=%27M14%2012c5-4%2010-1%209%205c-1%205-6%206-10%203c-3-2-2-6%201-8z%27/%3E%3Cpath%20d=%27M60%2040c5-4%2010-1%209%205c-1%205-6%206-10%203c-3-2-2-6%201-8z%27/%3E%3Cpath%20d=%27M32%2068c4-3%208-1%207%204c-1%204-5%205-8%202c-2-1-1-5%201-6z%27/%3E%3C/g%3E%3C/svg%3E) 0 0/90px 90px, linear-gradient(160deg,var(--b6,#fbeef2) 0,var(--b7,#f7e3e9) 55%,var(--b8,#f2d8e0) 100%), var(--b9,#f8e2e8)}
+}
+
+/* 238 Lotus Sen */
+@keyframes b238-an238-bloom{0%, 100% { background-size: 100% 100%, 100% 100%, 100% 100%, 100% 100%, 100% 100%; } 50% { background-size: 106% 100%, 104% 100%, 104% 100%, 103% 100%, 100% 100%; }}
+@scope ([data-bubble="238"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fcf2f0);--cai-tx:var(--bub-ai-tx,#4a2c34)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#f5e6e6);--cai-tx:var(--bub-user-tx,#4a2c34)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#4a2c34); border:1px solid var(--b8,rgba(74,44,52,.14)); box-shadow:0 2px 6px rgba(74,44,52,.14), inset 0 1px 0 rgba(255,255,255,.85)}
+.msg-content[data-side="ai"]{border-radius:20px 20px 20px 6px; background:radial-gradient(38% 48% at 50% 114%,var(--b9,rgba(226,138,164,.34)) 0 62%,var(--b10,rgba(226,138,164,0)) 67%), radial-gradient(30% 40% at 24% 116%,var(--b11,rgba(226,138,164,.24)) 0 62%,var(--b10,rgba(226,138,164,0)) 67%), radial-gradient(30% 40% at 76% 116%,var(--b11,rgba(226,138,164,.24)) 0 62%,var(--b10,rgba(226,138,164,0)) 67%), radial-gradient(84% 58% at 50% 134%,var(--b12,rgba(110,150,88,.3)) 0 60%,var(--b13,rgba(110,150,88,0)) 65%), linear-gradient(180deg,var(--b2,#fffbfa),var(--b3,#fbf0ef)), var(--b4,#fcf2f0)}
+.msg-content[data-side="user"]{border-radius:20px 20px 6px 20px; background:radial-gradient(38% 48% at 50% 114%,var(--b14,rgba(204,116,142,.34)) 0 62%,var(--b15,rgba(204,116,142,0)) 67%), radial-gradient(30% 40% at 24% 116%,var(--b16,rgba(204,116,142,.24)) 0 62%,var(--b15,rgba(204,116,142,0)) 67%), radial-gradient(30% 40% at 76% 116%,var(--b16,rgba(204,116,142,.24)) 0 62%,var(--b15,rgba(204,116,142,0)) 67%), radial-gradient(84% 58% at 50% 134%,var(--b17,rgba(96,136,76,.3)) 0 60%,var(--b18,rgba(96,136,76,0)) 65%), linear-gradient(180deg,var(--b5,#faeeee),var(--b6,#f2e0e0)), var(--b7,#f5e6e6)}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{animation: b238-an238-bloom 23s ease-in-out infinite;}
+}
+
+/* 239 Koi Pond */
+@keyframes b239-b239ripple{0% { transform:scale(.2); opacity:0 } 22% { opacity:.7 } 100% { transform:scale(1.7); opacity:0 }}
+@scope ([data-bubble="239"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#12474a);--cai-tx:var(--bub-ai-tx,#e6f5f2)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#0e3a3e);--cai-tx:var(--bub-user-tx,#e6f5f2)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#e6f5f2); box-shadow:inset 0 1px 0 rgba(255,255,255,.18), inset 0 -16px 28px -16px rgba(0,0,0,.55), 0 3px 8px rgba(0,0,0,.3)}
+.msg-content[data-side="ai"]{border-radius:18px 18px 18px 5px; background:repeating-radial-gradient(circle at 76% 22%,var(--b8,rgba(230,245,242,0)) 0 9px,var(--b9,rgba(230,245,242,.12)) 9px 10px,var(--b8,rgba(230,245,242,0)) 10px 23px), radial-gradient(26% 13% at 30% 66%,var(--b10,rgba(240,124,52,.8)) 0 55%,var(--b11,rgba(240,124,52,0)) 100%), radial-gradient(15% 8% at 47% 80%,var(--b12,rgba(250,206,158,.45)) 0 55%,var(--b13,rgba(250,206,158,0)) 100%), linear-gradient(165deg,var(--b2,#186a6d) 0,var(--b3,#12474a) 55%,var(--b4,#0b2f32) 100%), var(--b3,#12474a)}
+.msg-content[data-side="user"]{border-radius:18px 18px 5px 18px; background:repeating-radial-gradient(circle at 24% 22%,var(--b8,rgba(230,245,242,0)) 0 9px,var(--b9,rgba(230,245,242,.12)) 9px 10px,var(--b8,rgba(230,245,242,0)) 10px 23px), radial-gradient(26% 13% at 70% 66%,var(--b14,rgba(230,106,44,.75)) 0 55%,var(--b15,rgba(230,106,44,0)) 100%), radial-gradient(15% 8% at 53% 80%,var(--b16,rgba(244,196,146,.4)) 0 55%,var(--b17,rgba(244,196,146,0)) 100%), linear-gradient(165deg,var(--b5,#135b5f) 0,var(--b6,#0e3a3e) 55%,var(--b7,#082629) 100%), var(--b6,#0e3a3e)}
+.msg-content::after{content:""; position:absolute; top:10%; right:12%; width:26px; height:26px; border-radius:50%; border:1.5px solid var(--b18,rgba(230,245,242,.45)); animation:b239-b239ripple 5.5s ease-out infinite; pointer-events:none}
+.msg-content[data-side="user"]::after{right:auto; left:12%}
+}
+
+/* 240 Jade Bi */
+@keyframes b240-b240sheen{0%,12% { background-position:0% 0,0 0,0 0 } 60%,100% { background-position:100% 0,0 0,0 0 }}
+@scope ([data-bubble="240"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#17453a);--cai-tx:var(--bub-ai-tx,#dff0e6)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#1f5a49);--cai-tx:var(--bub-user-tx,#dff0e6)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#dff0e6); border:1px solid var(--b8,rgba(223,240,230,.16)); box-shadow:inset 0 1px 0 rgba(255,255,255,.26), inset 0 -12px 24px -12px rgba(0,0,0,.55), 0 3px 8px rgba(0,0,0,.3); animation:b240-b240sheen 9s ease-in-out infinite}
+.msg-content[data-side="ai"]{border-radius:18px 18px 18px 5px; background:linear-gradient(108deg,var(--b9,rgba(226,255,240,0)) 40%,var(--b10,rgba(226,255,240,.3)) 50%,var(--b9,rgba(226,255,240,0)) 60%) 0 0/200% 100% no-repeat, radial-gradient(66% 54% at 24% 18%,var(--b11,rgba(186,238,210,.34)) 0,var(--b12,rgba(186,238,210,0)) 72%), linear-gradient(160deg,var(--b2,#1e5546) 0,var(--b3,#17453a) 56%,var(--b4,#0f3127) 100%), var(--b3,#17453a)}
+.msg-content[data-side="user"]{border-radius:18px 18px 5px 18px; background:linear-gradient(108deg,var(--b9,rgba(226,255,240,0)) 40%,var(--b13,rgba(226,255,240,.28)) 50%,var(--b9,rgba(226,255,240,0)) 60%) 0 0/200% 100% no-repeat, radial-gradient(66% 54% at 76% 18%,var(--b14,rgba(196,244,218,.32)) 0,var(--b15,rgba(196,244,218,0)) 72%), linear-gradient(160deg,var(--b5,#286b56) 0,var(--b6,#1f5a49) 56%,var(--b7,#164033) 100%), var(--b6,#1f5a49)}
+}
+
+/* 241 Maki-e */
+@keyframes b241-an241-dust{0% { background-position: 0 0, 0 0, 0 0, 0 0; } 100% { background-position: 34px 29px, -23px 41px, 47px -53px, 0 0; }}
+@keyframes b241-an241-dustu{0% { background-position: 0 0, 0 0, 0 0, 0 0; } 100% { background-position: -31px 27px, 25px 39px, -43px -51px, 0 0; }}
+@scope ([data-bubble="241"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#17110d);--cai-tx:var(--bub-ai-tx,#f0dcae)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#241a12);--cai-tx:var(--bub-user-tx,#f0dcae)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#f0dcae); box-shadow:inset 0 0 0 1px rgba(198,163,90,.38), inset 0 1px 0 rgba(255,231,176,.2), inset 0 -14px 26px -14px rgba(0,0,0,.75), 0 4px 10px rgba(0,0,0,.42)}
+.msg-content[data-side="ai"]{border-radius:14px 14px 14px 4px; background:radial-gradient(1.5px 1.5px at 12% 22%,var(--b8,rgba(238,201,122,.85)) 0 50%,var(--b9,rgba(238,201,122,0)) 62%) 0 0/34px 29px, radial-gradient(1.2px 1.2px at 62% 68%,var(--b10,rgba(238,201,122,.55)) 0 50%,var(--b9,rgba(238,201,122,0)) 62%) 0 0/23px 41px, radial-gradient(1px 1px at 34% 84%,var(--b11,rgba(255,229,168,.5)) 0 50%,var(--b12,rgba(255,229,168,0)) 62%) 0 0/47px 53px, radial-gradient(130% 96% at 26% 0,var(--b2,#2c211a) 0,var(--b3,#17110d) 58%,var(--b4,#0b0705) 100%), var(--b3,#17110d)}
+.msg-content[data-side="user"]{border-radius:14px 14px 4px 14px; background:radial-gradient(1.5px 1.5px at 30% 30%,var(--b8,rgba(238,201,122,.85)) 0 50%,var(--b9,rgba(238,201,122,0)) 62%) 0 0/31px 27px, radial-gradient(1.2px 1.2px at 74% 58%,var(--b10,rgba(238,201,122,.55)) 0 50%,var(--b9,rgba(238,201,122,0)) 62%) 0 0/25px 39px, radial-gradient(1px 1px at 18% 76%,var(--b11,rgba(255,229,168,.5)) 0 50%,var(--b12,rgba(255,229,168,0)) 62%) 0 0/43px 51px, radial-gradient(130% 96% at 74% 0,var(--b5,#3b2a1d) 0,var(--b6,#241a12) 58%,var(--b7,#150e09) 100%), var(--b6,#241a12)}
+.msg-content[data-side="ai"]{animation: b241-an241-dust 40s linear infinite;}
+.msg-content[data-side="user"]{animation: b241-an241-dustu 40s linear infinite;}
+}
+
+/* 242 Raden */
+@keyframes b242-b242shift{0%,100% { background-position:0% 0%,0 0,0 0 } 50% { background-position:100% 100%,0 0,0 0 }}
+@scope ([data-bubble="242"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#1c1b28);--cai-tx:var(--bub-ai-tx,#eef0fa)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#26243a);--cai-tx:var(--bub-user-tx,#eef0fa)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#eef0fa); box-shadow:inset 0 0 0 1px rgba(238,240,250,.14), inset 0 -14px 26px -14px rgba(0,0,0,.6), 0 4px 10px rgba(0,0,0,.38); animation:b242-b242shift 16s ease-in-out infinite}
+.msg-content[data-side="ai"]{border-radius:16px 16px 16px 5px; background:conic-gradient(from 200deg at 28% 32%,var(--b7,rgba(120,220,220,.3)),var(--b8,rgba(178,150,240,.28)),var(--b9,rgba(255,190,150,.24)),var(--b10,rgba(150,240,190,.28)),var(--b7,rgba(120,220,220,.3))) 0 0/170% 170% no-repeat, radial-gradient(66% 56% at 78% 84%,var(--b11,rgba(255,255,255,.14)) 0,var(--b12,rgba(255,255,255,0)) 72%), linear-gradient(150deg,var(--b2,#26243a) 0,var(--b3,#1c1b28) 60%,var(--b4,#111019) 100%), var(--b3,#1c1b28)}
+.msg-content[data-side="user"]{border-radius:16px 16px 5px 16px; background:conic-gradient(from 20deg at 72% 32%,var(--b10,rgba(150,240,190,.28)),var(--b9,rgba(255,190,150,.24)),var(--b8,rgba(178,150,240,.28)),var(--b7,rgba(120,220,220,.3)),var(--b10,rgba(150,240,190,.28))) 0 0/170% 170% no-repeat, radial-gradient(66% 56% at 22% 84%,var(--b11,rgba(255,255,255,.14)) 0,var(--b12,rgba(255,255,255,0)) 72%), linear-gradient(150deg,var(--b5,#332f4c) 0,var(--b2,#26243a) 60%,var(--b6,#191727) 100%), var(--b2,#26243a)}
+}
+
+/* 243 Nishiki */
+@scope ([data-bubble="243"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#5c1626);--cai-tx:var(--bub-ai-tx,#f6e3c0)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#47101f);--cai-tx:var(--bub-user-tx,#f6e3c0)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#f6e3c0); box-shadow:inset 0 0 0 1px rgba(214,176,104,.5), inset 0 0 0 4px rgba(52,10,20,.55), inset 0 0 0 5px rgba(214,176,104,.26), 0 3px 9px rgba(0,0,0,.35)}
+.msg-content[data-side="ai"]{border-radius:15px 15px 15px 4px; background:repeating-linear-gradient(45deg,var(--b7,rgba(214,176,104,.16)) 0 2px,var(--b8,rgba(214,176,104,0)) 2px 9px), repeating-linear-gradient(-45deg,var(--b9,rgba(214,176,104,.12)) 0 2px,var(--b8,rgba(214,176,104,0)) 2px 9px), radial-gradient(13px 13px at 50% 50%,var(--b10,rgba(214,176,104,.24)) 0 34%,var(--b8,rgba(214,176,104,0)) 38%) 0 0/54px 54px, linear-gradient(160deg,var(--b2,#701c2f) 0,var(--b3,#5c1626) 58%,var(--b4,#47101f) 100%), var(--b3,#5c1626)}
+.msg-content[data-side="user"]{border-radius:15px 15px 4px 15px; background:repeating-linear-gradient(-45deg,var(--b7,rgba(214,176,104,.16)) 0 2px,var(--b8,rgba(214,176,104,0)) 2px 9px), repeating-linear-gradient(45deg,var(--b9,rgba(214,176,104,.12)) 0 2px,var(--b8,rgba(214,176,104,0)) 2px 9px), radial-gradient(13px 13px at 50% 50%,var(--b11,rgba(214,176,104,.22)) 0 34%,var(--b8,rgba(214,176,104,0)) 38%) 27px 27px/54px 54px, linear-gradient(160deg,var(--b5,#5a1526) 0,var(--b4,#47101f) 58%,var(--b6,#340a17) 100%), var(--b4,#47101f)}
+}
+
+/* 244 Sashiko */
+@scope ([data-bubble="244"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f5f0e4);--cai-tx:var(--bub-ai-tx,#1f3b57)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#e9e2d1);--cai-tx:var(--bub-user-tx,#1f3b57)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#1f3b57); border:1px solid var(--b8,rgba(31,59,87,.18)); box-shadow:0 2px 6px rgba(31,59,87,.13), inset 0 1px 0 rgba(255,255,255,.7)}
+.msg-content[data-side="ai"]{border-radius:14px 14px 14px 4px; outline:2px dashed var(--b9,rgba(31,59,87,.4)); outline-offset:-7px; background:repeating-linear-gradient(90deg,var(--b10,rgba(31,59,87,.05)) 0 1px,var(--b11,rgba(31,59,87,0)) 1px 4px), repeating-linear-gradient(0deg,var(--b10,rgba(31,59,87,.05)) 0 1px,var(--b11,rgba(31,59,87,0)) 1px 4px), linear-gradient(160deg,var(--b2,#f9f5ec),var(--b3,#f0ebdb)), var(--b4,#f5f0e4)}
+.msg-content[data-side="user"]{border-radius:14px 14px 4px 14px; outline:2px dashed var(--b12,rgba(168,72,62,.42)); outline-offset:-7px; background:repeating-linear-gradient(90deg,var(--b13,rgba(31,59,87,.06)) 0 1px,var(--b11,rgba(31,59,87,0)) 1px 4px), repeating-linear-gradient(0deg,var(--b13,rgba(31,59,87,.06)) 0 1px,var(--b11,rgba(31,59,87,0)) 1px 4px), linear-gradient(160deg,var(--b5,#efe9d9),var(--b6,#e3dbc7)), var(--b7,#e9e2d1)}
+}
+
+/* 245 Washi */
+@scope ([data-bubble="245"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f8f4ea);--cai-tx:var(--bub-ai-tx,#3a3327)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#efe9db);--cai-tx:var(--bub-user-tx,#3a3327)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#3a3327); border:1px solid var(--b8,rgba(58,51,39,.16)); box-shadow:0 2px 5px rgba(58,51,39,.13), inset 0 0 22px rgba(160,140,100,.14)}
+.msg-content[data-side="ai"]{border-radius:16px 19px 15px 5px/19px 15px 18px 6px; background:repeating-linear-gradient(78deg,var(--b9,rgba(150,130,95,0)) 0 13px,var(--b10,rgba(150,130,95,.17)) 13px 14px,var(--b9,rgba(150,130,95,0)) 14px 47px), repeating-linear-gradient(-67deg,var(--b9,rgba(150,130,95,0)) 0 19px,var(--b11,rgba(150,130,95,.13)) 19px 20px,var(--b9,rgba(150,130,95,0)) 20px 61px), repeating-linear-gradient(12deg,var(--b9,rgba(150,130,95,0)) 0 29px,var(--b12,rgba(150,130,95,.1)) 29px 30px,var(--b9,rgba(150,130,95,0)) 30px 83px), linear-gradient(150deg,var(--b2,#fcf9f1),var(--b3,#f3eee1)), var(--b4,#f8f4ea)}
+.msg-content[data-side="user"]{border-radius:19px 16px 5px 15px/15px 19px 6px 18px; background:repeating-linear-gradient(-78deg,var(--b9,rgba(150,130,95,0)) 0 13px,var(--b13,rgba(150,130,95,.19)) 13px 14px,var(--b9,rgba(150,130,95,0)) 14px 47px), repeating-linear-gradient(67deg,var(--b9,rgba(150,130,95,0)) 0 19px,var(--b14,rgba(150,130,95,.14)) 19px 20px,var(--b9,rgba(150,130,95,0)) 20px 61px), repeating-linear-gradient(-12deg,var(--b9,rgba(150,130,95,0)) 0 29px,var(--b15,rgba(150,130,95,.11)) 29px 30px,var(--b9,rgba(150,130,95,0)) 30px 83px), linear-gradient(150deg,var(--b5,#f4efe3),var(--b6,#eae2d1)), var(--b7,#efe9db)}
+}
+
+/* 246 Origami */
+@scope ([data-bubble="246"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#eef2f7);--cai-tx:var(--bub-ai-tx,#22303f)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#e2e9f2);--cai-tx:var(--bub-user-tx,#22303f)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#22303f); box-shadow:0 3px 8px rgba(34,48,63,.18), inset 0 0 0 1px rgba(34,48,63,.08)}
+.msg-content[data-side="ai"]{border-radius:14px 14px 14px 3px; background:linear-gradient(118deg,var(--b2,#ffffff) 0,var(--b3,#eef2f7) 37%,var(--b4,#dfe6ef) 37.5%,var(--b5,#f3f6fa) 72%,var(--b6,#e5ebf3) 100%), var(--b3,#eef2f7)}
+.msg-content[data-side="user"]{border-radius:14px 14px 3px 14px; background:linear-gradient(-118deg,var(--b7,#f7fafd) 0,var(--b8,#e6ecf4) 37%,var(--b9,#d4dde9) 37.5%,var(--b10,#eaf0f7) 72%,var(--b11,#dbe3ee) 100%), var(--b12,#e2e9f2)}
+.msg-content::after{content:""; position:absolute; top:0; right:0; width:20px; height:20px; background:linear-gradient(225deg,var(--b13,#d5dee9) 0 50%,var(--b15,rgba(213,222,233,0)) 50%); box-shadow:-1px 1px 2px rgba(34,48,63,.2); pointer-events:none}
+.msg-content[data-side="user"]::after{right:auto; left:0; background:linear-gradient(135deg,var(--b14,#c8d4e3) 0 50%,var(--b16,rgba(200,212,227,0)) 50%); box-shadow:1px 1px 2px rgba(34,48,63,.2)}
+}
+
+/* 247 Tatami */
+@scope ([data-bubble="247"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#e8dcb8);--cai-tx:var(--bub-ai-tx,#2e3a1d)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ddd0a8);--cai-tx:var(--bub-user-tx,#2e3a1d)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#2e3a1d); box-shadow:inset 6px 0 0 rgba(35,74,53,.9), inset -6px 0 0 rgba(35,74,53,.9), inset 0 0 0 1px rgba(46,58,29,.18), 0 2px 6px rgba(46,58,29,.2)}
+.msg-content[data-side="ai"]{border-radius:8px 8px 8px 3px; background:repeating-linear-gradient(0deg,var(--b8,rgba(96,84,42,.15)) 0 1px,var(--b9,rgba(96,84,42,0)) 1px 3px), repeating-linear-gradient(90deg,var(--b10,rgba(96,84,42,.08)) 0 1px,var(--b9,rgba(96,84,42,0)) 1px 7px), linear-gradient(180deg,var(--b2,#f0e5c5),var(--b3,#e1d3a9)), var(--b4,#e8dcb8)}
+.msg-content[data-side="user"]{border-radius:8px 8px 3px 8px; background:repeating-linear-gradient(90deg,var(--b8,rgba(96,84,42,.15)) 0 1px,var(--b9,rgba(96,84,42,0)) 1px 3px), repeating-linear-gradient(0deg,var(--b10,rgba(96,84,42,.08)) 0 1px,var(--b9,rgba(96,84,42,0)) 1px 7px), linear-gradient(180deg,var(--b5,#e5d8b3),var(--b6,#d6c79c)), var(--b7,#ddd0a8)}
+}
+
+/* 248 Shoji */
+@scope ([data-bubble="248"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f8f3e6);--cai-tx:var(--bub-ai-tx,#4a3a24)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#f0e9d7);--cai-tx:var(--bub-user-tx,#4a3a24)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#4a3a24); box-shadow:inset 0 0 0 4px rgba(150,110,66,.85), inset 0 0 0 5px rgba(90,64,36,.4), 0 3px 8px rgba(74,58,36,.22)}
+.msg-content[data-side="ai"]{border-radius:10px 10px 10px 3px; background:repeating-linear-gradient(90deg,var(--b10,rgba(150,110,66,0)) 0 44px,var(--b11,rgba(150,110,66,.3)) 44px 46px), repeating-linear-gradient(0deg,var(--b10,rgba(150,110,66,0)) 0 30px,var(--b11,rgba(150,110,66,.3)) 30px 32px), radial-gradient(130% 110% at 50% 125%,var(--b2,#fffdf4) 0,var(--b3,#f9f4e8) 58%,var(--b4,#efe7d2) 100%), var(--b5,#f8f3e6)}
+.msg-content[data-side="user"]{border-radius:10px 10px 3px 10px; background:repeating-linear-gradient(90deg,var(--b10,rgba(150,110,66,0)) 0 36px,var(--b11,rgba(150,110,66,.3)) 36px 38px), repeating-linear-gradient(0deg,var(--b10,rgba(150,110,66,0)) 0 34px,var(--b11,rgba(150,110,66,.3)) 34px 36px), radial-gradient(130% 110% at 50% 125%,var(--b6,#faf6ea) 0,var(--b7,#f1ebda) 58%,var(--b8,#e6dcc3) 100%), var(--b9,#f0e9d7)}
+}
+
+/* 249 Den Long */
+@keyframes b249-b249glow{0%,100% { box-shadow:inset 0 7px 0 -3px rgba(196,150,70,.9), inset 0 -7px 0 -3px rgba(196,150,70,.9), inset 0 0 22px rgba(0,0,0,.3), 0 3px 12px rgba(120,20,26,.35) } 50% { box-shadow:inset 0 7px 0 -3px rgba(216,172,90,.95), inset 0 -7px 0 -3px rgba(216,172,90,.95), inset 0 0 26px rgba(255,190,120,.22), 0 4px 20px rgba(190,60,50,.5) }}
+@scope ([data-bubble="249"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#a01f26);--cai-tx:var(--bub-ai-tx,#ffe9c6)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#8a1720);--cai-tx:var(--bub-user-tx,#ffe9c6)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#ffe9c6); animation:b249-b249glow 6.5s ease-in-out infinite}
+.msg-content[data-side="ai"]{border-radius:22px 22px 22px 7px; background:repeating-linear-gradient(90deg,var(--b8,rgba(0,0,0,.16)) 0 1px,var(--b9,rgba(0,0,0,0)) 1px 3px,var(--b10,rgba(255,220,170,.1)) 3px 5px,var(--b9,rgba(0,0,0,0)) 5px 16px), radial-gradient(112% 82% at 50% 50%,var(--b2,#c4343c) 0,var(--b3,#a01f26) 58%,var(--b4,#7c1218) 100%), var(--b3,#a01f26)}
+.msg-content[data-side="user"]{border-radius:22px 22px 7px 22px; background:repeating-linear-gradient(90deg,var(--b11,rgba(0,0,0,.18)) 0 1px,var(--b9,rgba(0,0,0,0)) 1px 3px,var(--b12,rgba(255,220,170,.09)) 3px 5px,var(--b9,rgba(0,0,0,0)) 5px 16px), radial-gradient(112% 82% at 50% 50%,var(--b5,#ab2830) 0,var(--b6,#8a1720) 58%,var(--b7,#680b12) 100%), var(--b6,#8a1720)}
+}
+
+/* 250 Li Xi */
+@scope ([data-bubble="250"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#9c0f1c);--cai-tx:var(--bub-ai-tx,#f7dfa0)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#7d0c17);--cai-tx:var(--bub-user-tx,#f7dfa0)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#f7dfa0); box-shadow:inset 0 0 0 1px rgba(214,170,90,.5), inset 0 -12px 24px -12px rgba(0,0,0,.5), 0 3px 9px rgba(0,0,0,.32)}
+.msg-content[data-side="ai"]{border-radius:8px 8px 8px 3px; background:radial-gradient(126% 42% at 50% 0,var(--b11,rgba(240,206,124,.32)) 0 68%,var(--b12,rgba(240,206,124,0)) 73%), repeating-linear-gradient(45deg,var(--b13,rgba(240,206,124,.09)) 0 3px,var(--b12,rgba(240,206,124,0)) 3px 12px), linear-gradient(170deg,var(--b2,#b41827) 0,var(--b3,#9c0f1c) 56%,var(--b4,#7a0a14) 100%), var(--b3,#9c0f1c)}
+.msg-content[data-side="user"]{border-radius:8px 8px 3px 8px; background:radial-gradient(126% 42% at 50% 0,var(--b14,rgba(240,206,124,.28)) 0 68%,var(--b12,rgba(240,206,124,0)) 73%), repeating-linear-gradient(-45deg,var(--b13,rgba(240,206,124,.09)) 0 3px,var(--b12,rgba(240,206,124,0)) 3px 12px), linear-gradient(170deg,var(--b5,#93131f) 0,var(--b6,#7d0c17) 56%,var(--b7,#5e0710) 100%), var(--b6,#7d0c17)}
+.msg-content::after{content:""; position:absolute; top:4px; right:4px; width:12px; height:12px; border-radius:50%; background:radial-gradient(circle at 38% 32%,var(--b8,#f8dd93) 0,var(--b9,#cb9d3e) 68%,var(--b10,#a97d24) 100%); box-shadow:0 1px 3px rgba(0,0,0,.4), inset 0 0 0 1px rgba(255,240,200,.45); pointer-events:none}
+.msg-content[data-side="user"]::after{right:auto; left:4px}
+}
+
+/* 251 Yuanbao */
+@keyframes b251-b251shine{0%,10% { background-position:0% 0,0 0 } 62%,100% { background-position:100% 0,0 0 }}
+@scope ([data-bubble="251"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f0c862);--cai-tx:var(--bub-ai-tx,#3c2a06)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#e0b448);--cai-tx:var(--bub-user-tx,#3c2a06)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#3c2a06); box-shadow:inset 0 1px 0 rgba(255,248,214,.9), inset 0 -10px 18px -10px rgba(120,80,10,.5), 0 3px 8px rgba(120,84,20,.32); animation:b251-b251shine 7.5s ease-in-out infinite}
+.msg-content[data-side="ai"]{border-radius:22px 22px 13px 4px; background:linear-gradient(105deg,var(--b10,rgba(255,252,228,0)) 40%,var(--b11,rgba(255,252,228,.75)) 50%,var(--b10,rgba(255,252,228,0)) 60%) 0 0/200% 100% no-repeat, linear-gradient(180deg,var(--b2,#fae2a0) 0,var(--b3,#f0c862) 40%,var(--b4,#d8a83e) 72%,var(--b5,#f2cd75) 100%), var(--b3,#f0c862)}
+.msg-content[data-side="user"]{border-radius:22px 22px 4px 13px; background:linear-gradient(255deg,var(--b10,rgba(255,252,228,0)) 40%,var(--b12,rgba(255,252,228,.7)) 50%,var(--b10,rgba(255,252,228,0)) 60%) 0 0/200% 100% no-repeat, linear-gradient(180deg,var(--b6,#f0ca72) 0,var(--b7,#e0b448) 44%,var(--b8,#c4952c) 72%,var(--b9,#e6bd5c) 100%), var(--b7,#e0b448)}
+}
+
+/* 252 Cloud Scroll */
+@keyframes b252-b252drift{from { background-position:0 100%,0 0 } to { background-position:120px 100%,0 0 }}
+@scope ([data-bubble="252"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#1d3557);--cai-tx:var(--bub-ai-tx,#e9eff8)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#16283f);--cai-tx:var(--bub-user-tx,#e9eff8)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#e9eff8); box-shadow:inset 0 0 0 1px rgba(233,239,248,.14), inset 0 -14px 26px -14px rgba(0,0,0,.55), 0 3px 9px rgba(0,0,0,.34); animation:b252-b252drift 44s linear infinite}
+.msg-content[data-side="ai"]{border-radius:16px 16px 16px 5px; background:url(data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20width=%27120%27%20height=%2726%27%3E%3Cg%20fill=%27none%27%20stroke=%27%23c9d8ee%27%20stroke-width=%271.6%27%20opacity=%27.42%27%3E%3Cpath%20d=%27M0%2021q10%200%2012-6t12-4q8%202%2010%2010%27/%3E%3Cpath%20d=%27M60%2021q10%200%2012-6t12-4q8%202%2010%2010%27/%3E%3Ccircle%20cx=%2740%27%20cy=%2712%27%20r=%274%27/%3E%3Ccircle%20cx=%27100%27%20cy=%2712%27%20r=%274%27/%3E%3C/g%3E%3C/svg%3E) 0 100%/120px 26px repeat-x, linear-gradient(170deg,var(--b2,#2a4a75) 0,var(--b3,#1d3557) 58%,var(--b4,#132441) 100%), var(--b3,#1d3557)}
+.msg-content[data-side="user"]{border-radius:16px 16px 5px 16px; background:url(data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20width=%27120%27%20height=%2726%27%3E%3Cg%20fill=%27none%27%20stroke=%27%23b6c6df%27%20stroke-width=%271.6%27%20opacity=%27.4%27%3E%3Cpath%20d=%27M0%2021q10%200%2012-6t12-4q8%202%2010%2010%27/%3E%3Cpath%20d=%27M60%2021q10%200%2012-6t12-4q8%202%2010%2010%27/%3E%3Ccircle%20cx=%2740%27%20cy=%2712%27%20r=%274%27/%3E%3Ccircle%20cx=%27100%27%20cy=%2712%27%20r=%274%27/%3E%3C/g%3E%3C/svg%3E) 0 100%/120px 26px repeat-x, linear-gradient(170deg,var(--b5,#213b5e) 0,var(--b6,#16283f) 58%,var(--b7,#0d1a2c) 100%), var(--b6,#16283f)}
+}
+
+/* 253 Seigaiha */
+@keyframes b253-an253-tide{from { background-position: 0 0, 0 0, 0 0, 0 0; } to { background-position: 40px 0, 40px 0, 0 0, 0 0; }}
+@keyframes b253-an253-tideu{from { background-position: 0 0, 0 0, 0 0, 0 0; } to { background-position: 34px 0, 34px 0, 0 0, 0 0; }}
+@scope ([data-bubble="253"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#1c4f6b);--cai-tx:var(--bub-ai-tx,#e8f2f7)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#153e56);--cai-tx:var(--bub-user-tx,#e8f2f7)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#e8f2f7); box-shadow:inset 0 1px 0 rgba(255,255,255,.16), inset 0 -14px 26px -14px rgba(0,0,0,.5), 0 3px 8px rgba(0,0,0,.3)}
+.msg-content[data-side="ai"]{border-radius:16px 16px 16px 5px; background:repeating-radial-gradient(circle at 0 0,var(--b8,rgba(232,242,247,0)) 0 6px,var(--b9,rgba(232,242,247,.34)) 6px 7px,var(--b8,rgba(232,242,247,0)) 7px 13px,var(--b10,rgba(232,242,247,.26)) 13px 14px,var(--b8,rgba(232,242,247,0)) 14px 20px,var(--b11,rgba(232,242,247,.2)) 20px 21px,var(--b8,rgba(232,242,247,0)) 21px 27px) 0 0/40px 40px, repeating-radial-gradient(circle at 20px 20px,var(--b8,rgba(232,242,247,0)) 0 6px,var(--b9,rgba(232,242,247,.34)) 6px 7px,var(--b8,rgba(232,242,247,0)) 7px 13px,var(--b10,rgba(232,242,247,.26)) 13px 14px,var(--b8,rgba(232,242,247,0)) 14px 20px,var(--b11,rgba(232,242,247,.2)) 20px 21px,var(--b8,rgba(232,242,247,0)) 21px 27px) 0 0/40px 40px, linear-gradient(165deg,var(--b2,#26657f) 0,var(--b3,#1c4f6b) 56%,var(--b4,#143c53) 100%), var(--b3,#1c4f6b)}
+.msg-content[data-side="user"]{border-radius:16px 16px 5px 16px; background:repeating-radial-gradient(circle at 0 0,var(--b8,rgba(232,242,247,0)) 0 5px,var(--b12,rgba(232,242,247,.3)) 5px 6px,var(--b8,rgba(232,242,247,0)) 6px 11px,var(--b13,rgba(232,242,247,.22)) 11px 12px,var(--b8,rgba(232,242,247,0)) 12px 17px,var(--b14,rgba(232,242,247,.17)) 17px 18px,var(--b8,rgba(232,242,247,0)) 18px 23px) 0 0/34px 34px, repeating-radial-gradient(circle at 17px 17px,var(--b8,rgba(232,242,247,0)) 0 5px,var(--b12,rgba(232,242,247,.3)) 5px 6px,var(--b8,rgba(232,242,247,0)) 6px 11px,var(--b13,rgba(232,242,247,.22)) 11px 12px,var(--b8,rgba(232,242,247,0)) 12px 17px,var(--b14,rgba(232,242,247,.17)) 17px 18px,var(--b8,rgba(232,242,247,0)) 18px 23px) 0 0/34px 34px, linear-gradient(165deg,var(--b5,#1d5470) 0,var(--b6,#153e56) 56%,var(--b7,#0e2c3e) 100%), var(--b6,#153e56)}
+.msg-content[data-side="ai"]{animation: b253-an253-tide 30s linear infinite;}
+.msg-content[data-side="user"]{animation: b253-an253-tideu 30s linear infinite;}
+}
+
+/* 254 Asanoha */
+@scope ([data-bubble="254"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f2eee3);--cai-tx:var(--bub-ai-tx,#25355c)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#e7e1d1);--cai-tx:var(--bub-user-tx,#25355c)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#25355c); border:1px solid var(--b8,rgba(37,53,92,.18)); box-shadow:0 2px 6px rgba(37,53,92,.13), inset 0 1px 0 rgba(255,255,255,.7)}
+.msg-content[data-side="ai"]{border-radius:14px 14px 14px 4px; background:repeating-linear-gradient(60deg,var(--b9,rgba(37,53,92,0)) 0 17px,var(--b10,rgba(37,53,92,.17)) 17px 18px), repeating-linear-gradient(-60deg,var(--b9,rgba(37,53,92,0)) 0 17px,var(--b10,rgba(37,53,92,.17)) 17px 18px), repeating-linear-gradient(0deg,var(--b9,rgba(37,53,92,0)) 0 14.7px,var(--b11,rgba(37,53,92,.13)) 14.7px 15.7px), radial-gradient(1.7px 1.7px at 50% 50%,var(--b12,rgba(37,53,92,.34)) 0 50%,var(--b9,rgba(37,53,92,0)) 62%) 0 0/20px 17.4px, linear-gradient(160deg,var(--b2,#f8f4ea),var(--b3,#ece6d8)), var(--b4,#f2eee3)}
+.msg-content[data-side="user"]{border-radius:14px 14px 4px 14px; background:repeating-linear-gradient(60deg,var(--b9,rgba(37,53,92,0)) 0 13px,var(--b13,rgba(37,53,92,.19)) 13px 14px), repeating-linear-gradient(-60deg,var(--b9,rgba(37,53,92,0)) 0 13px,var(--b13,rgba(37,53,92,.19)) 13px 14px), repeating-linear-gradient(0deg,var(--b9,rgba(37,53,92,0)) 0 11.3px,var(--b14,rgba(37,53,92,.15)) 11.3px 12.3px), radial-gradient(1.5px 1.5px at 50% 50%,var(--b15,rgba(37,53,92,.36)) 0 50%,var(--b9,rgba(37,53,92,0)) 62%) 0 0/15px 13.1px, linear-gradient(160deg,var(--b5,#ede7d9),var(--b6,#e0d8c5)), var(--b7,#e7e1d1)}
+}
+
+/* 255 Shibori */
+@scope ([data-bubble="255"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#1b3159);--cai-tx:var(--bub-ai-tx,#e4ecf7)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#142645);--cai-tx:var(--bub-user-tx,#e4ecf7)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#e4ecf7); box-shadow:inset 0 0 0 1px rgba(228,236,247,.14), inset 0 -14px 26px -14px rgba(0,0,0,.5), 0 3px 8px rgba(0,0,0,.3)}
+.msg-content[data-side="ai"]{border-radius:16px 16px 16px 5px; background:repeating-radial-gradient(circle at 22% 32%,var(--b8,rgba(228,236,247,0)) 0 5px,var(--b9,rgba(228,236,247,.28)) 5px 7px,var(--b8,rgba(228,236,247,0)) 7px 13px,var(--b10,rgba(228,236,247,.16)) 13px 15px,var(--b8,rgba(228,236,247,0)) 15px 25px), repeating-radial-gradient(circle at 80% 74%,var(--b8,rgba(228,236,247,0)) 0 4px,var(--b11,rgba(228,236,247,.22)) 4px 6px,var(--b8,rgba(228,236,247,0)) 6px 12px,var(--b12,rgba(228,236,247,.13)) 12px 14px,var(--b8,rgba(228,236,247,0)) 14px 23px), radial-gradient(96% 84% at 50% 18%,var(--b2,#2b4a7c) 0,var(--b3,#1b3159) 60%,var(--b4,#122443) 100%), var(--b3,#1b3159)}
+.msg-content[data-side="user"]{border-radius:16px 16px 5px 16px; background:repeating-radial-gradient(circle at 78% 30%,var(--b8,rgba(228,236,247,0)) 0 5px,var(--b13,rgba(228,236,247,.26)) 5px 7px,var(--b8,rgba(228,236,247,0)) 7px 13px,var(--b14,rgba(228,236,247,.15)) 13px 15px,var(--b8,rgba(228,236,247,0)) 15px 25px), repeating-radial-gradient(circle at 20% 76%,var(--b8,rgba(228,236,247,0)) 0 4px,var(--b15,rgba(228,236,247,.2)) 4px 6px,var(--b8,rgba(228,236,247,0)) 6px 12px,var(--b16,rgba(228,236,247,.12)) 12px 14px,var(--b8,rgba(228,236,247,0)) 14px 23px), radial-gradient(96% 84% at 50% 18%,var(--b5,#20396a) 0,var(--b6,#142645) 60%,var(--b7,#0c1a33) 100%), var(--b6,#142645)}
+}
+
+/* 256 Matcha */
+@keyframes b256-an256-froth{from { background-position: 0 0, 0 0, 0 0, 0 0, 0 0, 0 0; } to { background-position: 34px -30px, 46px -42px, 0 0, 0 0, 0 0, 0 0; }}
+@keyframes b256-an256-frothu{from { background-position: 0 0, 0 0, 0 0, 0 0, 0 0, 0 0; } to { background-position: 38px -34px, 50px -46px, 0 0, 0 0, 0 0, 0 0; }}
+@scope ([data-bubble="256"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#4e6a27);--cai-tx:var(--bub-ai-tx,#f7f8ec)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#3e5a1d);--cai-tx:var(--bub-user-tx,#f7f8ec)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#f7f8ec); box-shadow:inset 0 1px 0 rgba(255,255,255,.2), inset 0 -12px 22px -12px rgba(0,0,0,.45), 0 3px 8px rgba(0,0,0,.24)}
+.msg-content[data-side="ai"]{border-radius:20px 20px 18px 6px; background:radial-gradient(2.2px 2.2px at 18% 22%,var(--b8,rgba(235,242,198,.5)) 0 50%,var(--b9,rgba(235,242,198,0)) 62%) 0 0/17px 15px, radial-gradient(1.6px 1.6px at 66% 60%,var(--b10,rgba(235,242,198,.36)) 0 50%,var(--b9,rgba(235,242,198,0)) 62%) 0 0/23px 21px, repeating-linear-gradient(88deg,var(--b11,rgba(255,255,255,.05)) 0 1px,var(--b12,rgba(255,255,255,0)) 1px 6px), radial-gradient(130% 72% at 50% -12%,var(--b13,rgba(190,214,120,.45)) 0,var(--b14,rgba(190,214,120,0)) 64%), linear-gradient(180deg,var(--b2,#5d7d2f) 0,var(--b3,#4e6a27) 60%,var(--b4,#3f5a1e) 100%), var(--b3,#4e6a27)}
+.msg-content[data-side="user"]{border-radius:20px 20px 6px 18px; background:radial-gradient(2.2px 2.2px at 70% 26%,var(--b15,rgba(235,242,198,.46)) 0 50%,var(--b9,rgba(235,242,198,0)) 62%) 0 0/19px 17px, radial-gradient(1.6px 1.6px at 30% 64%,var(--b16,rgba(235,242,198,.32)) 0 50%,var(--b9,rgba(235,242,198,0)) 62%) 0 0/25px 23px, repeating-linear-gradient(-88deg,var(--b11,rgba(255,255,255,.05)) 0 1px,var(--b12,rgba(255,255,255,0)) 1px 6px), radial-gradient(130% 72% at 50% -12%,var(--b17,rgba(176,202,106,.4)) 0,var(--b18,rgba(176,202,106,0)) 64%), linear-gradient(180deg,var(--b5,#4c6c26) 0,var(--b6,#3e5a1d) 60%,var(--b7,#314916) 100%), var(--b6,#3e5a1d)}
+.msg-content[data-side="ai"]{animation: b256-an256-froth 30s linear infinite;}
+.msg-content[data-side="user"]{animation: b256-an256-frothu 30s linear infinite;}
+}
+
+/* 257 Mooncake */
+@scope ([data-bubble="257"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#8f5a24);--cai-tx:var(--bub-ai-tx,#fdf1dc)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#7a4a1b);--cai-tx:var(--bub-user-tx,#fdf1dc)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#fdf1dc); box-shadow:inset 0 0 0 2px rgba(255,236,200,.16), inset 0 -12px 24px -12px rgba(0,0,0,.5), 0 3px 8px rgba(0,0,0,.3)}
+.msg-content[data-side="ai"]{border-radius:12px 12px 12px 4px; background:repeating-linear-gradient(90deg,var(--b8,rgba(255,236,200,.14)) 0 2px,var(--b9,rgba(0,0,0,0)) 2px 22px), repeating-linear-gradient(90deg,var(--b9,rgba(0,0,0,0)) 0 20px,var(--b10,rgba(60,30,8,.16)) 20px 22px), repeating-linear-gradient(0deg,var(--b8,rgba(255,236,200,.14)) 0 2px,var(--b9,rgba(0,0,0,0)) 2px 22px), repeating-linear-gradient(0deg,var(--b9,rgba(0,0,0,0)) 0 20px,var(--b10,rgba(60,30,8,.16)) 20px 22px), radial-gradient(130% 96% at 30% 0,var(--b2,#ab6d2e) 0,var(--b3,#8f5a24) 58%,var(--b4,#74471a) 100%), var(--b3,#8f5a24)}
+.msg-content[data-side="user"]{border-radius:12px 12px 4px 12px; background:repeating-linear-gradient(90deg,var(--b11,rgba(255,236,200,.13)) 0 2px,var(--b9,rgba(0,0,0,0)) 2px 18px), repeating-linear-gradient(90deg,var(--b9,rgba(0,0,0,0)) 0 16px,var(--b10,rgba(60,30,8,.16)) 16px 18px), repeating-linear-gradient(0deg,var(--b11,rgba(255,236,200,.13)) 0 2px,var(--b9,rgba(0,0,0,0)) 2px 18px), repeating-linear-gradient(0deg,var(--b9,rgba(0,0,0,0)) 0 16px,var(--b10,rgba(60,30,8,.16)) 16px 18px), radial-gradient(130% 96% at 70% 0,var(--b5,#935a22) 0,var(--b6,#7a4a1b) 58%,var(--b7,#603812) 100%), var(--b6,#7a4a1b)}
+}
+
+/* 258 Boba Pearl */
+@keyframes b258-an258-settle{0%, 100% { background-size: 100% 100%, 100% 100%, 100% 100%, 100% 100%, 100% 100%, 100% 100%; } 50% { background-size: 100.6% 100%, 101% 100%, 101.4% 100%, 100.8% 100%, 101.2% 100%, 100% 100%; }}
+@scope ([data-bubble="258"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#d9ba95);--cai-tx:var(--bub-ai-tx,#38230f)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#c9a67d);--cai-tx:var(--bub-user-tx,#38230f)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#38230f); box-shadow:inset 0 1px 0 rgba(255,255,255,.55), inset 0 -16px 24px -16px rgba(80,48,20,.45), 0 2px 6px rgba(80,48,20,.24)}
+.msg-content[data-side="ai"]{border-radius:18px 18px 16px 5px; background:radial-gradient(6px 6px at 11% 97%,var(--b2,#3b2415) 0 46%,var(--b13,rgba(59,36,21,0)) 54%), radial-gradient(6px 6px at 29% 101%,var(--b3,#43291a) 0 46%,var(--b14,rgba(67,41,26,0)) 54%), radial-gradient(6px 6px at 47% 96%,var(--b4,#33200f) 0 46%,var(--b15,rgba(51,32,15,0)) 54%), radial-gradient(6px 6px at 67% 101%,var(--b5,#40271a) 0 46%,var(--b16,rgba(64,39,26,0)) 54%), radial-gradient(6px 6px at 86% 97%,var(--b6,#3a2415) 0 46%,var(--b17,rgba(58,36,21,0)) 54%), linear-gradient(180deg,var(--b7,#e8d2b4) 0,var(--b8,#d9ba95) 56%,var(--b9,#cbab84) 100%), var(--b8,#d9ba95)}
+.msg-content[data-side="user"]{border-radius:18px 18px 5px 16px; background:radial-gradient(6px 6px at 16% 101%,var(--b2,#3b2415) 0 46%,var(--b13,rgba(59,36,21,0)) 54%), radial-gradient(6px 6px at 36% 96%,var(--b3,#43291a) 0 46%,var(--b14,rgba(67,41,26,0)) 54%), radial-gradient(6px 6px at 56% 101%,var(--b4,#33200f) 0 46%,var(--b15,rgba(51,32,15,0)) 54%), radial-gradient(6px 6px at 74% 96%,var(--b5,#40271a) 0 46%,var(--b16,rgba(64,39,26,0)) 54%), radial-gradient(6px 6px at 91% 101%,var(--b6,#3a2415) 0 46%,var(--b17,rgba(58,36,21,0)) 54%), linear-gradient(180deg,var(--b10,#dcc09b) 0,var(--b11,#c9a67d) 56%,var(--b12,#b8926a) 100%), var(--b11,#c9a67d)}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{animation: b258-an258-settle 26s ease-in-out infinite;}
+}
+
+/* 259 Ao Dai */
+@keyframes b259-an259-sheen{from { background-position: 0 0, 0 0, 0 0, 0 0; } to { background-position: 40.8935px 0, 0 0, 0 0, 0 0; }}
+@keyframes b259-an259-sheenu{from { background-position: 0 0, 0 0, 0 0, 0 0; } to { background-position: -40.8935px 0, 0 0, 0 0, 0 0; }}
+@scope ([data-bubble="259"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f3e2ea);--cai-tx:var(--bub-ai-tx,#4c2138)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ead2de);--cai-tx:var(--bub-user-tx,#4c2138)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#4c2138); box-shadow:inset 0 1px 0 rgba(255,255,255,.8), 0 2px 8px rgba(76,33,56,.18)}
+.msg-content[data-side="ai"]{border-radius:21px 21px 21px 6px; background:repeating-linear-gradient(102deg,var(--b10,rgba(255,255,255,0)) 0 14px,var(--b11,rgba(255,255,255,.5)) 14px 22px,var(--b10,rgba(255,255,255,0)) 22px 40px), repeating-linear-gradient(102deg,var(--b12,rgba(120,50,86,.07)) 0 3px,var(--b13,rgba(120,50,86,0)) 3px 9px), linear-gradient(160deg,var(--b2,#f9edf3) 0,var(--b3,#f1dfe9) 56%,var(--b4,#e7cedc) 100%), var(--b5,#f3e2ea)}
+.msg-content[data-side="user"]{border-radius:21px 21px 6px 21px; background:repeating-linear-gradient(-102deg,var(--b10,rgba(255,255,255,0)) 0 14px,var(--b14,rgba(255,255,255,.45)) 14px 22px,var(--b10,rgba(255,255,255,0)) 22px 40px), repeating-linear-gradient(-102deg,var(--b15,rgba(120,50,86,.08)) 0 3px,var(--b13,rgba(120,50,86,0)) 3px 9px), linear-gradient(160deg,var(--b6,#f0dbe6) 0,var(--b7,#e8cfdc) 56%,var(--b8,#dcbecf) 100%), var(--b9,#ead2de)}
+.msg-content::before{content:""; position:absolute; left:6px; top:0; bottom:0; width:1px; background:linear-gradient(180deg,var(--b16,rgba(178,120,150,0)),var(--b17,rgba(178,120,150,.6)) 30%,var(--b17,rgba(178,120,150,.6)) 70%,var(--b16,rgba(178,120,150,0))); pointer-events:none}
+.msg-content[data-side="user"]::before{left:auto; right:6px}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{background-size: 40.8935px 192.3892px, auto, auto, auto;}
+.msg-content[data-side="ai"]{animation: b259-an259-sheen 24s linear infinite;}
+.msg-content[data-side="user"]{animation: b259-an259-sheenu 24s linear infinite;}
+}
+
+/* 260 Dong Ho */
+@scope ([data-bubble="260"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f4ead2);--cai-tx:var(--bub-ai-tx,#2f2a20)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ebdfc0);--cai-tx:var(--bub-user-tx,#2f2a20)}
+.msg-content{position:relative; overflow:hidden; color:var(--b1,#2f2a20); border:1px solid var(--b12,rgba(47,42,32,.42)); box-shadow:0 2px 6px rgba(47,42,32,.18), inset 0 0 0 2px rgba(255,255,255,.45)}
+.msg-content[data-side="ai"]{border-radius:6px 6px 6px 2px; background:radial-gradient(1.6px 1.6px at 20% 30%,var(--b13,rgba(255,255,255,.8)) 0 50%,var(--b14,rgba(255,255,255,0)) 62%) 0 0/9px 11px, radial-gradient(1.4px 1.4px at 70% 70%,var(--b15,rgba(214,190,140,.55)) 0 50%,var(--b16,rgba(214,190,140,0)) 62%) 0 0/13px 15px, linear-gradient(160deg,var(--b2,#faf1da),var(--b3,#efe4c6)), var(--b4,#f4ead2)}
+.msg-content[data-side="user"]{border-radius:6px 6px 2px 6px; background:radial-gradient(1.6px 1.6px at 62% 26%,var(--b17,rgba(255,255,255,.75)) 0 50%,var(--b14,rgba(255,255,255,0)) 62%) 0 0/11px 9px, radial-gradient(1.4px 1.4px at 26% 74%,var(--b18,rgba(196,170,116,.55)) 0 50%,var(--b19,rgba(196,170,116,0)) 62%) 0 0/15px 13px, linear-gradient(160deg,var(--b5,#f2e7c9),var(--b6,#e5d7b3)), var(--b7,#ebdfc0)}
+.msg-content::after{content:""; position:absolute; left:0; right:0; bottom:0; height:4px; background:repeating-linear-gradient(90deg,var(--b8,#b8392b) 0 16px,var(--b9,#22301f) 16px 32px,var(--b10,#2d7a4d) 32px 48px,var(--b11,#cf9f22) 48px 64px); opacity:.85; pointer-events:none}
+.msg-content[data-side="user"]::after{bottom:auto; top:0}
+}
+
+/* 261 Strawberry Milk */
+@keyframes b261-an261-drip{0% { background-position: 0 0, 0 0, 0 0; } 100% { background-position: 16px 0, 0 0, 0 0; }}
+@keyframes b261-an261-dripu{0% { background-position: 5px 0, 0 0, 0 0; } 100% { background-position: 19px 0, 0 0, 0 0; }}
+@scope ([data-bubble="261"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffe2ee);--cai-tx:var(--bub-ai-tx,#6b243f)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffcfe1);--cai-tx:var(--bub-user-tx,#5e1c35)}
+.msg-content{position:relative;overflow:hidden;border:1px solid var(--b8,rgba(255,255,255,0.85));box-shadow:0 1px 2px rgba(198,116,152,0.2),0 7px 16px rgba(198,116,152,0.24),inset 0 1px 0 rgba(255,255,255,0.95),inset 0 -9px 14px rgba(255,176,205,0.32)}
+.msg-content[data-side="ai"]{color:var(--b1,#6b243f);background-image:radial-gradient(circle at 8px 13px,var(--b2,#fff7fa) 0 8px,var(--b9,rgba(0,0,0,0)) 8.5px),linear-gradient(180deg,var(--b2,#fff7fa) 0 13px,var(--b9,rgba(0,0,0,0)) 13px),linear-gradient(180deg,var(--b3,#ffe2ee) 0%,var(--b4,#ffc6db) 100%);background-size:16px 30px,100% 100%,100% 100%;background-position:0 0,0 0,0 0;background-repeat:repeat-x,no-repeat,no-repeat;border-radius:20px 20px 20px 7px}
+.msg-content[data-side="user"]{color:var(--b5,#5e1c35);background-image:radial-gradient(circle at 7px 11px,var(--b2,#fff7fa) 0 7px,var(--b9,rgba(0,0,0,0)) 7.5px),linear-gradient(180deg,var(--b2,#fff7fa) 0 11px,var(--b9,rgba(0,0,0,0)) 11px),linear-gradient(180deg,var(--b6,#ffcfe1) 0%,var(--b7,#ffb3d0) 100%);background-size:14px 27px,100% 100%,100% 100%;background-position:5px 0,0 0,0 0;background-repeat:repeat-x,no-repeat,no-repeat;border-radius:20px 20px 7px 20px}
+.msg-content[data-side="ai"]{animation: b261-an261-drip 26s linear infinite;}
+.msg-content[data-side="user"]{animation: b261-an261-dripu 26s linear infinite;}
+}
+
+/* 262 Peach Soda */
+@keyframes b262-c262fizz{0%{opacity:0;transform:translateY(3px)}22%{opacity:0.95}66%{opacity:0.5}100%{opacity:0;transform:translateY(-9px)}}
+@scope ([data-bubble="262"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffe2cd);--cai-tx:var(--bub-ai-tx,#6b3013)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffcba6);--cai-tx:var(--bub-user-tx,#5e2a10)}
+.msg-content{position:relative;overflow:hidden;border:1px solid var(--b8,rgba(255,255,255,0.85));box-shadow:0 1px 2px rgba(214,132,80,0.18),0 7px 16px rgba(214,132,80,0.26),inset 0 1px 0 rgba(255,255,255,0.92),inset 0 -8px 14px rgba(224,140,86,0.22)}
+.msg-content[data-side="ai"]{color:var(--b1,#6b3013);background-image:linear-gradient(100deg,var(--b9,rgba(0,0,0,0)) 0 15%,var(--b10,rgba(255,255,255,0.55)) 20%,var(--b11,rgba(255,255,255,0.1)) 25%,var(--b9,rgba(0,0,0,0)) 30%,var(--b9,rgba(0,0,0,0)) 71%,var(--b10,rgba(255,255,255,0.55)) 76%,var(--b9,rgba(0,0,0,0)) 81%),linear-gradient(180deg,var(--b2,#fff6ee) 0%,var(--b3,#ffe2cd) 58%,var(--b4,#ffcba6) 100%);border-radius:19px 19px 19px 6px}
+.msg-content[data-side="user"]{color:var(--b5,#5e2a10);background-image:linear-gradient(-100deg,var(--b9,rgba(0,0,0,0)) 0 15%,var(--b10,rgba(255,255,255,0.55)) 20%,var(--b11,rgba(255,255,255,0.1)) 25%,var(--b9,rgba(0,0,0,0)) 30%,var(--b9,rgba(0,0,0,0)) 71%,var(--b10,rgba(255,255,255,0.55)) 76%,var(--b9,rgba(0,0,0,0)) 81%),linear-gradient(180deg,var(--b6,#ffeadb) 0%,var(--b4,#ffcba6) 58%,var(--b7,#f7b183) 100%);border-radius:19px 19px 6px 19px}
+.msg-content[data-side="ai"]::after{content:"";position:absolute;left:11px;bottom:4px;width:26px;height:15px;pointer-events:none;background-image:radial-gradient(circle at 4px 11px,var(--b8,rgba(255,255,255,0.85)) 0 2px,var(--b9,rgba(0,0,0,0)) 2.6px),radial-gradient(circle at 13px 8px,var(--b8,rgba(255,255,255,0.85)) 0 1.5px,var(--b9,rgba(0,0,0,0)) 2px),radial-gradient(circle at 21px 12px,var(--b8,rgba(255,255,255,0.85)) 0 1.2px,var(--b9,rgba(0,0,0,0)) 1.7px);animation:b262-c262fizz 4.6s ease-in-out infinite}
+.msg-content[data-side="user"]::after{content:"";position:absolute;right:11px;bottom:4px;width:26px;height:15px;pointer-events:none;background-image:radial-gradient(circle at 22px 11px,var(--b8,rgba(255,255,255,0.85)) 0 2px,var(--b9,rgba(0,0,0,0)) 2.6px),radial-gradient(circle at 13px 8px,var(--b8,rgba(255,255,255,0.85)) 0 1.5px,var(--b9,rgba(0,0,0,0)) 2px),radial-gradient(circle at 5px 12px,var(--b8,rgba(255,255,255,0.85)) 0 1.2px,var(--b9,rgba(0,0,0,0)) 1.7px);animation:b262-c262fizz 5.8s ease-in-out infinite}
+}
+
+/* 263 Macaron */
+@keyframes b263-an263-foot{0% { background-position: 0 0, 0 calc(100% - 9px), 0 100%, 0 0; } 100% { background-position: 0 0, 9px calc(100% - 9px), 0 100%, 0 0; }}
+@keyframes b263-an263-footu{0% { background-position: 0 0, 0 calc(100% - 8px), 0 100%, 0 0; } 100% { background-position: 0 0, 8px calc(100% - 8px), 0 100%, 0 0; }}
+@scope ([data-bubble="263"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffd8e8);--cai-tx:var(--bub-ai-tx,#5e2340)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ddd2fb);--cai-tx:var(--bub-user-tx,#33265e)}
+.msg-content{position:relative;overflow:hidden;border:1px solid var(--b11,rgba(255,255,255,0.7));box-shadow:0 1px 2px rgba(160,120,150,0.18),0 6px 14px rgba(160,120,150,0.24),inset 0 3px 6px rgba(255,255,255,0.85),inset 0 -3px 5px rgba(170,130,160,0.22)}
+.msg-content[data-side="ai"]{color:var(--b1,#5e2340);background-image:radial-gradient(130% 62% at 50% -16%,var(--b12,rgba(255,255,255,0.8)) 0%,var(--b13,rgba(0,0,0,0)) 64%),radial-gradient(circle at 4.5px 2px,var(--b2,#f6bcd6) 0 4px,var(--b13,rgba(0,0,0,0)) 4.5px),linear-gradient(180deg,var(--b3,#fff2d2) 0%,var(--b4,#ffe4ae) 100%),linear-gradient(180deg,var(--b5,#ffeef5) 0%,var(--b6,#ffd8e8) 62%,var(--b2,#f6bcd6) 100%);background-size:100% 100%,9px 9px,100% 6px,100% 100%;background-position:0 0,0 calc(100% - 9px),0 100%,0 0;background-repeat:no-repeat,repeat-x,no-repeat,no-repeat;border-radius:22px 22px 22px 8px}
+.msg-content[data-side="user"]{color:var(--b7,#33265e);background-image:radial-gradient(130% 62% at 50% -16%,var(--b12,rgba(255,255,255,0.8)) 0%,var(--b13,rgba(0,0,0,0)) 64%),radial-gradient(circle at 4px 2px,var(--b8,#c3b3f2) 0 3.6px,var(--b13,rgba(0,0,0,0)) 4.1px),linear-gradient(180deg,var(--b3,#fff2d2) 0%,var(--b4,#ffe4ae) 100%),linear-gradient(180deg,var(--b9,#f2edff) 0%,var(--b10,#ddd2fb) 62%,var(--b8,#c3b3f2) 100%);background-size:100% 100%,8px 8px,100% 6px,100% 100%;background-position:0 0,0 calc(100% - 8px),0 100%,0 0;background-repeat:no-repeat,repeat-x,no-repeat,no-repeat;border-radius:22px 22px 8px 22px}
+.msg-content[data-side="ai"]{animation: b263-an263-foot 27s linear infinite;}
+.msg-content[data-side="user"]{animation: b263-an263-footu 27s linear infinite;}
+}
+
+/* 264 Mochi */
+@keyframes b264-c264mocha{0%,100%{border-radius:26px 26px 26px 9px}50%{border-radius:30px 22px 29px 9px}}
+@keyframes b264-c264mochb{0%,100%{border-radius:26px 26px 9px 26px}50%{border-radius:22px 30px 9px 29px}}
+@scope ([data-bubble="264"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f3e6fb);--cai-tx:var(--bub-ai-tx,#45285a)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#dcf2e6);--cai-tx:var(--bub-user-tx,#14402e)}
+.msg-content{position:relative;overflow:hidden;border:1px solid var(--b9,rgba(255,255,255,0.8));box-shadow:0 1px 2px rgba(150,125,165,0.14),0 8px 16px rgba(150,125,165,0.2),inset 0 7px 12px rgba(255,255,255,0.95),inset 0 -8px 14px rgba(150,120,170,0.2)}
+.msg-content[data-side="ai"]{color:var(--b1,#45285a);background-image:radial-gradient(88% 58% at 34% 2%,var(--b10,rgba(255,255,255,0.75)) 0%,var(--b11,rgba(0,0,0,0)) 62%),radial-gradient(130% 95% at 30% 4%,var(--b2,#fdf6ff) 0%,var(--b3,#f3e6fb) 52%,var(--b4,#e2cdf2) 100%);border-radius:26px 26px 26px 9px;animation:b264-c264mocha 7.2s ease-in-out infinite}
+.msg-content[data-side="user"]{color:var(--b5,#14402e);background-image:radial-gradient(88% 58% at 66% 2%,var(--b10,rgba(255,255,255,0.75)) 0%,var(--b11,rgba(0,0,0,0)) 62%),radial-gradient(130% 95% at 70% 4%,var(--b6,#f4fdf8) 0%,var(--b7,#dcf2e6) 52%,var(--b8,#bfe4d2) 100%);border-radius:26px 26px 9px 26px;animation:b264-c264mochb 7.2s ease-in-out infinite}
+}
+
+/* 265 Cotton Candy */
+@scope ([data-bubble="265"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fbdcf3);--cai-tx:var(--bub-ai-tx,#4d2350)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#dfe9ff);--cai-tx:var(--bub-user-tx,#24356b)}
+.msg-content{position:relative;overflow:hidden;border:1px solid var(--b8,rgba(255,255,255,0.9));box-shadow:0 0 5px 2px rgba(255,205,235,0.42),0 0 13px 5px rgba(214,226,255,0.32),0 8px 18px rgba(178,146,206,0.26),inset 0 1px 0 rgba(255,255,255,0.95),inset 0 -8px 14px rgba(190,150,215,0.22)}
+.msg-content[data-side="ai"]{color:var(--b1,#4d2350);background-image:repeating-linear-gradient(64deg,var(--b9,rgba(255,255,255,0.26)) 0 1.5px,var(--b10,rgba(0,0,0,0)) 1.5px 5px),linear-gradient(138deg,var(--b2,#fff2fb) 0%,var(--b3,#fbdcf3) 46%,var(--b4,#ecdcff) 100%);border-radius:24px 24px 24px 8px}
+.msg-content[data-side="user"]{color:var(--b5,#24356b);background-image:repeating-linear-gradient(-64deg,var(--b9,rgba(255,255,255,0.26)) 0 1.5px,var(--b10,rgba(0,0,0,0)) 1.5px 5px),linear-gradient(138deg,var(--b6,#f4f8ff) 0%,var(--b7,#dfe9ff) 46%,var(--b4,#ecdcff) 100%);border-radius:24px 24px 8px 24px}
+}
+
+/* 266 Boba Pearls */
+@keyframes b266-an266-roll{0% { background-position: 4px bottom, 4px bottom; } 100% { background-position: 22px bottom, 22px bottom; }}
+@scope ([data-bubble="266"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f7e9d6);--cai-tx:var(--bub-ai-tx,#4a2f1c)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#f0dcc0);--cai-tx:var(--bub-user-tx,#4a2f1c)}
+.msg-content{isolation: isolate; position: relative; overflow: hidden; color: var(--b1,#4a2f1c);}
+.msg-content[data-side="ai"]{background: linear-gradient(180deg, var(--b2,#f7e9d6) 0%, var(--b3,#e6cca6) 100%); border-radius: 16px 16px 16px 5px;}
+.msg-content[data-side="user"]{background: linear-gradient(180deg, var(--b4,#f0dcc0) 0%, var(--b5,#d9bb90) 100%); border-radius: 16px 16px 5px 16px;}
+.msg-content::after{content: ""; position: absolute; left: 0; right: 0; bottom: -4px; height: 17px; z-index: -1; pointer-events: none; background-image: radial-gradient(circle 1.7px at 6.2px 4.6px, var(--b7,rgba(255,255,255,0.55)), var(--b8,rgba(255,255,255,0)) 72%), radial-gradient(circle 5.6px at 8.5px 8.5px, var(--b6,#452a17) 94%, var(--b9,rgba(69,42,23,0)) 97%); background-size: 18px 17px, 18px 17px; background-repeat: repeat-x, repeat-x; background-position: 4px bottom, 4px bottom;}
+.msg-content::before{content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 20px; z-index: -1; pointer-events: none; background: linear-gradient(180deg, var(--b10,rgba(90,58,30,0)) 0%, var(--b11,rgba(90,58,30,0.16)) 100%);}
+.msg-content::after{animation: b266-an266-roll 23s linear infinite;}
+}
+
+/* 267 Honey Drip */
+@keyframes b267-an267-ooze{0%, 100% { background-position: 0 0, 0 0, 0 0, 0 0, 0 0, 0 0; } 50% { background-position: 0 3px, 0 4px, 0 2px, 0 0, 0 0, 0 0; }}
+@scope ([data-bubble="267"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fff8e6);--cai-tx:var(--bub-ai-tx,#57370a)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffe9b4);--cai-tx:var(--bub-user-tx,#513307)}
+.msg-content{position:relative;overflow:hidden;border:1px solid var(--b11,rgba(255,255,255,0.75));box-shadow:0 1px 2px rgba(196,146,42,0.2),0 6px 15px rgba(196,146,42,0.26),inset 0 -8px 14px rgba(214,160,40,0.22)}
+.msg-content[data-side="ai"]{color:var(--b1,#57370a);background-image:radial-gradient(4.5px 6px at 18px 7px,var(--b2,#ffc93c) 0 100%,var(--b12,rgba(0,0,0,0)) 101%),radial-gradient(4px 6.5px at 42px 6.5px,var(--b2,#ffc93c) 0 100%,var(--b12,rgba(0,0,0,0)) 101%),radial-gradient(3.5px 5px at 64px 7px,var(--b2,#ffc93c) 0 100%,var(--b12,rgba(0,0,0,0)) 101%),linear-gradient(180deg,var(--b13,rgba(255,255,255,0.42)) 0 3px,var(--b12,rgba(0,0,0,0)) 3px),linear-gradient(180deg,var(--b2,#ffc93c) 0 7px,var(--b12,rgba(0,0,0,0)) 7px),linear-gradient(180deg,var(--b3,#fffdf4) 0%,var(--b4,#fff8e6) 46%,var(--b5,#ffedbf) 100%);background-repeat:no-repeat;border-radius:18px 18px 18px 6px}
+.msg-content[data-side="user"]{color:var(--b6,#513307);background-image:radial-gradient(4px 5px at 20px 7px,var(--b7,#f0ae21) 0 100%,var(--b12,rgba(0,0,0,0)) 101%),radial-gradient(4.5px 6.5px at 46px 6.5px,var(--b7,#f0ae21) 0 100%,var(--b12,rgba(0,0,0,0)) 101%),radial-gradient(3.5px 6px at 70px 7px,var(--b7,#f0ae21) 0 100%,var(--b12,rgba(0,0,0,0)) 101%),linear-gradient(180deg,var(--b13,rgba(255,255,255,0.42)) 0 3px,var(--b12,rgba(0,0,0,0)) 3px),linear-gradient(180deg,var(--b7,#f0ae21) 0 7px,var(--b12,rgba(0,0,0,0)) 7px),linear-gradient(180deg,var(--b8,#fff6dc) 0%,var(--b9,#ffe9b4) 46%,var(--b10,#ffd88a) 100%);background-repeat:no-repeat;border-radius:18px 18px 6px 18px}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{animation: b267-an267-ooze 18s ease-in-out infinite;}
+}
+
+/* 268 Lemon Fizz */
+@keyframes b268-an268-spin{0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); }}
+@keyframes b268-an268-fizz{0% { background-position: 0 0, 0 0; } 100% { background-position: 8.83px 4.69px, 0 0; }}
+@scope ([data-bubble="268"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fff5cc);--cai-tx:var(--bub-ai-tx,#4a4106)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffe98f);--cai-tx:var(--bub-user-tx,#463d05)}
+.msg-content{position:relative;overflow:visible;border:1px solid var(--b9,rgba(255,255,255,0.85));box-shadow:0 1px 2px rgba(190,175,60,0.18),0 6px 14px rgba(190,175,60,0.24),inset 0 1px 0 rgba(255,255,255,0.95),inset 0 -7px 12px rgba(200,175,50,0.18)}
+.msg-content[data-side="ai"]{color:var(--b1,#4a4106);background-image:repeating-linear-gradient(118deg,var(--b10,rgba(255,255,255,0.5)) 0 5px,var(--b11,rgba(0,0,0,0)) 5px 10px),linear-gradient(180deg,var(--b2,#fffdf0) 0%,var(--b3,#fff5cc) 100%);border-radius:17px 17px 17px 5px}
+.msg-content[data-side="user"]{color:var(--b4,#463d05);background-image:repeating-linear-gradient(118deg,var(--b10,rgba(255,255,255,0.5)) 0 5px,var(--b11,rgba(0,0,0,0)) 5px 10px),linear-gradient(180deg,var(--b5,#fff7d5) 0%,var(--b6,#ffe98f) 100%);border-radius:17px 17px 5px 17px}
+.msg-content[data-side="ai"]::after{content:"";position:absolute;left:-4px;top:-7px;width:14px;height:14px;border-radius:50%;pointer-events:none;background-image:conic-gradient(from 18deg,var(--b7,#fff6c8) 0deg 55deg,var(--b8,#f2d24a) 55deg 60deg,var(--b7,#fff6c8) 60deg 115deg,var(--b8,#f2d24a) 115deg 120deg,var(--b7,#fff6c8) 120deg 175deg,var(--b8,#f2d24a) 175deg 180deg,var(--b7,#fff6c8) 180deg 235deg,var(--b8,#f2d24a) 235deg 240deg,var(--b7,#fff6c8) 240deg 295deg,var(--b8,#f2d24a) 295deg 300deg,var(--b7,#fff6c8) 300deg 355deg,var(--b8,#f2d24a) 355deg 360deg);box-shadow:0 0 0 2px rgba(255,252,238,0.98),0 0 0 3px rgba(214,180,50,0.6),0 1px 3px rgba(150,130,40,0.45)}
+.msg-content[data-side="user"]::after{content:"";position:absolute;right:-4px;top:-7px;width:14px;height:14px;border-radius:50%;pointer-events:none;background-image:conic-gradient(from 48deg,var(--b7,#fff6c8) 0deg 55deg,var(--b8,#f2d24a) 55deg 60deg,var(--b7,#fff6c8) 60deg 115deg,var(--b8,#f2d24a) 115deg 120deg,var(--b7,#fff6c8) 120deg 175deg,var(--b8,#f2d24a) 175deg 180deg,var(--b7,#fff6c8) 180deg 235deg,var(--b8,#f2d24a) 235deg 240deg,var(--b7,#fff6c8) 240deg 295deg,var(--b8,#f2d24a) 295deg 300deg,var(--b7,#fff6c8) 300deg 355deg,var(--b8,#f2d24a) 355deg 360deg);box-shadow:0 0 0 2px rgba(255,252,238,0.98),0 0 0 3px rgba(214,180,50,0.6),0 1px 3px rgba(150,130,40,0.45)}
+.msg-content[data-side="ai"]::after,.msg-content[data-side="user"]::after{animation: b268-an268-spin 36s linear infinite;}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{animation: b268-an268-fizz 21s linear infinite;}
+}
+
+/* 269 Matcha Foam */
+@keyframes b269-an269-foam{0% { background-position: 0 0, 0 0, 0 0, 0 0, 0 0; } 100% { background-position: 15px 0, 26px 0, 0 0, 0 0, 0 0; }}
+@keyframes b269-an269-foamu{0% { background-position: 7px 0, 11px 0, 0 0, 0 0, 0 0; } 100% { background-position: 22px 0, 33px 0, 0 0, 0 0, 0 0; }}
+@scope ([data-bubble="269"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#cfe3ae);--cai-tx:var(--bub-ai-tx,#1e3b16)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#b6d494);--cai-tx:var(--bub-user-tx,#142a0f)}
+.msg-content{position:relative;overflow:hidden;border:1px solid var(--b10,rgba(255,255,255,0.5));box-shadow:0 1px 2px rgba(92,124,68,0.2),0 6px 15px rgba(92,124,68,0.26),inset 0 1px 0 rgba(255,255,255,0.6),inset 0 -8px 14px rgba(70,104,44,0.22)}
+.msg-content[data-side="ai"]{color:var(--b1,#1e3b16);background-image:radial-gradient(circle at 7px 4px,var(--b11,rgba(255,255,255,0.72)) 0 1.4px,var(--b12,rgba(0,0,0,0)) 1.9px),radial-gradient(circle at 13px 5px,var(--b2,#fdf6e4) 0 10px,var(--b12,rgba(0,0,0,0)) 10.5px),linear-gradient(180deg,var(--b2,#fdf6e4) 0 8px,var(--b12,rgba(0,0,0,0)) 8px),linear-gradient(180deg,var(--b13,rgba(90,70,30,0.16)) 0 17px,var(--b12,rgba(0,0,0,0)) 17px),linear-gradient(180deg,var(--b3,#dcecc4) 0%,var(--b4,#cfe3ae) 46%,var(--b5,#aecd88) 100%);background-size:15px 15px,26px 26px,100% 100%,100% 100%,100% 100%;background-repeat:repeat-x,repeat-x,no-repeat,no-repeat,no-repeat;background-position:0 0,0 0,0 0,0 0,0 0;border-radius:18px 18px 18px 6px}
+.msg-content[data-side="user"]{color:var(--b6,#142a0f);background-image:radial-gradient(circle at 7px 4px,var(--b11,rgba(255,255,255,0.72)) 0 1.4px,var(--b12,rgba(0,0,0,0)) 1.9px),radial-gradient(circle at 11px 4px,var(--b2,#fdf6e4) 0 8.6px,var(--b12,rgba(0,0,0,0)) 9.1px),linear-gradient(180deg,var(--b2,#fdf6e4) 0 7px,var(--b12,rgba(0,0,0,0)) 7px),linear-gradient(180deg,var(--b13,rgba(90,70,30,0.16)) 0 14px,var(--b12,rgba(0,0,0,0)) 14px),linear-gradient(180deg,var(--b7,#c8dfa2) 0%,var(--b8,#b6d494) 46%,var(--b9,#9bc072) 100%);background-size:15px 15px,22px 22px,100% 100%,100% 100%,100% 100%;background-repeat:repeat-x,repeat-x,no-repeat,no-repeat,no-repeat;background-position:7px 0,11px 0,0 0,0 0,0 0;border-radius:18px 18px 6px 18px}
+.msg-content[data-side="ai"]{animation: b269-an269-foam 26s linear infinite;}
+.msg-content[data-side="user"]{animation: b269-an269-foamu 26s linear infinite;}
+}
+
+/* 270 Caramel Swirl */
+@keyframes b270-an270-swirl{0%, 100% { background-size: 100% 100%, 100% 100%, 100% 100%; } 50% { background-size: 100% 100%, 110% 113%, 100% 100%; }}
+@scope ([data-bubble="270"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f6dcb2);--cai-tx:var(--bub-ai-tx,#3f2409)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#e2b880);--cai-tx:var(--bub-user-tx,#38200a)}
+.msg-content{position:relative;overflow:hidden;border:1px solid var(--b8,rgba(255,255,255,0.45));box-shadow:0 1px 2px rgba(126,84,36,0.24),0 7px 17px rgba(126,84,36,0.3),inset 0 2px 0 rgba(255,255,255,0.6),inset 0 -9px 16px rgba(110,66,20,0.26)}
+.msg-content[data-side="ai"]{color:var(--b1,#3f2409);background-image:radial-gradient(62% 88% at 24% -8%,var(--b9,rgba(255,255,255,0.8)) 0%,var(--b10,rgba(0,0,0,0)) 66%),conic-gradient(from 190deg at 76% 24%,var(--b11,rgba(255,255,255,0.4)) 0deg,var(--b10,rgba(0,0,0,0)) 62deg,var(--b12,rgba(255,255,255,0.28)) 148deg,var(--b10,rgba(0,0,0,0)) 232deg,var(--b13,rgba(255,255,255,0.36)) 318deg,var(--b11,rgba(255,255,255,0.4)) 360deg),linear-gradient(158deg,var(--b2,#fdeed6) 0%,var(--b3,#f6dcb2) 48%,var(--b4,#e2b880) 100%);border-radius:20px 20px 20px 7px}
+.msg-content[data-side="user"]{color:var(--b5,#38200a);background-image:radial-gradient(62% 88% at 76% -8%,var(--b14,rgba(255,255,255,0.66)) 0%,var(--b10,rgba(0,0,0,0)) 66%),conic-gradient(from 20deg at 24% 26%,var(--b11,rgba(255,255,255,0.4)) 0deg,var(--b10,rgba(0,0,0,0)) 62deg,var(--b12,rgba(255,255,255,0.28)) 148deg,var(--b10,rgba(0,0,0,0)) 232deg,var(--b13,rgba(255,255,255,0.36)) 318deg,var(--b11,rgba(255,255,255,0.4)) 360deg),linear-gradient(158deg,var(--b6,#f2d3a4) 0%,var(--b4,#e2b880) 52%,var(--b7,#c9954f) 100%);border-radius:20px 20px 7px 20px}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{animation: b270-an270-swirl 30s ease-in-out infinite;}
+}
+
+/* 271 Marshmallow */
+@keyframes b271-an271-sugar{0% { background-position: 0 calc(100% - 7px), 0 0; } 100% { background-position: 9px calc(100% - 7px), 0 0; }}
+@keyframes b271-an271-sugaru{0% { background-position: 4px calc(100% - 7px), 0 0; } 100% { background-position: 13px calc(100% - 7px), 0 0; }}
+@scope ([data-bubble="271"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f7f2f5);--cai-tx:var(--bub-ai-tx,#4a3b46)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffe4ed);--cai-tx:var(--bub-user-tx,#4d2536)}
+.msg-content{position:relative;overflow:hidden;border:1px solid var(--b9,rgba(224,212,220,0.85));box-shadow:0 1px 2px rgba(150,130,145,0.12),0 10px 18px rgba(150,130,145,0.18),inset 0 9px 14px rgba(255,255,255,1),inset 0 -9px 14px rgba(180,155,175,0.34)}
+.msg-content[data-side="ai"]{color:var(--b1,#4a3b46);background-image:radial-gradient(circle at 4px 2px,var(--b10,rgba(255,255,255,0.6)) 0 0.9px,var(--b11,rgba(0,0,0,0)) 1.4px),linear-gradient(180deg,var(--b2,#ffffff) 0%,var(--b3,#f7f2f5) 58%,var(--b4,#eae0e7) 100%);background-size:9px 9px,100% 100%;background-repeat:repeat-x,no-repeat;background-position:0 calc(100% - 7px),0 0;border-radius:24px 24px 24px 9px}
+.msg-content[data-side="user"]{color:var(--b5,#4d2536);background-image:radial-gradient(circle at 4px 2px,var(--b10,rgba(255,255,255,0.6)) 0 0.9px,var(--b11,rgba(0,0,0,0)) 1.4px),linear-gradient(180deg,var(--b6,#fff5f8) 0%,var(--b7,#ffe4ed) 58%,var(--b8,#f8cbdc) 100%);background-size:9px 9px,100% 100%;background-repeat:repeat-x,no-repeat;background-position:4px calc(100% - 7px),0 0;border-radius:24px 24px 9px 24px}
+.msg-content[data-side="ai"]{animation: b271-an271-sugar 29s linear infinite;}
+.msg-content[data-side="user"]{animation: b271-an271-sugaru 29s linear infinite;}
+}
+
+/* 272 Sprinkles */
+@keyframes b272-an272-bob{0%, 100% { background-position: 12px 2px, 34px 4px, 56px 3px, 80px 5px, 24px 6px, 68px 6px, 0 0, 0 0; } 50% { background-position: 12px 5px, 34px 2px, 56px 6px, 80px 3px, 24px 3px, 68px 9px, 0 0, 0 0; }}
+@keyframes b272-an272-bobu{0%, 100% { background-position: calc(100% - 12px) 2px, calc(100% - 34px) 4px, calc(100% - 56px) 3px, calc(100% - 80px) 5px, calc(100% - 24px) 6px, calc(100% - 68px) 6px, 0 0, 0 0; } 50% { background-position: calc(100% - 12px) 5px, calc(100% - 34px) 2px, calc(100% - 56px) 6px, calc(100% - 80px) 3px, calc(100% - 24px) 3px, calc(100% - 68px) 9px, 0 0, 0 0; }}
+@scope ([data-bubble="272"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fbeaf2);--cai-tx:var(--bub-ai-tx,#4a3550)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffdaeb);--cai-tx:var(--bub-user-tx,#4a1f3c)}
+.msg-content{position:relative;overflow:hidden;border:1px solid var(--b11,rgba(255,255,255,0.9));box-shadow:0 1px 2px rgba(180,140,170,0.16),0 6px 14px rgba(180,140,170,0.24),inset 0 1px 0 rgba(255,255,255,0.95),inset 0 -8px 14px rgba(190,140,175,0.2)}
+.msg-content[data-side="ai"]{color:var(--b1,#4a3550);background-image:linear-gradient(56deg,var(--b12,rgba(0,0,0,0)) 40%,var(--b2,#ff7fae) 40% 60%,var(--b12,rgba(0,0,0,0)) 60%),linear-gradient(-38deg,var(--b12,rgba(0,0,0,0)) 40%,var(--b3,#64c8ff) 40% 60%,var(--b12,rgba(0,0,0,0)) 60%),linear-gradient(14deg,var(--b12,rgba(0,0,0,0)) 40%,var(--b4,#ffcf4d) 40% 60%,var(--b12,rgba(0,0,0,0)) 60%),linear-gradient(-64deg,var(--b12,rgba(0,0,0,0)) 40%,var(--b5,#ffffff) 40% 60%,var(--b12,rgba(0,0,0,0)) 60%),linear-gradient(74deg,var(--b12,rgba(0,0,0,0)) 40%,var(--b2,#ff7fae) 40% 60%,var(--b12,rgba(0,0,0,0)) 60%),linear-gradient(-22deg,var(--b12,rgba(0,0,0,0)) 40%,var(--b3,#64c8ff) 40% 60%,var(--b12,rgba(0,0,0,0)) 60%),linear-gradient(180deg,var(--b13,rgba(255,255,255,0.62)) 0%,var(--b12,rgba(0,0,0,0)) 38%),linear-gradient(180deg,var(--b6,#fffaf6) 0%,var(--b7,#fbeaf2) 100%);background-size:9px 5px,8px 5px,10px 5px,8px 5px,8px 5px,9px 5px,100% 100%,100% 100%;background-position:12px 2px,34px 4px,56px 3px,80px 5px,24px 6px,68px 6px,0 0,0 0;background-repeat:no-repeat;border-radius:20px 20px 20px 6px}
+.msg-content[data-side="user"]{color:var(--b8,#4a1f3c);background-image:linear-gradient(-48deg,var(--b12,rgba(0,0,0,0)) 40%,var(--b2,#ff7fae) 40% 60%,var(--b12,rgba(0,0,0,0)) 60%),linear-gradient(30deg,var(--b12,rgba(0,0,0,0)) 40%,var(--b3,#64c8ff) 40% 60%,var(--b12,rgba(0,0,0,0)) 60%),linear-gradient(-16deg,var(--b12,rgba(0,0,0,0)) 40%,var(--b4,#ffcf4d) 40% 60%,var(--b12,rgba(0,0,0,0)) 60%),linear-gradient(68deg,var(--b12,rgba(0,0,0,0)) 40%,var(--b5,#ffffff) 40% 60%,var(--b12,rgba(0,0,0,0)) 60%),linear-gradient(-74deg,var(--b12,rgba(0,0,0,0)) 40%,var(--b2,#ff7fae) 40% 60%,var(--b12,rgba(0,0,0,0)) 60%),linear-gradient(22deg,var(--b12,rgba(0,0,0,0)) 40%,var(--b3,#64c8ff) 40% 60%,var(--b12,rgba(0,0,0,0)) 60%),linear-gradient(180deg,var(--b13,rgba(255,255,255,0.62)) 0%,var(--b12,rgba(0,0,0,0)) 38%),linear-gradient(180deg,var(--b9,#fff0f7) 0%,var(--b10,#ffdaeb) 100%);background-size:9px 5px,8px 5px,10px 5px,8px 5px,8px 5px,9px 5px,100% 100%,100% 100%;background-position:calc(100% - 12px) 2px,calc(100% - 34px) 4px,calc(100% - 56px) 3px,calc(100% - 80px) 5px,calc(100% - 24px) 6px,calc(100% - 68px) 6px,0 0,0 0;background-repeat:no-repeat;border-radius:20px 20px 6px 20px}
+.msg-content[data-side="ai"]{animation: b272-an272-bob 19s ease-in-out infinite;}
+.msg-content[data-side="user"]{animation: b272-an272-bobu 19s ease-in-out infinite;}
+}
+
+/* 273 Rainbow Sherbet */
+@keyframes b273-an273-melt{0%, 100% { background-position: 0 0, 0% 50%; } 50% { background-position: 0 0, 100% 50%; }}
+@scope ([data-bubble="273"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f3f8d4);--cai-tx:var(--bub-ai-tx,#3f2a46)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#e3ecc6);--cai-tx:var(--bub-user-tx,#38243e)}
+.msg-content{position:relative;overflow:hidden;border:1px solid var(--b8,rgba(255,255,255,0.9));box-shadow:0 1px 2px rgba(160,140,190,0.16),0 7px 16px rgba(160,140,190,0.26),inset 0 1px 0 rgba(255,255,255,1),inset 0 -8px 14px rgba(140,120,170,0.18)}
+.msg-content[data-side="ai"]{color:var(--b1,#3f2a46);background-image:linear-gradient(180deg,var(--b9,rgba(255,255,255,0.78)) 0%,var(--b10,rgba(255,255,255,0.12)) 40%,var(--b11,rgba(0,0,0,0)) 58%),linear-gradient(118deg,var(--b2,#ffe0e8) 0%,var(--b3,#ffeacd) 26%,var(--b4,#f3f8d4) 49%,var(--b5,#d9f0f5) 72%,var(--b6,#e6dcfa) 100%);border-radius:20px 20px 20px 6px}
+.msg-content[data-side="user"]{color:var(--b7,#38243e);background-image:linear-gradient(180deg,var(--b12,rgba(255,255,255,0.5)) 0%,var(--b13,rgba(255,255,255,0.08)) 34%,var(--b11,rgba(0,0,0,0)) 52%,var(--b14,rgba(94,74,124,0.16)) 100%),linear-gradient(298deg,var(--b2,#ffe0e8) 0%,var(--b3,#ffeacd) 26%,var(--b4,#f3f8d4) 49%,var(--b5,#d9f0f5) 72%,var(--b6,#e6dcfa) 100%);border-radius:20px 20px 6px 20px}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{background-size: 100% 100%, 170% 170%; animation: b273-an273-melt 28s ease-in-out infinite;}
+}
+
+/* 274 Jelly Gummy */
+@keyframes b274-c274jela{0%,100%{border-radius:24px 24px 24px 8px}50%{border-radius:28px 20px 26px 8px}}
+@keyframes b274-c274jelb{0%,100%{border-radius:24px 24px 8px 24px}50%{border-radius:20px 28px 8px 26px}}
+@scope ([data-bubble="274"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ffb3d4);--cai-tx:var(--bub-ai-tx,#4f0f31)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#a4ead2);--cai-tx:var(--bub-user-tx,#0c3d30)}
+.msg-content{position:relative;overflow:hidden;border:1px solid var(--b9,rgba(255,255,255,0.5));box-shadow:0 1px 2px rgba(150,90,130,0.18),0 8px 18px rgba(150,90,130,0.28),inset 0 0 0 1.5px rgba(255,255,255,0.3),inset 0 -12px 20px rgba(255,255,255,0.3)}
+.msg-content[data-side="ai"]{color:var(--b1,#4f0f31);background-image:radial-gradient(76% 42% at 50% 5%,var(--b10,rgba(255,255,255,0.92)) 0%,var(--b11,rgba(255,255,255,0.16)) 56%,var(--b12,rgba(0,0,0,0)) 100%),linear-gradient(180deg,var(--b2,#ffe3ef) 0%,var(--b3,#ffb3d4) 56%,var(--b4,#ff8cbe) 100%);border-radius:24px 24px 24px 8px;animation:b274-c274jela 5.6s ease-in-out infinite}
+.msg-content[data-side="user"]{color:var(--b5,#0c3d30);background-image:radial-gradient(76% 42% at 50% 5%,var(--b10,rgba(255,255,255,0.92)) 0%,var(--b11,rgba(255,255,255,0.16)) 56%,var(--b12,rgba(0,0,0,0)) 100%),linear-gradient(180deg,var(--b6,#dcf8ee) 0%,var(--b7,#a4ead2) 56%,var(--b8,#74d9bd) 100%);border-radius:24px 24px 8px 24px;animation:b274-c274jelb 5.6s ease-in-out infinite}
+}
+
+/* 275 Kitty Ears */
+@keyframes b275-an275-earl{0%, 100% { transform: rotate(-14deg); } 50% { transform: rotate(-9deg); }}
+@keyframes b275-an275-earr{0%, 100% { transform: rotate(14deg); } 50% { transform: rotate(9deg); }}
+@scope ([data-bubble="275"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fff3e6);--cai-tx:var(--bub-ai-tx,#4d3320)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffdcc4);--cai-tx:var(--bub-user-tx,#52301a)}
+.msg-content{position:relative;overflow:visible;border:1px solid var(--b12,rgba(255,255,255,0.8));box-shadow:0 1px 2px rgba(190,150,110,0.18),0 6px 14px rgba(190,150,110,0.26),inset 0 1px 0 rgba(255,255,255,0.9),inset 0 -8px 14px rgba(200,150,100,0.18)}
+.msg-content[data-side="ai"]{color:var(--b1,#4d3320);background-image:linear-gradient(180deg,var(--b2,#fffaf3) 0%,var(--b3,#fff3e6) 55%,var(--b4,#ffe2cb) 100%);border-radius:20px 20px 20px 6px}
+.msg-content[data-side="user"]{color:var(--b5,#52301a);background-image:linear-gradient(180deg,var(--b6,#ffece0) 0%,var(--b7,#ffdcc4) 55%,var(--b8,#ffc7a4) 100%);border-radius:20px 20px 6px 20px}
+.msg-content[data-side="ai"]::before{content:"";position:absolute;left:6px;top:-8px;width:17px;height:16px;pointer-events:none;clip-path:polygon(50% 0,58% 7%,100% 88%,94% 100%,6% 100%,0 88%);transform:rotate(-14deg);background-image:radial-gradient(34% 30% at 50% 52%,var(--b9,#e79b7e) 0 100%,var(--b13,rgba(0,0,0,0)) 101%),linear-gradient(180deg,var(--b10,#f7c4a4) 0%,var(--b4,#ffe2cb) 42%,var(--b2,#fffaf3) 64%,var(--b13,rgba(0,0,0,0)) 100%);filter:drop-shadow(0 1px 1px rgba(170,120,80,0.3))}
+.msg-content[data-side="ai"]::after{content:"";position:absolute;left:29px;top:-8px;width:17px;height:16px;pointer-events:none;clip-path:polygon(50% 0,58% 7%,100% 88%,94% 100%,6% 100%,0 88%);transform:rotate(14deg);background-image:radial-gradient(34% 30% at 50% 52%,var(--b9,#e79b7e) 0 100%,var(--b13,rgba(0,0,0,0)) 101%),linear-gradient(180deg,var(--b10,#f7c4a4) 0%,var(--b4,#ffe2cb) 42%,var(--b2,#fffaf3) 64%,var(--b13,rgba(0,0,0,0)) 100%);filter:drop-shadow(0 1px 1px rgba(170,120,80,0.3))}
+.msg-content[data-side="user"]::before{content:"";position:absolute;right:6px;top:-8px;width:17px;height:16px;pointer-events:none;clip-path:polygon(50% 0,58% 7%,100% 88%,94% 100%,6% 100%,0 88%);transform:rotate(14deg);background-image:radial-gradient(34% 30% at 50% 52%,var(--b9,#e79b7e) 0 100%,var(--b13,rgba(0,0,0,0)) 101%),linear-gradient(180deg,var(--b11,#f0ab84) 0%,var(--b8,#ffc7a4) 42%,var(--b6,#ffece0) 64%,var(--b13,rgba(0,0,0,0)) 100%);filter:drop-shadow(0 1px 1px rgba(170,120,80,0.3))}
+.msg-content[data-side="user"]::after{content:"";position:absolute;right:29px;top:-8px;width:17px;height:16px;pointer-events:none;clip-path:polygon(50% 0,58% 7%,100% 88%,94% 100%,6% 100%,0 88%);transform:rotate(-14deg);background-image:radial-gradient(34% 30% at 50% 52%,var(--b9,#e79b7e) 0 100%,var(--b13,rgba(0,0,0,0)) 101%),linear-gradient(180deg,var(--b11,#f0ab84) 0%,var(--b8,#ffc7a4) 42%,var(--b6,#ffece0) 64%,var(--b13,rgba(0,0,0,0)) 100%);filter:drop-shadow(0 1px 1px rgba(170,120,80,0.3))}
+.msg-content[data-side="ai"]::before,.msg-content[data-side="user"]::after{transform-origin: 50% 100%; animation: b275-an275-earl 17s ease-in-out infinite;}
+.msg-content[data-side="ai"]::after,.msg-content[data-side="user"]::before{transform-origin: 50% 100%; animation: b275-an275-earr 17s ease-in-out infinite;}
+}
+
+/* 276 Bunny Ears */
+@keyframes b276-an276-e1{0%, 100% { transform: rotate(-8deg); } 50% { transform: rotate(-4deg); }}
+@keyframes b276-an276-e2{0%, 100% { transform: rotate(9deg); } 50% { transform: rotate(5deg); }}
+@keyframes b276-an276-e3{0%, 100% { transform: rotate(8deg); } 50% { transform: rotate(4deg); }}
+@keyframes b276-an276-e4{0%, 100% { transform: rotate(-9deg); } 50% { transform: rotate(-5deg); }}
+@scope ([data-bubble="276"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fff4f8);--cai-tx:var(--bub-ai-tx,#4d2b3d)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffdfec);--cai-tx:var(--bub-user-tx,#4d2035)}
+.msg-content{position:relative;overflow:visible;border:1px solid var(--b11,rgba(255,255,255,0.9));box-shadow:0 1px 2px rgba(200,150,175,0.16),0 6px 14px rgba(200,150,175,0.24),inset 0 2px 0 rgba(255,255,255,0.95),inset 0 -8px 14px rgba(210,150,180,0.18)}
+.msg-content[data-side="ai"]{color:var(--b1,#4d2b3d);background-image:linear-gradient(180deg,var(--b2,#ffffff) 0%,var(--b3,#fff4f8) 58%,var(--b4,#ffe7f0) 100%);border-radius:22px 22px 22px 7px}
+.msg-content[data-side="user"]{color:var(--b5,#4d2035);background-image:linear-gradient(180deg,var(--b6,#fff0f6) 0%,var(--b7,#ffdfec) 58%,var(--b8,#ffc9df) 100%);border-radius:22px 22px 7px 22px}
+.msg-content[data-side="ai"]::before{content:"";position:absolute;left:9px;top:-9px;width:12px;height:23px;pointer-events:none;border-radius:50% 50% 34% 34% / 64% 64% 36% 36%;transform:rotate(-8deg);background-image:radial-gradient(48% 40% at 50% 36%,var(--b9,#ffb0cd) 0 100%,var(--b12,rgba(0,0,0,0)) 101%),linear-gradient(180deg,var(--b10,#ffdcea) 0%,var(--b3,#fff4f8) 40%,var(--b2,#ffffff) 58%,var(--b12,rgba(0,0,0,0)) 100%);filter:drop-shadow(0 1px 1px rgba(190,140,170,0.3))}
+.msg-content[data-side="ai"]::after{content:"";position:absolute;left:24px;top:-9px;width:12px;height:23px;pointer-events:none;border-radius:50% 50% 34% 34% / 64% 64% 36% 36%;transform:rotate(9deg);background-image:radial-gradient(48% 40% at 50% 36%,var(--b9,#ffb0cd) 0 100%,var(--b12,rgba(0,0,0,0)) 101%),linear-gradient(180deg,var(--b10,#ffdcea) 0%,var(--b3,#fff4f8) 40%,var(--b2,#ffffff) 58%,var(--b12,rgba(0,0,0,0)) 100%);filter:drop-shadow(0 1px 1px rgba(190,140,170,0.3))}
+.msg-content[data-side="user"]::before{content:"";position:absolute;right:9px;top:-9px;width:12px;height:23px;pointer-events:none;border-radius:50% 50% 34% 34% / 64% 64% 36% 36%;transform:rotate(8deg);background-image:radial-gradient(48% 40% at 50% 36%,var(--b9,#ffb0cd) 0 100%,var(--b12,rgba(0,0,0,0)) 101%),linear-gradient(180deg,var(--b8,#ffc9df) 0%,var(--b7,#ffdfec) 40%,var(--b6,#fff0f6) 58%,var(--b12,rgba(0,0,0,0)) 100%);filter:drop-shadow(0 1px 1px rgba(190,140,170,0.3))}
+.msg-content[data-side="user"]::after{content:"";position:absolute;right:24px;top:-9px;width:12px;height:23px;pointer-events:none;border-radius:50% 50% 34% 34% / 64% 64% 36% 36%;transform:rotate(-9deg);background-image:radial-gradient(48% 40% at 50% 36%,var(--b9,#ffb0cd) 0 100%,var(--b12,rgba(0,0,0,0)) 101%),linear-gradient(180deg,var(--b8,#ffc9df) 0%,var(--b7,#ffdfec) 40%,var(--b6,#fff0f6) 58%,var(--b12,rgba(0,0,0,0)) 100%);filter:drop-shadow(0 1px 1px rgba(190,140,170,0.3))}
+.msg-content[data-side="ai"]::before,.msg-content[data-side="ai"]::after,.msg-content[data-side="user"]::before,.msg-content[data-side="user"]::after{transform-origin: 50% 100%; animation-duration: 19s; animation-timing-function: ease-in-out; animation-iteration-count: infinite;}
+.msg-content[data-side="ai"]::before{animation-name: b276-an276-e1;}
+.msg-content[data-side="ai"]::after{animation-name: b276-an276-e2;}
+.msg-content[data-side="user"]::before{animation-name: b276-an276-e3;}
+.msg-content[data-side="user"]::after{animation-name: b276-an276-e4;}
+}
+
+/* 277 Panda Pal */
+@keyframes b277-an277-earl{0%, 100% { transform: rotate(-7deg); } 50% { transform: rotate(-3.5deg); }}
+@keyframes b277-an277-earr{0%, 100% { transform: rotate(7deg); } 50% { transform: rotate(3.5deg); }}
+@scope ([data-bubble="277"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f4f5f8);--cai-tx:var(--bub-ai-tx,#1f2124)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#e4e7ec);--cai-tx:var(--bub-user-tx,#1b1d20)}
+.msg-content{position:relative;overflow:visible;border:1px solid var(--b12,rgba(38,40,46,0.14));box-shadow:0 1px 2px rgba(30,32,38,0.12),0 6px 14px rgba(30,32,38,0.18),inset 0 2px 0 rgba(255,255,255,0.9)}
+.msg-content[data-side="ai"]{color:var(--b1,#1f2124);background-image:linear-gradient(180deg,var(--b2,#ffffff) 0%,var(--b3,#f4f5f8) 62%,var(--b4,#e9ebef) 100%);border-radius:20px 20px 20px 6px}
+.msg-content[data-side="user"]{color:var(--b5,#1b1d20);background-image:linear-gradient(180deg,var(--b6,#eff1f5) 0%,var(--b7,#e4e7ec) 62%,var(--b8,#d3d7de) 100%);border-radius:20px 20px 6px 20px}
+.msg-content[data-side="ai"]::before{content:"";position:absolute;left:9px;top:-9px;width:16px;height:13px;pointer-events:none;border-radius:52% 52% 12% 12% / 88% 88% 12% 12%;transform:rotate(-7deg);background-image:radial-gradient(40% 34% at 50% 40%,var(--b9,#6e7583) 0 100%,var(--b13,rgba(0,0,0,0)) 101%),linear-gradient(180deg,var(--b10,#3a3d45) 0%,var(--b11,#24262c) 100%);filter:drop-shadow(0 1px 2px rgba(20,22,28,0.38))}
+.msg-content[data-side="ai"]::after{content:"";position:absolute;left:31px;top:-9px;width:16px;height:13px;pointer-events:none;border-radius:52% 52% 12% 12% / 88% 88% 12% 12%;transform:rotate(7deg);background-image:radial-gradient(40% 34% at 50% 40%,var(--b9,#6e7583) 0 100%,var(--b13,rgba(0,0,0,0)) 101%),linear-gradient(180deg,var(--b10,#3a3d45) 0%,var(--b11,#24262c) 100%);filter:drop-shadow(0 1px 2px rgba(20,22,28,0.38))}
+.msg-content[data-side="user"]::before{content:"";position:absolute;right:9px;top:-9px;width:16px;height:13px;pointer-events:none;border-radius:52% 52% 12% 12% / 88% 88% 12% 12%;transform:rotate(7deg);background-image:radial-gradient(40% 34% at 50% 40%,var(--b9,#6e7583) 0 100%,var(--b13,rgba(0,0,0,0)) 101%),linear-gradient(180deg,var(--b10,#3a3d45) 0%,var(--b11,#24262c) 100%);filter:drop-shadow(0 1px 2px rgba(20,22,28,0.38))}
+.msg-content[data-side="user"]::after{content:"";position:absolute;right:31px;top:-9px;width:16px;height:13px;pointer-events:none;border-radius:52% 52% 12% 12% / 88% 88% 12% 12%;transform:rotate(-7deg);background-image:radial-gradient(40% 34% at 50% 40%,var(--b9,#6e7583) 0 100%,var(--b13,rgba(0,0,0,0)) 101%),linear-gradient(180deg,var(--b10,#3a3d45) 0%,var(--b11,#24262c) 100%);filter:drop-shadow(0 1px 2px rgba(20,22,28,0.38))}
+.msg-content[data-side="ai"]::before,.msg-content[data-side="user"]::after{transform-origin: 50% 100%; animation: b277-an277-earl 21s ease-in-out infinite;}
+.msg-content[data-side="ai"]::after,.msg-content[data-side="user"]::before{transform-origin: 50% 100%; animation: b277-an277-earr 21s ease-in-out infinite;}
+}
+
+/* 278 Buttercream */
+@scope ([data-bubble="278"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fff2cf);--cai-tx:var(--bub-ai-tx,#4d3d05)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffe19a);--cai-tx:var(--bub-user-tx,#473805)}
+.msg-content{position:relative;overflow:hidden;border:1px solid var(--b11,rgba(255,255,255,0.8));box-shadow:0 1px 2px rgba(196,164,70,0.18),0 6px 14px rgba(196,164,70,0.26),inset 0 -8px 14px rgba(200,160,50,0.18)}
+.msg-content[data-side="ai"]{color:var(--b1,#4d3d05);background-image:radial-gradient(circle at 7px 2.5px,var(--b12,rgba(255,255,255,0.85)) 0 2px,var(--b13,rgba(0,0,0,0)) 2.7px),repeating-linear-gradient(90deg,var(--b14,rgba(190,150,60,0.11)) 0 1px,var(--b13,rgba(0,0,0,0)) 1px 4px),radial-gradient(circle at 8.5px 4px,var(--b2,#fffdf2) 0 7.5px,var(--b13,rgba(0,0,0,0)) 8px),linear-gradient(180deg,var(--b15,rgba(190,150,60,0.2)) 0 12px,var(--b13,rgba(0,0,0,0)) 12px),linear-gradient(180deg,var(--b3,#fffaea) 0%,var(--b4,#fff2cf) 55%,var(--b5,#ffe6ab) 100%);background-size:17px 18px,17px 10px,17px 18px,100% 100%,100% 100%;background-repeat:repeat-x,repeat-x,repeat-x,no-repeat,no-repeat;background-position:0 0,0 0,0 0,0 0,0 0;border-radius:19px 19px 19px 6px}
+.msg-content[data-side="user"]{color:var(--b6,#473805);background-image:radial-gradient(circle at 6px 2.2px,var(--b12,rgba(255,255,255,0.85)) 0 1.8px,var(--b13,rgba(0,0,0,0)) 2.4px),repeating-linear-gradient(90deg,var(--b14,rgba(190,150,60,0.11)) 0 1px,var(--b13,rgba(0,0,0,0)) 1px 4px),radial-gradient(circle at 7.5px 3.5px,var(--b7,#fff6d8) 0 6.6px,var(--b13,rgba(0,0,0,0)) 7.1px),linear-gradient(180deg,var(--b15,rgba(190,150,60,0.2)) 0 11px,var(--b13,rgba(0,0,0,0)) 11px),linear-gradient(180deg,var(--b8,#fff1cd) 0%,var(--b9,#ffe19a) 55%,var(--b10,#f8cd6c) 100%);background-size:15px 17px,15px 9px,15px 17px,100% 100%,100% 100%;background-repeat:repeat-x,repeat-x,repeat-x,no-repeat,no-repeat;background-position:8px 0,8px 0,8px 0,0 0,0 0;border-radius:19px 19px 6px 19px}
+}
+
+/* 279 Cloud Fluff */
+@keyframes b279-an279-drift{0%, 100% { transform: translate(0px, 0px); } 50% { transform: translate(6px, -2px); }}
+@scope ([data-bubble="279"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f0f5ff);--cai-tx:var(--bub-ai-tx,#333a4d)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#e4ecfb);--cai-tx:var(--bub-user-tx,#2a3149)}
+.msg-content{position:relative;overflow:visible;border:1px solid var(--b9,rgba(218,226,244,0.9));box-shadow:0 1px 2px rgba(120,136,180,0.12),0 9px 18px rgba(120,136,180,0.2),inset 0 2px 0 rgba(255,255,255,0.95),inset 0 -8px 14px rgba(150,170,215,0.16)}
+.msg-content[data-side="ai"]{color:var(--b1,#333a4d);background-image:linear-gradient(180deg,var(--b2,#f7faff) 0%,var(--b3,#f0f5ff) 58%,var(--b4,#e4ebf9) 100%);border-radius:26px 26px 26px 9px}
+.msg-content[data-side="user"]{color:var(--b5,#2a3149);background-image:linear-gradient(180deg,var(--b6,#eef3fe) 0%,var(--b7,#e4ecfb) 58%,var(--b8,#d3ddf4) 100%);border-radius:26px 26px 9px 26px}
+.msg-content[data-side="ai"]::before{content:"";position:absolute;left:7px;top:-9px;width:18px;height:17px;pointer-events:none;border-radius:50%;background-image:linear-gradient(180deg,var(--b2,#f7faff) 0 100%);box-shadow:15px -2px 0 -2px #f7faff,-8px 5px 0 -5px #f7faff,26px 4px 0 -4px #f7faff;filter:drop-shadow(0 1px 2px rgba(120,136,180,0.34))}
+.msg-content[data-side="user"]::before{content:"";position:absolute;right:7px;top:-9px;width:18px;height:17px;pointer-events:none;border-radius:50%;background-image:linear-gradient(180deg,var(--b6,#eef3fe) 0 100%);box-shadow:-15px -2px 0 -2px #eef3fe,8px 5px 0 -5px #eef3fe,-26px 4px 0 -4px #eef3fe;filter:drop-shadow(0 1px 2px rgba(120,136,180,0.34))}
+.msg-content[data-side="ai"]::before,.msg-content[data-side="user"]::before{animation: b279-an279-drift 26s ease-in-out infinite;}
+}
+
+/* 280 Bear Paw */
+@keyframes b280-an280-pat{0%, 100% { transform: rotate(-3deg); } 50% { transform: rotate(3deg); }}
+@scope ([data-bubble="280"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f2e0c9);--cai-tx:var(--bub-ai-tx,#45260f)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ddbf98);--cai-tx:var(--bub-user-tx,#3a1f08)}
+.msg-content{position:relative;overflow:visible;border:1px solid var(--b11,rgba(255,255,255,0.5));box-shadow:0 1px 2px rgba(130,90,50,0.2),0 7px 16px rgba(130,90,50,0.28),inset 0 2px 0 rgba(255,255,255,0.65),inset 0 -8px 14px rgba(110,70,30,0.2)}
+.msg-content[data-side="ai"]{color:var(--b1,#45260f);background-image:linear-gradient(180deg,var(--b2,#fdf5ec) 0%,var(--b3,#f2e0c9) 56%,var(--b4,#e4cba9) 100%);border-radius:22px 22px 22px 8px}
+.msg-content[data-side="user"]{color:var(--b5,#3a1f08);background-image:linear-gradient(180deg,var(--b6,#eddbc0) 0%,var(--b7,#ddbf98) 56%,var(--b8,#caa675) 100%);border-radius:22px 22px 8px 22px}
+.msg-content[data-side="ai"]::after{content:"";position:absolute;left:-3px;top:-9px;width:19px;height:14px;pointer-events:none;background-image:radial-gradient(4.4px 3.6px at 9.5px 10.8px,var(--b9,#a9754a) 0 100%,var(--b12,rgba(0,0,0,0)) 101%),radial-gradient(2.3px 2.7px at 3.1px 5.8px,var(--b9,#a9754a) 0 100%,var(--b12,rgba(0,0,0,0)) 101%),radial-gradient(2.3px 2.8px at 7.5px 2.9px,var(--b9,#a9754a) 0 100%,var(--b12,rgba(0,0,0,0)) 101%),radial-gradient(2.3px 2.8px at 12px 3.1px,var(--b9,#a9754a) 0 100%,var(--b12,rgba(0,0,0,0)) 101%),radial-gradient(2.3px 2.7px at 16.2px 6px,var(--b9,#a9754a) 0 100%,var(--b12,rgba(0,0,0,0)) 101%);filter:drop-shadow(0 1px 1px rgba(90,58,26,0.45))}
+.msg-content[data-side="user"]::after{content:"";position:absolute;right:-3px;top:-9px;width:19px;height:14px;pointer-events:none;background-image:radial-gradient(4.4px 3.6px at 9.5px 10.8px,var(--b10,#8a5a32) 0 100%,var(--b12,rgba(0,0,0,0)) 101%),radial-gradient(2.3px 2.7px at 3.1px 5.8px,var(--b10,#8a5a32) 0 100%,var(--b12,rgba(0,0,0,0)) 101%),radial-gradient(2.3px 2.8px at 7.5px 2.9px,var(--b10,#8a5a32) 0 100%,var(--b12,rgba(0,0,0,0)) 101%),radial-gradient(2.3px 2.8px at 12px 3.1px,var(--b10,#8a5a32) 0 100%,var(--b12,rgba(0,0,0,0)) 101%),radial-gradient(2.3px 2.7px at 16.2px 6px,var(--b10,#8a5a32) 0 100%,var(--b12,rgba(0,0,0,0)) 101%);filter:drop-shadow(0 1px 1px rgba(90,58,26,0.45))}
+.msg-content[data-side="ai"]::after,.msg-content[data-side="user"]::after{transform-origin: 50% 100%; animation: b280-an280-pat 18s ease-in-out infinite;}
+}
+
+/* 281 Star Jar */
+@keyframes b281-c281twink{0%,100%{opacity:0.62}50%{opacity:1}}
+@scope ([data-bubble="281"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#1b2048);--cai-tx:var(--bub-ai-tx,#dfe4ff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#241d4a);--cai-tx:var(--bub-user-tx,#f0e6ff)}
+.msg-content{position:relative;overflow:visible;border:1px solid var(--b12,rgba(255,255,255,0.16));box-shadow:0 2px 4px rgba(6,6,20,0.45),0 10px 22px rgba(6,6,20,0.55),inset 0 1px 0 rgba(255,255,255,0.16)}
+.msg-content[data-side="ai"]{color:var(--b1,#dfe4ff);background-image:linear-gradient(0deg,var(--b2,#ffffff) 0 100%),linear-gradient(0deg,var(--b3,#ffe9a8) 0 100%),linear-gradient(0deg,var(--b4,#b9c8ff) 0 100%),linear-gradient(0deg,var(--b2,#ffffff) 0 100%),linear-gradient(0deg,var(--b3,#ffe9a8) 0 100%),linear-gradient(158deg,var(--b13,rgba(255,255,255,0.14)) 0%,var(--b14,rgba(0,0,0,0)) 44%),radial-gradient(130% 100% at 26% 0%,var(--b5,#2b3168) 0%,var(--b6,#1b2048) 46%,var(--b7,#101430) 100%);background-size:2px 2px,3px 3px,2px 2px,2px 2px,3px 3px,100% 100%,100% 100%;background-repeat:no-repeat;background-position:15px 5px,40px 9px,64px 4px,calc(100% - 20px) calc(100% - 5px),calc(100% - 44px) calc(100% - 4px),0 0,0 0;border-radius:16px 16px 16px 5px}
+.msg-content[data-side="user"]{color:var(--b8,#f0e6ff);background-image:linear-gradient(0deg,var(--b2,#ffffff) 0 100%),linear-gradient(0deg,var(--b3,#ffe9a8) 0 100%),linear-gradient(0deg,var(--b4,#b9c8ff) 0 100%),linear-gradient(0deg,var(--b2,#ffffff) 0 100%),linear-gradient(0deg,var(--b3,#ffe9a8) 0 100%),linear-gradient(202deg,var(--b13,rgba(255,255,255,0.14)) 0%,var(--b14,rgba(0,0,0,0)) 44%),radial-gradient(130% 100% at 74% 0%,var(--b9,#3a2c6b) 0%,var(--b10,#241d4a) 46%,var(--b11,#150f2c) 100%);background-size:2px 2px,3px 3px,2px 2px,2px 2px,3px 3px,100% 100%,100% 100%;background-repeat:no-repeat;background-position:calc(100% - 15px) 5px,calc(100% - 40px) 9px,calc(100% - 64px) 4px,20px calc(100% - 5px),44px calc(100% - 4px),0 0,0 0;border-radius:16px 16px 5px 16px}
+.msg-content[data-side="ai"]::after{content:"";position:absolute;left:-6px;top:-8px;width:14px;height:14px;pointer-events:none;background-image:linear-gradient(0deg,var(--b3,#ffe9a8) 0 100%);clip-path:polygon(50% 0,58% 40%,100% 50%,58% 60%,50% 100%,42% 60%,0 50%,42% 40%);filter:drop-shadow(0 0 1px rgba(184,132,26,0.85)) drop-shadow(0 0 4px rgba(255,224,130,0.95));animation:b281-c281twink 3.8s ease-in-out infinite}
+.msg-content[data-side="user"]::after{content:"";position:absolute;right:-6px;top:-8px;width:14px;height:14px;pointer-events:none;background-image:linear-gradient(0deg,var(--b3,#ffe9a8) 0 100%);clip-path:polygon(50% 0,58% 40%,100% 50%,58% 60%,50% 100%,42% 60%,0 50%,42% 40%);filter:drop-shadow(0 0 1px rgba(184,132,26,0.85)) drop-shadow(0 0 4px rgba(255,224,130,0.95));animation:b281-c281twink 4.6s ease-in-out infinite}
+}
+
+/* 282 Heart Locket */
+@keyframes b282-an282-beat{0%, 100% { transform: scale(1); } 50% { transform: scale(1.09); }}
+@scope ([data-bubble="282"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#e8dbf2);--cai-tx:var(--bub-ai-tx,#3d2350)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#d5c1ea);--cai-tx:var(--bub-user-tx,#35204a)}
+.msg-content{position:relative;overflow:visible;border:1px solid var(--b11,rgba(255,255,255,0.7));box-shadow:0 1px 2px rgba(120,90,150,0.18),0 7px 16px rgba(120,90,150,0.26),inset 0 1px 0 rgba(255,255,255,0.9),inset 0 -8px 14px rgba(110,80,140,0.18)}
+.msg-content[data-side="ai"]{color:var(--b1,#3d2350);background-image:linear-gradient(148deg,var(--b12,rgba(255,255,255,0.55)) 0%,var(--b13,rgba(0,0,0,0)) 34%,var(--b13,rgba(0,0,0,0)) 66%,var(--b14,rgba(255,255,255,0.28)) 100%),linear-gradient(160deg,var(--b2,#f7f1fb) 0%,var(--b3,#e8dbf2) 52%,var(--b4,#d5c1ea) 100%);border-radius:18px 18px 18px 6px}
+.msg-content[data-side="user"]{color:var(--b5,#35204a);background-image:linear-gradient(212deg,var(--b12,rgba(255,255,255,0.55)) 0%,var(--b13,rgba(0,0,0,0)) 34%,var(--b13,rgba(0,0,0,0)) 66%,var(--b14,rgba(255,255,255,0.28)) 100%),linear-gradient(160deg,var(--b6,#e6d9f1) 0%,var(--b4,#d5c1ea) 52%,var(--b7,#bda4d8) 100%);border-radius:18px 18px 6px 18px}
+.msg-content[data-side="ai"]::after{content:"";position:absolute;left:-2px;top:-8px;width:16px;height:15px;pointer-events:none;background-image:linear-gradient(145deg,var(--b8,#f2c8b6) 0%,var(--b9,#d68f76) 46%,var(--b10,#b06a52) 100%);clip-path:polygon(50% 100%,8% 62%,0 36%,4% 16%,18% 6%,34% 8%,50% 24%,66% 8%,82% 6%,96% 16%,100% 36%,92% 62%);filter:drop-shadow(0 1px 2px rgba(90,55,80,0.5))}
+.msg-content[data-side="user"]::after{content:"";position:absolute;right:-2px;top:-8px;width:16px;height:15px;pointer-events:none;background-image:linear-gradient(215deg,var(--b8,#f2c8b6) 0%,var(--b9,#d68f76) 46%,var(--b10,#b06a52) 100%);clip-path:polygon(50% 100%,8% 62%,0 36%,4% 16%,18% 6%,34% 8%,50% 24%,66% 8%,82% 6%,96% 16%,100% 36%,92% 62%);filter:drop-shadow(0 1px 2px rgba(90,55,80,0.5))}
+.msg-content[data-side="ai"]::after,.msg-content[data-side="user"]::after{transform-origin: 50% 55%; animation: b282-an282-beat 12s ease-in-out infinite;}
+}
+
+/* 283 Ribbon Wrap */
+@scope ([data-bubble="283"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f9ece2);--cai-tx:var(--bub-ai-tx,#4a3327)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#f4dee4);--cai-tx:var(--bub-user-tx,#4a2430)}
+.msg-content{position:relative;overflow:hidden;border:1px solid var(--b11,rgba(255,255,255,0.85));box-shadow:0 1px 2px rgba(170,140,130,0.16),0 6px 15px rgba(170,140,130,0.24),inset 0 1px 0 rgba(255,255,255,0.95),inset 0 -8px 14px rgba(180,145,135,0.16)}
+.msg-content[data-side="ai"]{color:var(--b1,#4a3327);background-image:linear-gradient(160deg,var(--b12,rgba(255,255,255,0.6)) 0%,var(--b13,rgba(0,0,0,0)) 42%),linear-gradient(180deg,var(--b2,#fffaf6) 0%,var(--b3,#f9ece2) 58%,var(--b4,#f0dbcd) 100%);border-radius:16px 16px 16px 5px}
+.msg-content[data-side="user"]{color:var(--b5,#4a2430);background-image:linear-gradient(200deg,var(--b12,rgba(255,255,255,0.6)) 0%,var(--b13,rgba(0,0,0,0)) 42%),linear-gradient(180deg,var(--b6,#fdf3f6) 0%,var(--b7,#f4dee4) 58%,var(--b8,#e9c7d2) 100%);border-radius:16px 16px 5px 16px}
+.msg-content[data-side="ai"]::before{content:"";position:absolute;left:-24px;top:-1px;width:58px;height:9px;pointer-events:none;transform:rotate(-45deg);background-image:linear-gradient(180deg,var(--b13,rgba(0,0,0,0)) 20%,var(--b14,rgba(255,255,255,0.5)) 46%,var(--b13,rgba(0,0,0,0)) 68%),linear-gradient(180deg,var(--b9,#e7a3b6) 0%,var(--b10,#cd7a92) 100%);box-shadow:0 1px 3px rgba(140,80,100,0.3)}
+.msg-content[data-side="user"]::before{content:"";position:absolute;right:-24px;top:-1px;width:58px;height:9px;pointer-events:none;transform:rotate(45deg);background-image:linear-gradient(180deg,var(--b13,rgba(0,0,0,0)) 20%,var(--b14,rgba(255,255,255,0.5)) 46%,var(--b13,rgba(0,0,0,0)) 68%),linear-gradient(180deg,var(--b9,#e7a3b6) 0%,var(--b10,#cd7a92) 100%);box-shadow:0 1px 3px rgba(140,80,100,0.3)}
+}
+
+/* 284 Gift Box */
+@scope ([data-bubble="284"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f7eeda);--cai-tx:var(--bub-ai-tx,#4a3512)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#eddcb0);--cai-tx:var(--bub-user-tx,#45300c)}
+.msg-content{position:relative;overflow:visible;border:1px solid var(--b13,rgba(255,255,255,0.7));box-shadow:0 1px 2px rgba(170,135,70,0.2),0 6px 16px rgba(170,135,70,0.28),inset 0 -8px 14px rgba(160,120,50,0.18)}
+.msg-content[data-side="ai"]{color:var(--b1,#4a3512);background-image:linear-gradient(180deg,var(--b14,rgba(120,90,30,0.28)) 0 1px,var(--b15,rgba(0,0,0,0)) 1px),linear-gradient(180deg,var(--b16,rgba(255,246,220,0.75)) 0 1px,var(--b15,rgba(0,0,0,0)) 1px),linear-gradient(180deg,var(--b2,#e6c684) 0 12px,var(--b15,rgba(0,0,0,0)) 12px),repeating-linear-gradient(135deg,var(--b17,rgba(150,115,50,0.1)) 0 5px,var(--b15,rgba(0,0,0,0)) 5px 10px),linear-gradient(180deg,var(--b3,#fffaf0) 0%,var(--b4,#f7eeda) 55%,var(--b5,#ecdcbb) 100%);background-size:100% 100%,100% 100%,100% 100%,100% 100%,100% 100%;background-position:0 12px,0 0,0 0,0 0,0 0;background-repeat:no-repeat;border-radius:14px 14px 14px 4px}
+.msg-content[data-side="user"]{color:var(--b6,#45300c);background-image:linear-gradient(180deg,var(--b14,rgba(120,90,30,0.28)) 0 1px,var(--b15,rgba(0,0,0,0)) 1px),linear-gradient(180deg,var(--b16,rgba(255,246,220,0.75)) 0 1px,var(--b15,rgba(0,0,0,0)) 1px),linear-gradient(180deg,var(--b7,#d9b062) 0 12px,var(--b15,rgba(0,0,0,0)) 12px),repeating-linear-gradient(45deg,var(--b17,rgba(150,115,50,0.1)) 0 5px,var(--b15,rgba(0,0,0,0)) 5px 10px),linear-gradient(180deg,var(--b8,#f8efd6) 0%,var(--b9,#eddcb0) 55%,var(--b10,#dcc68d) 100%);background-size:100% 100%,100% 100%,100% 100%,100% 100%,100% 100%;background-position:0 12px,0 0,0 0,0 0,0 0;background-repeat:no-repeat;border-radius:14px 14px 4px 14px}
+.msg-content[data-side="ai"]::after{content:"";position:absolute;left:12px;top:-4px;width:22px;height:14px;pointer-events:none;background-image:radial-gradient(2.4px 2.4px at 11px 6px,var(--b11,#8f6a22) 0 100%,var(--b15,rgba(0,0,0,0)) 101%),radial-gradient(5.2px 4.2px at 5.6px 5.4px,var(--b12,#f0d089) 0 100%,var(--b15,rgba(0,0,0,0)) 101%),radial-gradient(5.2px 4.2px at 16.4px 5.4px,var(--b12,#f0d089) 0 100%,var(--b15,rgba(0,0,0,0)) 101%),radial-gradient(2px 4.2px at 8.2px 10.4px,var(--b11,#8f6a22) 0 100%,var(--b15,rgba(0,0,0,0)) 101%),radial-gradient(2px 4.2px at 13.8px 10.4px,var(--b11,#8f6a22) 0 100%,var(--b15,rgba(0,0,0,0)) 101%);filter:drop-shadow(0 1px 1px rgba(120,88,30,0.45))}
+.msg-content[data-side="user"]::after{content:"";position:absolute;right:12px;top:-4px;width:22px;height:14px;pointer-events:none;background-image:radial-gradient(2.4px 2.4px at 11px 6px,var(--b11,#8f6a22) 0 100%,var(--b15,rgba(0,0,0,0)) 101%),radial-gradient(5.2px 4.2px at 5.6px 5.4px,var(--b12,#f0d089) 0 100%,var(--b15,rgba(0,0,0,0)) 101%),radial-gradient(5.2px 4.2px at 16.4px 5.4px,var(--b12,#f0d089) 0 100%,var(--b15,rgba(0,0,0,0)) 101%),radial-gradient(2px 4.2px at 8.2px 10.4px,var(--b11,#8f6a22) 0 100%,var(--b15,rgba(0,0,0,0)) 101%),radial-gradient(2px 4.2px at 13.8px 10.4px,var(--b11,#8f6a22) 0 100%,var(--b15,rgba(0,0,0,0)) 101%);filter:drop-shadow(0 1px 1px rgba(120,88,30,0.45))}
+}
+
+/* 285 Crown VIP */
+@keyframes b285-an285-foil{0%, 100% { background-position: 0 0, 0 0, 0% 50%; } 50% { background-position: 0 0, 0 0, 100% 50%; }}
+@scope ([data-bubble="285"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#16130d);--cai-tx:var(--bub-ai-tx,#f6e3ae)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#241c10);--cai-tx:var(--bub-user-tx,#ffeec2)}
+.msg-content{position:relative;overflow:visible;border:2px solid var(--b14,rgba(0,0,0,0));box-shadow:0 2px 5px rgba(0,0,0,0.4),0 9px 22px rgba(0,0,0,0.48),inset 0 1px 0 rgba(255,235,180,0.2);transition:box-shadow 0.35s ease}
+.msg-content:hover{box-shadow:0 3px 7px rgba(0,0,0,0.45),0 12px 28px rgba(0,0,0,0.55),inset 0 1px 0 rgba(255,235,180,0.34)}
+.msg-content[data-side="ai"]{color:var(--b1,#f6e3ae);background-image:radial-gradient(120% 100% at 26% 4%,var(--b15,rgba(255,226,150,0.12)) 0%,var(--b14,rgba(0,0,0,0)) 62%),linear-gradient(180deg,var(--b2,#1e1912) 0%,var(--b3,#16130d) 52%,var(--b4,#0d0b07) 100%),linear-gradient(135deg,var(--b5,#f7e39a) 0%,var(--b6,#b8862f) 34%,var(--b7,#fff2c4) 54%,var(--b8,#a9762a) 78%,var(--b5,#f7e39a) 100%);background-origin:padding-box,padding-box,border-box;background-clip:padding-box,padding-box,border-box;border-radius:16px 16px 16px 5px}
+.msg-content[data-side="user"]{color:var(--b9,#ffeec2);background-image:radial-gradient(120% 100% at 74% 4%,var(--b15,rgba(255,226,150,0.12)) 0%,var(--b14,rgba(0,0,0,0)) 62%),linear-gradient(180deg,var(--b10,#2e2415) 0%,var(--b11,#241c10) 52%,var(--b12,#150f07) 100%),linear-gradient(315deg,var(--b5,#f7e39a) 0%,var(--b6,#b8862f) 34%,var(--b7,#fff2c4) 54%,var(--b8,#a9762a) 78%,var(--b5,#f7e39a) 100%);background-origin:padding-box,padding-box,border-box;background-clip:padding-box,padding-box,border-box;border-radius:16px 16px 5px 16px}
+.msg-content[data-side="ai"]::after{content:"";position:absolute;left:3px;top:-10px;width:23px;height:13px;pointer-events:none;background-image:linear-gradient(180deg,var(--b7,#fff2c4) 0%,var(--b13,#e0b756) 44%,var(--b6,#b8862f) 100%);clip-path:polygon(0 100%,0 26%,22% 58%,50% 0,78% 58%,100% 26%,100% 100%);filter:drop-shadow(0 1px 2px rgba(0,0,0,0.6))}
+.msg-content[data-side="user"]::after{content:"";position:absolute;right:3px;top:-10px;width:23px;height:13px;pointer-events:none;background-image:linear-gradient(180deg,var(--b7,#fff2c4) 0%,var(--b13,#e0b756) 44%,var(--b6,#b8862f) 100%);clip-path:polygon(0 100%,0 26%,22% 58%,50% 0,78% 58%,100% 26%,100% 100%);filter:drop-shadow(0 1px 2px rgba(0,0,0,0.6))}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{background-size: 100% 100%, 100% 100%, 320% 320%; animation: b285-an285-foil 30s ease-in-out infinite;}
+}
+
+/* 286 Diamond Facet */
+@keyframes b286-c286glint{0%,100%{opacity:0.6}50%{opacity:1}}
+@scope ([data-bubble="286"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#e4eefc);--cai-tx:var(--bub-ai-tx,#14263d)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#cadef5);--cai-tx:var(--bub-user-tx,#10203a)}
+.msg-content{position:relative;overflow:visible;border:1px solid var(--b11,rgba(255,255,255,0.95));box-shadow:0 1px 2px rgba(90,130,180,0.2),0 7px 16px rgba(90,130,180,0.28),inset 0 1px 0 rgba(255,255,255,1),inset 0 0 0 1px rgba(255,255,255,0.55),inset 0 -1px 0 rgba(120,160,205,0.55)}
+.msg-content[data-side="ai"]{color:var(--b1,#14263d);background-image:linear-gradient(180deg,var(--b12,rgba(255,255,255,0.55)) 0%,var(--b13,rgba(0,0,0,0)) 34%),conic-gradient(from 214deg at 26% 4%,var(--b2,#f8fcff) 0deg 44deg,var(--b3,#e4eefc) 44deg 88deg,var(--b4,#ffffff) 88deg 132deg,var(--b5,#dae8fa) 132deg 176deg,var(--b6,#f2f8ff) 176deg 220deg,var(--b3,#e4eefc) 220deg 266deg,var(--b4,#ffffff) 266deg 312deg,var(--b5,#dae8fa) 312deg 360deg);border-radius:14px 14px 14px 4px}
+.msg-content[data-side="user"]{color:var(--b7,#10203a);background-image:linear-gradient(180deg,var(--b14,rgba(255,255,255,0.45)) 0%,var(--b13,rgba(0,0,0,0)) 34%),conic-gradient(from 326deg at 74% 4%,var(--b8,#eef6ff) 0deg 44deg,var(--b9,#cadef5) 44deg 88deg,var(--b2,#f8fcff) 88deg 132deg,var(--b10,#bed6f1) 132deg 176deg,var(--b3,#e4eefc) 176deg 220deg,var(--b9,#cadef5) 220deg 266deg,var(--b2,#f8fcff) 266deg 312deg,var(--b10,#bed6f1) 312deg 360deg);border-radius:14px 14px 4px 14px}
+.msg-content[data-side="ai"]::after{content:"";position:absolute;left:-5px;top:-8px;width:15px;height:15px;pointer-events:none;background-image:linear-gradient(0deg,var(--b4,#ffffff) 0 100%);clip-path:polygon(50% 0,57% 43%,100% 50%,57% 57%,50% 100%,43% 57%,0 50%,43% 43%);filter:drop-shadow(0 0 1px rgba(55,125,210,0.95)) drop-shadow(0 0 4px rgba(95,160,230,0.9));animation:b286-c286glint 3.6s ease-in-out infinite}
+.msg-content[data-side="user"]::after{content:"";position:absolute;right:-5px;top:-8px;width:15px;height:15px;pointer-events:none;background-image:linear-gradient(0deg,var(--b4,#ffffff) 0 100%);clip-path:polygon(50% 0,57% 43%,100% 50%,57% 57%,50% 100%,43% 57%,0 50%,43% 43%);filter:drop-shadow(0 0 1px rgba(55,125,210,0.95)) drop-shadow(0 0 4px rgba(95,160,230,0.9));animation:b286-c286glint 4.4s ease-in-out infinite}
+}
+
+/* 287 Rose Gold */
+@keyframes b287-c287glint{0%{background-position:0 0,0 0}100%{background-position:220px 0,0 0}}
+@scope ([data-bubble="287"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#eec0ab);--cai-tx:var(--bub-ai-tx,#4a2318)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#e0a68e);--cai-tx:var(--bub-user-tx,#411c12)}
+.msg-content{position:relative;overflow:hidden;border:1px solid var(--b10,rgba(255,255,255,0.55));box-shadow:0 1px 2px rgba(160,105,85,0.24),0 8px 18px rgba(160,105,85,0.32),inset 0 1px 0 rgba(255,255,255,0.9),inset 0 -1px 0 rgba(150,95,70,0.45)}
+.msg-content[data-side="ai"]{color:var(--b1,#4a2318);background-image:linear-gradient(104deg,var(--b11,rgba(0,0,0,0)) 0 38%,var(--b12,rgba(255,255,255,0.5)) 48%,var(--b13,rgba(255,255,255,0.08)) 54%,var(--b11,rgba(0,0,0,0)) 62%),linear-gradient(148deg,var(--b2,#fbe6dc) 0%,var(--b3,#eec0ab) 20%,var(--b2,#fbe6dc) 36%,var(--b4,#d9977e) 56%,var(--b2,#fbe6dc) 72%,var(--b5,#c9866c) 88%,var(--b3,#eec0ab) 100%);background-size:220px 100%,100% 100%;background-repeat:repeat-x,no-repeat;animation:b287-c287glint 8.5s linear infinite;border-radius:18px 18px 18px 6px}
+.msg-content[data-side="user"]{color:var(--b6,#411c12);background-image:linear-gradient(104deg,var(--b11,rgba(0,0,0,0)) 0 38%,var(--b12,rgba(255,255,255,0.5)) 48%,var(--b13,rgba(255,255,255,0.08)) 54%,var(--b11,rgba(0,0,0,0)) 62%),linear-gradient(212deg,var(--b7,#f5d3c5) 0%,var(--b8,#e0a68e) 20%,var(--b7,#f5d3c5) 36%,var(--b5,#c9866c) 56%,var(--b7,#f5d3c5) 72%,var(--b9,#b57058) 88%,var(--b8,#e0a68e) 100%);background-size:220px 100%,100% 100%;background-repeat:repeat-x,no-repeat;animation:b287-c287glint 11s linear infinite;border-radius:18px 18px 6px 18px}
+}
+
+/* 288 Champagne */
+@keyframes b288-c288flute{0%{background-position:1px 0,1px 0,1px 0,0 0,0 0,0 0}100%{background-position:1px -24px,1px -18px,1px -30px,0 0,0 0,0 0}}
+@keyframes b288-c288pour{0%{background-position:calc(100% - 1px) 0,calc(100% - 1px) 0,calc(100% - 1px) 0,0 0,0 0,0 0}100%{background-position:calc(100% - 1px) -22px,calc(100% - 1px) -17px,calc(100% - 1px) -28px,0 0,0 0,0 0}}
+@scope ([data-bubble="288"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f4e2b0);--cai-tx:var(--bub-ai-tx,#453409)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#e6cd8c);--cai-tx:var(--bub-user-tx,#3f2f08)}
+.msg-content{position:relative;overflow:hidden;border:1px solid var(--b9,rgba(255,244,205,0.8));box-shadow:0 1px 2px rgba(150,120,50,0.24),0 9px 20px rgba(150,120,50,0.32),inset 0 1px 0 rgba(255,255,250,1),inset 0 -1px 0 rgba(140,108,38,0.45),inset 0 -12px 18px rgba(150,115,38,0.22)}
+.msg-content[data-side="ai"]{color:var(--b1,#453409);background-image:radial-gradient(circle at 5px 7px,var(--b10,rgba(255,255,255,0.9)) 0 1.8px,var(--b11,rgba(0,0,0,0)) 2.4px),radial-gradient(circle at 9px 11px,var(--b12,rgba(255,255,255,0.7)) 0 1.2px,var(--b11,rgba(0,0,0,0)) 1.7px),radial-gradient(circle at 3px 15px,var(--b13,rgba(255,255,255,0.55)) 0 0.9px,var(--b11,rgba(0,0,0,0)) 1.4px),linear-gradient(180deg,var(--b10,rgba(255,255,255,0.9)) 0 1.5px,var(--b14,rgba(255,255,255,0.32)) 1.5px 3px,var(--b11,rgba(0,0,0,0)) 3px),radial-gradient(95% 62% at 20% 0%,var(--b15,rgba(255,255,255,0.62)) 0%,var(--b11,rgba(0,0,0,0)) 62%),linear-gradient(180deg,var(--b2,#fff8e3) 0%,var(--b3,#f4e2b0) 46%,var(--b4,#d9b96e) 100%);background-size:13px 24px,13px 18px,13px 30px,100% 100%,100% 100%,100% 100%;background-repeat:repeat-y,repeat-y,repeat-y,no-repeat,no-repeat,no-repeat;animation:b288-c288flute 9s linear infinite;border-radius:18px 18px 18px 6px}
+.msg-content[data-side="user"]{color:var(--b5,#3f2f08);background-image:radial-gradient(circle at 8px 7px,var(--b10,rgba(255,255,255,0.9)) 0 1.8px,var(--b11,rgba(0,0,0,0)) 2.4px),radial-gradient(circle at 4px 11px,var(--b12,rgba(255,255,255,0.7)) 0 1.2px,var(--b11,rgba(0,0,0,0)) 1.7px),radial-gradient(circle at 10px 15px,var(--b13,rgba(255,255,255,0.55)) 0 0.9px,var(--b11,rgba(0,0,0,0)) 1.4px),linear-gradient(180deg,var(--b10,rgba(255,255,255,0.9)) 0 1.5px,var(--b14,rgba(255,255,255,0.32)) 1.5px 3px,var(--b11,rgba(0,0,0,0)) 3px),radial-gradient(95% 62% at 80% 0%,var(--b15,rgba(255,255,255,0.62)) 0%,var(--b11,rgba(0,0,0,0)) 62%),linear-gradient(180deg,var(--b6,#f8ecc6) 0%,var(--b7,#e6cd8c) 46%,var(--b8,#c9a352) 100%);background-size:13px 22px,13px 17px,13px 28px,100% 100%,100% 100%,100% 100%;background-repeat:repeat-y,repeat-y,repeat-y,no-repeat,no-repeat,no-repeat;animation:b288-c288pour 11s linear infinite;border-radius:18px 18px 6px 18px}
+}
+
+/* 289 Onyx Marble */
+@keyframes b289-an289-polish{0%, 100% { background-position: 0 0, 0 0, 0 0, 0 0, 10% 20%, 0 0; } 50% { background-position: 0 0, 0 0, 0 0, 0 0, 62% 4%, 0 0; }}
+@scope ([data-bubble="289"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#1c1c21);--cai-tx:var(--bub-ai-tx,#f0e3c2)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#26252d);--cai-tx:var(--bub-user-tx,#f7ecd0)}
+.msg-content{position:relative;overflow:hidden;border:1px solid var(--b9,rgba(214,178,92,0.32));box-shadow:0 2px 5px rgba(0,0,0,0.42),0 12px 28px rgba(0,0,0,0.5),inset 0 1px 0 rgba(255,240,200,0.16),inset 0 -1px 0 rgba(0,0,0,0.5)}
+.msg-content[data-side="ai"]{color:var(--b1,#f0e3c2);background-image:radial-gradient(150% 90% at 6% 120%,var(--b10,rgba(0,0,0,0)) 57.2%,var(--b11,rgba(232,200,118,0.6)) 58.1%,var(--b10,rgba(0,0,0,0)) 59.3%),radial-gradient(120% 130% at 94% -22%,var(--b10,rgba(0,0,0,0)) 61.8%,var(--b12,rgba(232,200,118,0.26)) 62.4%,var(--b10,rgba(0,0,0,0)) 63.4%),radial-gradient(180% 70% at 42% 142%,var(--b10,rgba(0,0,0,0)) 70.8%,var(--b13,rgba(184,148,63,0.34)) 71.6%,var(--b10,rgba(0,0,0,0)) 72.5%),linear-gradient(72deg,var(--b10,rgba(0,0,0,0)) 46.3%,var(--b14,rgba(232,200,118,0.16)) 46.8%,var(--b10,rgba(0,0,0,0)) 47.2%),radial-gradient(120% 90% at 24% 2%,var(--b15,rgba(255,255,255,0.11)) 0%,var(--b10,rgba(0,0,0,0)) 58%),radial-gradient(140% 110% at 26% 6%,var(--b2,#2b2b33) 0%,var(--b3,#1c1c21) 48%,var(--b4,#0c0c0f) 100%);border-radius:16px 16px 16px 5px}
+.msg-content[data-side="user"]{color:var(--b5,#f7ecd0);background-image:radial-gradient(150% 90% at 94% 120%,var(--b10,rgba(0,0,0,0)) 57.2%,var(--b11,rgba(232,200,118,0.6)) 58.1%,var(--b10,rgba(0,0,0,0)) 59.3%),radial-gradient(120% 130% at 6% -22%,var(--b10,rgba(0,0,0,0)) 61.8%,var(--b12,rgba(232,200,118,0.26)) 62.4%,var(--b10,rgba(0,0,0,0)) 63.4%),radial-gradient(180% 70% at 58% 142%,var(--b10,rgba(0,0,0,0)) 70.8%,var(--b13,rgba(184,148,63,0.34)) 71.6%,var(--b10,rgba(0,0,0,0)) 72.5%),linear-gradient(-72deg,var(--b10,rgba(0,0,0,0)) 46.3%,var(--b14,rgba(232,200,118,0.16)) 46.8%,var(--b10,rgba(0,0,0,0)) 47.2%),radial-gradient(120% 90% at 76% 2%,var(--b15,rgba(255,255,255,0.11)) 0%,var(--b10,rgba(0,0,0,0)) 58%),radial-gradient(140% 110% at 74% 6%,var(--b6,#37363f) 0%,var(--b7,#26252d) 48%,var(--b8,#141419) 100%);border-radius:16px 16px 5px 16px}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{background-size: 100% 100%, 100% 100%, 100% 100%, 100% 100%, 150% 150%, 100% 100%; animation: b289-an289-polish 34s ease-in-out infinite;}
+}
+
+/* 290 Velvet Pearl */
+@keyframes b290-an290-sheen{0%, 100% { background-position: 0% 0%, 0 0, 0 0; } 50% { background-position: 100% 0%, 0 0, 0 0; }}
+@scope ([data-bubble="290"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#2e1a34);--cai-tx:var(--bub-ai-tx,#f6e6ef)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#3d2030);--cai-tx:var(--bub-user-tx,#ffeaf0)}
+.msg-content{position:relative;overflow:visible;border:1px solid var(--b13,rgba(255,255,255,0.14));box-shadow:0 2px 5px rgba(20,6,20,0.45),0 12px 26px rgba(20,6,20,0.55),inset 0 1px 0 rgba(255,255,255,0.14),inset 0 -1px 0 rgba(0,0,0,0.4)}
+.msg-content[data-side="ai"]{color:var(--b1,#f6e6ef);background-image:linear-gradient(112deg,var(--b14,rgba(255,214,238,0.11)) 0%,var(--b15,rgba(0,0,0,0)) 32%,var(--b15,rgba(0,0,0,0)) 68%,var(--b14,rgba(255,214,238,0.11)) 100%),radial-gradient(150% 130% at 50% 44%,var(--b15,rgba(0,0,0,0)) 30%,var(--b16,rgba(255,214,238,0.09)) 74%,var(--b17,rgba(255,214,238,0.21)) 100%),radial-gradient(130% 100% at 28% 2%,var(--b2,#452551) 0%,var(--b3,#2e1a34) 52%,var(--b4,#1a0e1f) 100%);border-radius:18px 18px 18px 6px}
+.msg-content[data-side="user"]{color:var(--b5,#ffeaf0);background-image:linear-gradient(248deg,var(--b14,rgba(255,214,238,0.11)) 0%,var(--b15,rgba(0,0,0,0)) 32%,var(--b15,rgba(0,0,0,0)) 68%,var(--b14,rgba(255,214,238,0.11)) 100%),radial-gradient(150% 130% at 50% 44%,var(--b15,rgba(0,0,0,0)) 30%,var(--b16,rgba(255,214,238,0.09)) 74%,var(--b17,rgba(255,214,238,0.21)) 100%),radial-gradient(130% 100% at 72% 2%,var(--b6,#572c43) 0%,var(--b7,#3d2030) 52%,var(--b8,#231320) 100%);border-radius:18px 18px 6px 18px}
+.msg-content[data-side="ai"]::after{content:"";position:absolute;left:-3px;top:-8px;width:15px;height:15px;border-radius:50%;pointer-events:none;background-image:radial-gradient(circle at 4.8px 3.9px,var(--b9,#ffffff) 0 1.6px,var(--b15,rgba(0,0,0,0)) 3.9px),radial-gradient(120% 120% at 34% 26%,var(--b10,#fbf1f6) 0%,var(--b11,#e2ccda) 44%,var(--b12,#b193a4) 100%);box-shadow:0 2px 5px rgba(0,0,0,0.6),inset 0 -1px 2px rgba(110,88,102,0.55)}
+.msg-content[data-side="user"]::after{content:"";position:absolute;right:-3px;top:-8px;width:15px;height:15px;border-radius:50%;pointer-events:none;background-image:radial-gradient(circle at 4.8px 3.9px,var(--b9,#ffffff) 0 1.6px,var(--b15,rgba(0,0,0,0)) 3.9px),radial-gradient(120% 120% at 34% 26%,var(--b10,#fbf1f6) 0%,var(--b11,#e2ccda) 44%,var(--b12,#b193a4) 100%);box-shadow:0 2px 5px rgba(0,0,0,0.6),inset 0 -1px 2px rgba(110,88,102,0.55)}
+.msg-content[data-side="ai"],.msg-content[data-side="user"]{background-size: 260% 100%, 100% 100%, 100% 100%; animation: b290-an290-sheen 32s ease-in-out infinite;}
+}
+
+/* 291 Dawn Ridge */
+@keyframes b291-d291a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b291-d291b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="291"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#8794ac);--cai-tx:var(--bub-ai-tx,#16232e)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#8794ac);--cai-tx:var(--bub-user-tx,#16232e)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 0 rgba(255,255,255,0.6);background:linear-gradient(180deg,var(--b13,rgba(255,255,255,0.18)) 0%,var(--b14,rgba(255,255,255,0.38)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,44%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,44L18,11L33,25L52,6L70,27L86,15L104,29L120,13L120,44Z%22%20fill=%22%237f92b0%22/%3E%3Cpath%20d=%22M0,44L15,28L31,37L49,23L67,35L83,27L101,39L120,26L120,44Z%22%20fill=%22%2356688a%22/%3E%3C/svg%3E) 0% 100%/100% 50% no-repeat,radial-gradient(circle closest-side,var(--b1,#fff3d0) 0 98%,transparent 99%) 78% 60%/46px 46px no-repeat,linear-gradient(180deg,var(--b2,#b9d6ea),var(--b3,#ffd0a6) 55%,var(--b4,#ffb489)) 0% 0%/100% 100% no-repeat var(--b4,#ffb489) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-28px;right:18px;width:40px;height:53px;clip-path:polygon(50% 0,100% 100%,0 100%);animation:b291-d291b 34s ease-in-out infinite alternate;background:var(--b5,#56688a);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-22px;left:24%;width:43px;height:14px;border-radius:6px;animation:b291-d291a 26s ease-in-out infinite alternate;background:var(--b6,#7f92b0);box-shadow:16px -6px 0 -2px #7f92b0,-14px 3px 0 -3px #7f92b0;}
+.msg-content[data-side="ai"]{border-radius:20px 20px 20px 6px}
+.msg-content[data-side="user"]{border-radius:20px 20px 6px 20px;background-position:0% 0%,100% 100%,22% 60%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{color:var(--b7,#eaf1ff) !important;text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b15,rgba(6,10,24,0.42)) 0%,var(--b16,rgba(6,10,24,0.22)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,44%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,44L18,11L33,25L52,6L70,27L86,15L104,29L120,13L120,44Z%22%20fill=%22%23131d40%22/%3E%3Cpath%20d=%22M0,44L15,28L31,37L49,23L67,35L83,27L101,39L120,26L120,44Z%22%20fill=%22%23080e26%22/%3E%3C/svg%3E) 0% 100%/100% 50% no-repeat,radial-gradient(circle closest-side,var(--b8,#888cae) 0 98%,transparent 99%) 78% 60%/40px 40px no-repeat,linear-gradient(180deg,var(--b9,#0a1230),var(--b10,#1b2551) 55%,var(--b11,#33305c)) 0% 0%/100% 100% no-repeat var(--b11,#33305c) !important}
+:is(:scope.dark,.dark :scope) .msg-content *{color:var(--b7,#eaf1ff) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b12,#dde7ff);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b12,#dde7ff);box-shadow:10px -4px 0 -1px #dde7ff,-9px 2px 0 -2px #dde7ff;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,22% 60%,0% 0% !important}
+}
+
+/* 292 Gold Vale */
+@keyframes b292-d292a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b292-d292b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="292"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#a38867);--cai-tx:var(--bub-ai-tx,#2b1a08)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#a38867);--cai-tx:var(--bub-user-tx,#2b1a08)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 0 rgba(255,255,255,0.6);background:linear-gradient(180deg,var(--b10,rgba(255,255,255,0.21)) 0%,var(--b11,rgba(255,255,255,0.41)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,22Q26,6,52,20Q78,33,120,14L120,40Z%22%20fill=%22%23a3702f%22/%3E%3Cpath%20d=%22M0,40L0,32Q30,20,60,31Q90,41,120,28L120,40Z%22%20fill=%22%2377501f%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,linear-gradient(180deg,var(--b1,#ffe7b0),var(--b2,#ffc178) 52%,var(--b3,#f79f6a)) 0% 0%/100% 100% no-repeat var(--b3,#f79f6a) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:20px;width:53px;height:53px;border-radius:50%;animation:b292-d292b 32s ease-in-out infinite alternate;background:var(--b4,#ef9f3c);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-20px;left:24%;width:47px;height:19px;animation:b292-d292a 30s ease-in-out infinite alternate;background:url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,30,12%22%3E%3Cpath%20d=%22M2,8q4,-5,8,0q4,-5,8,0%22%20fill=%22none%22%20stroke=%22%2377501f%22%20stroke-width=%221.4%22/%3E%3Cpath%20d=%22M17,4q3,-4,6,0q3,-4,6,0%22%20fill=%22none%22%20stroke=%22%2377501f%22%20stroke-width=%221.2%22/%3E%3C/svg%3E) 0% 0%/100% 100% no-repeat;}
+.msg-content[data-side="ai"]{border-radius:22px 22px 22px 6px}
+.msg-content[data-side="user"]{border-radius:22px 22px 6px 22px;background-position:0% 0%,100% 100%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{color:var(--b5,#f6eddd) !important;text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b12,rgba(6,10,24,0.38)) 0%,var(--b13,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,22Q26,6,52,20Q78,33,120,14L120,40Z%22%20fill=%22%23241a34%22/%3E%3Cpath%20d=%22M0,40L0,32Q30,20,60,31Q90,41,120,28L120,40Z%22%20fill=%22%23150e20%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,linear-gradient(180deg,var(--b6,#12102a),var(--b7,#2a1f45) 52%,var(--b8,#43264a)) 0% 0%/100% 100% no-repeat var(--b8,#43264a) !important}
+:is(:scope.dark,.dark :scope) .msg-content *{color:var(--b5,#f6eddd) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b9,#f2e5c6);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,30,12%22%3E%3Cpath%20d=%22M2,8q4,-5,8,0q4,-5,8,0%22%20fill=%22none%22%20stroke=%22%23f2e5c6%22%20stroke-width=%221.4%22/%3E%3Cpath%20d=%22M17,4q3,-4,6,0q3,-4,6,0%22%20fill=%22none%22%20stroke=%22%23f2e5c6%22%20stroke-width=%221.2%22/%3E%3C/svg%3E) 0% 0%/100% 100% no-repeat;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,0% 0% !important}
+}
+
+/* 293 Dusk Lake */
+@keyframes b293-d293a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b293-d293b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="293"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#806451);--cai-tx:var(--bub-ai-tx,#fdf3ff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#806451);--cai-tx:var(--bub-user-tx,#fdf3ff)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 3px rgba(5,9,20,0.75);background:linear-gradient(180deg,var(--b12,rgba(6,10,24,0.62)) 0%,var(--b13,rgba(6,10,24,0.42)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,32%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,32L0,12Q15,5,30,12T60,12T90,12T120,12L120,32Z%22%20fill=%22%237a4f74%22/%3E%3Cpath%20d=%22M0,32L0,22Q18,15,36,22T72,22T120,20L120,32Z%22%20fill=%22%234d3358%22/%3E%3C/svg%3E) 0% 100%/100% 38% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,44%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,44L18,11L33,25L52,6L70,27L86,15L104,29L120,13L120,44Z%22%20fill=%22%234a3560%22/%3E%3Cpath%20d=%22M0,44L15,28L31,37L49,23L67,35L83,27L101,39L120,26L120,44Z%22%20fill=%22%2333244a%22/%3E%3C/svg%3E) 0% 100%/100% 50% no-repeat,radial-gradient(circle closest-side,var(--b1,#f8bd89) 0 98%,transparent 99%) 50% 58%/44px 44px no-repeat,linear-gradient(180deg,var(--b2,#5d4a7a),var(--b3,#c0648a) 50%,var(--b4,#f0a06e)) 0% 0%/100% 100% no-repeat var(--b4,#f0a06e) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-28px;right:18px;width:40px;height:53px;clip-path:polygon(50% 0,100% 100%,0 100%);animation:b293-d293b 34s ease-in-out infinite alternate;background:var(--b5,#33244a);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-22px;left:24%;width:43px;height:14px;border-radius:6px;animation:b293-d293a 26s ease-in-out infinite alternate;background:var(--b6,#7a4f74);box-shadow:16px -6px 0 -2px #7a4f74,-14px 3px 0 -3px #7a4f74;}
+.msg-content[data-side="ai"]{border-radius:18px 18px 18px 5px}
+.msg-content[data-side="user"]{border-radius:18px 18px 5px 18px;background-position:0% 0%,100% 100%,100% 100%,50% 58%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b14,rgba(6,10,24,0.4)) 0%,var(--b15,rgba(6,10,24,0.2)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,32%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,32L0,12Q15,5,30,12T60,12T90,12T120,12L120,32Z%22%20fill=%22%231a1738%22/%3E%3Cpath%20d=%22M0,32L0,22Q18,15,36,22T72,22T120,20L120,32Z%22%20fill=%22%23100e26%22/%3E%3C/svg%3E) 0% 100%/100% 38% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,44%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,44L18,11L33,25L52,6L70,27L86,15L104,29L120,13L120,44Z%22%20fill=%22%23141130%22/%3E%3Cpath%20d=%22M0,44L15,28L31,37L49,23L67,35L83,27L101,39L120,26L120,44Z%22%20fill=%22%2308061a%22/%3E%3C/svg%3E) 0% 100%/100% 50% no-repeat,radial-gradient(circle closest-side,var(--b7,#8b81a8) 0 98%,transparent 99%) 50% 58%/38px 38px no-repeat,linear-gradient(180deg,var(--b8,#0a0c22),var(--b9,#1c1a3f) 50%,var(--b10,#2f2450)) 0% 0%/100% 100% no-repeat var(--b10,#2f2450) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b11,#e6ddff);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b11,#e6ddff);box-shadow:10px -4px 0 -1px #e6ddff,-9px 2px 0 -2px #e6ddff;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,100% 100%,50% 58%,0% 0% !important}
+}
+
+/* 294 Pine Night */
+@keyframes b294-d294a{0%{opacity:1}100%{opacity:0.78}}
+@keyframes b294-d294b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="294"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#626a7f);--cai-tx:var(--bub-ai-tx,#f1f5ff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#626a7f);--cai-tx:var(--bub-user-tx,#f1f5ff)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 3px rgba(5,9,20,0.75);background:linear-gradient(180deg,var(--b12,rgba(6,10,24,0.62)) 0%,var(--b13,rgba(6,10,24,0.42)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,26,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M13,3L18,16L15,16L21,27L17,27L24,40L2,40L9,27L5,27L11,16L8,16Z%22%20fill=%22%231c2742%22/%3E%3C/svg%3E) 0% 100%/26px 40% repeat-x,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,44%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,44L18,11L33,25L52,6L70,27L86,15L104,29L120,13L120,44Z%22%20fill=%22%2333436b%22/%3E%3Cpath%20d=%22M0,44L15,28L31,37L49,23L67,35L83,27L101,39L120,26L120,44Z%22%20fill=%22%23243354%22/%3E%3C/svg%3E) 0% 100%/100% 50% no-repeat,radial-gradient(circle closest-side,var(--b1,#bcc9e4) 0 98%,transparent 99%) 76% 56%/36px 36px no-repeat,linear-gradient(180deg,var(--b2,#2b3a63),var(--b3,#4a5c8c) 50%,var(--b4,#8fa3c9)) 0% 0%/100% 100% no-repeat var(--b4,#8fa3c9) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:18px;width:34px;height:59px;clip-path:polygon(50% 0,72% 34%,60% 34%,86% 70%,70% 70%,100% 100%,0 100%,30% 70%,14% 70%,40% 34%,28% 34%);animation:b294-d294b 36s ease-in-out infinite alternate;background:var(--b5,#1c2742);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-18px;left:26%;width:6px;height:6px;border-radius:50%;animation:b294-d294a 11s ease-in-out infinite alternate;background:var(--b6,#33436b);box-shadow:14px 9px 0 -2px #33436b,-15px 6px 0 -2px #33436b,23px -5px 0 -2px #33436b;}
+.msg-content[data-side="ai"]{border-radius:20px 20px 20px 5px}
+.msg-content[data-side="user"]{border-radius:20px 20px 5px 20px;background-position:0% 0%,100% 100%,100% 100%,24% 56%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b14,rgba(6,10,24,0.38)) 0%,var(--b15,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,26,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M13,3L18,16L15,16L21,27L17,27L24,40L2,40L9,27L5,27L11,16L8,16Z%22%20fill=%22%2303060f%22/%3E%3C/svg%3E) 0% 100%/26px 40% repeat-x,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,44%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,44L18,11L33,25L52,6L70,27L86,15L104,29L120,13L120,44Z%22%20fill=%22%230a1128%22/%3E%3Cpath%20d=%22M0,44L15,28L31,37L49,23L67,35L83,27L101,39L120,26L120,44Z%22%20fill=%22%23050916%22/%3E%3C/svg%3E) 0% 100%/100% 50% no-repeat,radial-gradient(circle closest-side,var(--b7,#757f9d) 0 98%,transparent 99%) 76% 56%/32px 32px no-repeat,linear-gradient(180deg,var(--b8,#050a1c),var(--b9,#0e1734) 50%,var(--b10,#1b2547)) 0% 0%/100% 100% no-repeat var(--b10,#1b2547) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b11,#cfd9f2);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b11,#cfd9f2);box-shadow:9px 6px 0 -1px #cfd9f2,-10px 4px 0 -1px #cfd9f2,15px -3px 0 -1px #cfd9f2;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,100% 100%,24% 56%,0% 0% !important}
+}
+
+/* 295 Aurora */
+@keyframes b295-d295a{0%{opacity:1}100%{opacity:0.78}}
+@keyframes b295-d295b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="295"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#2f7768);--cai-tx:var(--bub-ai-tx,#eafaff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#2f7768);--cai-tx:var(--bub-user-tx,#eafaff)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 3px rgba(5,9,20,0.75);background:linear-gradient(180deg,var(--b13,rgba(6,10,24,0.47)) 0%,var(--b14,rgba(6,10,24,0.27)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,44%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,44L18,11L33,25L52,6L70,27L86,15L104,29L120,13L120,44Z%22%20fill=%22%23123048%22/%3E%3Cpath%20d=%22M0,44L15,28L31,37L49,23L67,35L83,27L101,39L120,26L120,44Z%22%20fill=%22%230b2032%22/%3E%3C/svg%3E) 0% 100%/100% 50% no-repeat,linear-gradient(170deg,transparent 0 14%,var(--b1,#3e9f86) 30%,transparent 48%),linear-gradient(198deg,transparent 0 10%,var(--b2,#4a76b8) 26%,transparent 44%) 0% 0%,0% 0%/100% 100%,100% 100% no-repeat,no-repeat,linear-gradient(180deg,var(--b3,#0f2a44),var(--b4,#1c3f5e) 52%,var(--b5,#2d5878)) 0% 0%/100% 100% no-repeat var(--b5,#2d5878) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:20px;width:53px;height:53px;border-radius:50%;animation:b295-d295b 32s ease-in-out infinite alternate;background:var(--b6,#5f93a8);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-18px;left:26%;width:6px;height:6px;border-radius:50%;animation:b295-d295a 11s ease-in-out infinite alternate;background:var(--b1,#3e9f86);box-shadow:14px 9px 0 -2px #3e9f86,-15px 6px 0 -2px #3e9f86,23px -5px 0 -2px #3e9f86;}
+.msg-content[data-side="ai"]{border-radius:22px 22px 22px 6px}
+.msg-content[data-side="user"]{border-radius:22px 22px 6px 22px;background-position:0% 0%,100% 100%,100% 0%,100% 0%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b15,rgba(6,10,24,0.38)) 0%,var(--b16,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,44%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,44L18,11L33,25L52,6L70,27L86,15L104,29L120,13L120,44Z%22%20fill=%22%23061422%22/%3E%3Cpath%20d=%22M0,44L15,28L31,37L49,23L67,35L83,27L101,39L120,26L120,44Z%22%20fill=%22%23030a12%22/%3E%3C/svg%3E) 0% 100%/100% 50% no-repeat,linear-gradient(170deg,transparent 0 14%,var(--b7,#2c7a66) 30%,transparent 48%),linear-gradient(198deg,transparent 0 10%,var(--b8,#33558c) 26%,transparent 44%) 0% 0%,0% 0%/100% 100%,100% 100% no-repeat,no-repeat,linear-gradient(180deg,var(--b9,#040c1a),var(--b10,#08182c) 52%,var(--b11,#0d2740)) 0% 0%/100% 100% no-repeat var(--b11,#0d2740) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b12,#cfe6f2);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b12,#cfe6f2);box-shadow:9px 6px 0 -1px #cfe6f2,-10px 4px 0 -1px #cfe6f2,15px -3px 0 -1px #cfe6f2;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,100% 0%,100% 0%,0% 0% !important}
+}
+
+/* 296 Low Dune */
+@keyframes b296-d296a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b296-d296b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="296"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#c2997c);--cai-tx:var(--bub-ai-tx,#2e1a0c)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#c2997c);--cai-tx:var(--bub-user-tx,#2e1a0c)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 0 rgba(255,255,255,0.6);background:linear-gradient(180deg,var(--b10,rgba(255,255,255,0.18)) 0%,var(--b11,rgba(255,255,255,0.38)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,24Q30,8,62,22Q88,33,120,16L120,40Z%22%20fill=%22%23d59a63%22/%3E%3Cpath%20d=%22M0,40L0,34Q34,22,66,33Q94,41,120,30L120,40Z%22%20fill=%22%23a97047%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,linear-gradient(180deg,var(--b1,#ffe1b3),var(--b2,#ffbe86) 55%,var(--b3,#f5a06c)) 0% 0%/100% 100% no-repeat var(--b3,#f5a06c) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:20px;width:53px;height:53px;border-radius:50%;animation:b296-d296b 32s ease-in-out infinite alternate;background:var(--b4,#ef9a53);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-20px;left:24%;width:47px;height:19px;animation:b296-d296a 30s ease-in-out infinite alternate;background:url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,30,12%22%3E%3Cpath%20d=%22M2,8q4,-5,8,0q4,-5,8,0%22%20fill=%22none%22%20stroke=%22%23a97047%22%20stroke-width=%221.4%22/%3E%3Cpath%20d=%22M17,4q3,-4,6,0q3,-4,6,0%22%20fill=%22none%22%20stroke=%22%23a97047%22%20stroke-width=%221.2%22/%3E%3C/svg%3E) 0% 0%/100% 100% no-repeat;}
+.msg-content[data-side="ai"]{border-radius:20px 20px 20px 6px}
+.msg-content[data-side="user"]{border-radius:20px 20px 6px 20px;background-position:0% 0%,100% 100%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{color:var(--b5,#f3ecff) !important;text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b12,rgba(6,10,24,0.38)) 0%,var(--b13,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,24Q30,8,62,22Q88,33,120,16L120,40Z%22%20fill=%22%23241c38%22/%3E%3Cpath%20d=%22M0,40L0,34Q34,22,66,33Q94,41,120,30L120,40Z%22%20fill=%22%23151024%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,linear-gradient(180deg,var(--b6,#12122e),var(--b7,#2a2148) 55%,var(--b8,#3d2a4e)) 0% 0%/100% 100% no-repeat var(--b8,#3d2a4e) !important}
+:is(:scope.dark,.dark :scope) .msg-content *{color:var(--b5,#f3ecff) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b9,#e7dcf5);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,30,12%22%3E%3Cpath%20d=%22M2,8q4,-5,8,0q4,-5,8,0%22%20fill=%22none%22%20stroke=%22%23e7dcf5%22%20stroke-width=%221.4%22/%3E%3Cpath%20d=%22M17,4q3,-4,6,0q3,-4,6,0%22%20fill=%22none%22%20stroke=%22%23e7dcf5%22%20stroke-width=%221.2%22/%3E%3C/svg%3E) 0% 0%/100% 100% no-repeat;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,0% 0% !important}
+}
+
+/* 297 Sea Line */
+@keyframes b297-d297a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b297-d297b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="297"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#6999b4);--cai-tx:var(--bub-ai-tx,#0f2430)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#6999b4);--cai-tx:var(--bub-user-tx,#0f2430)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 0 rgba(255,255,255,0.6);background:linear-gradient(180deg,var(--b11,rgba(255,255,255,0.18)) 0%,var(--b12,rgba(255,255,255,0.38)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,32%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,32L0,12Q15,5,30,12T60,12T90,12T120,12L120,32Z%22%20fill=%22%233f8fb5%22/%3E%3Cpath%20d=%22M0,32L0,22Q18,15,36,22T72,22T120,20L120,32Z%22%20fill=%22%232c6f95%22/%3E%3C/svg%3E) 0% 100%/100% 38% no-repeat,linear-gradient(180deg,var(--b1,#c5e9f4),var(--b2,#93d2e8) 55%,var(--b3,#63b6d6)) 0% 0%/100% 100% no-repeat var(--b3,#63b6d6) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:20px;width:53px;height:53px;border-radius:50%;animation:b297-d297b 32s ease-in-out infinite alternate;background:var(--b4,#efab2e);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-22px;left:24%;width:43px;height:14px;border-radius:6px;animation:b297-d297a 26s ease-in-out infinite alternate;background:var(--b5,#3f8fb5);box-shadow:16px -6px 0 -2px #3f8fb5,-14px 3px 0 -3px #3f8fb5;}
+.msg-content[data-side="ai"]{border-radius:18px 18px 18px 5px}
+.msg-content[data-side="user"]{border-radius:18px 18px 5px 18px;background-position:0% 0%,100% 100%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{color:var(--b6,#e6f2fb) !important;text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b13,rgba(6,10,24,0.38)) 0%,var(--b14,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,32%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,32L0,12Q15,5,30,12T60,12T90,12T120,12L120,32Z%22%20fill=%22%230c2036%22/%3E%3Cpath%20d=%22M0,32L0,22Q18,15,36,22T72,22T120,20L120,32Z%22%20fill=%22%23061422%22/%3E%3C/svg%3E) 0% 100%/100% 38% no-repeat,linear-gradient(180deg,var(--b7,#050f22),var(--b8,#0d2140) 55%,var(--b9,#153053)) 0% 0%/100% 100% no-repeat var(--b9,#153053) !important}
+:is(:scope.dark,.dark :scope) .msg-content *{color:var(--b6,#e6f2fb) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b10,#d7e8f7);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b10,#d7e8f7);box-shadow:10px -4px 0 -1px #d7e8f7,-9px 2px 0 -2px #d7e8f7;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,0% 0% !important}
+}
+
+/* 298 Palm Isle */
+@keyframes b298-d298a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b298-d298b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="298"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#749b96);--cai-tx:var(--bub-ai-tx,#0e2b28)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#749b96);--cai-tx:var(--bub-user-tx,#0e2b28)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 0 rgba(255,255,255,0.6);background:linear-gradient(180deg,var(--b10,rgba(255,255,255,0.22)) 0%,var(--b11,rgba(255,255,255,0.42)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,33Q34,23,70,31Q98,37,120,29L120,40Z%22%20fill=%22%232f6a63%22/%3E%3Cpath%20d=%22M30,33C30,24,32,17,35,11%22%20fill=%22none%22%20stroke=%22%232f6a63%22%20stroke-width=%222%22/%3E%3Cpath%20d=%22M35,11q-11,-6,-17,-1q9,-1,17,3zM35,11q11,-6,17,-1q-9,-1,-17,3z%22%20fill=%22%232f6a63%22/%3E%3Cpath%20d=%22M84,34C84,26,83,20,81,15%22%20fill=%22none%22%20stroke=%22%232f6a63%22%20stroke-width=%221.6%22/%3E%3Cpath%20d=%22M81,15q-9,-5,-14,-1q8,-1,14,3zM81,15q9,-5,14,-1q-8,-1,-14,3z%22%20fill=%22%232f6a63%22/%3E%3C/svg%3E) 0% 100%/100% 52% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,32%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,32L0,12Q15,5,30,12T60,12T90,12T120,12L120,32Z%22%20fill=%22%233f9aa0%22/%3E%3Cpath%20d=%22M0,32L0,22Q18,15,36,22T72,22T120,20L120,32Z%22%20fill=%22%232c7a82%22/%3E%3C/svg%3E) 0% 100%/100% 38% no-repeat,linear-gradient(180deg,var(--b1,#ffe3c0),var(--b2,#ffc19a) 50%,var(--b3,#86d2da)) 0% 0%/100% 100% no-repeat var(--b3,#86d2da) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:20px;width:53px;height:53px;border-radius:50%;animation:b298-d298b 32s ease-in-out infinite alternate;background:var(--b4,#ef9a53);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-20px;left:24%;width:47px;height:19px;animation:b298-d298a 30s ease-in-out infinite alternate;background:url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,30,12%22%3E%3Cpath%20d=%22M2,8q4,-5,8,0q4,-5,8,0%22%20fill=%22none%22%20stroke=%22%232f6a63%22%20stroke-width=%221.4%22/%3E%3Cpath%20d=%22M17,4q3,-4,6,0q3,-4,6,0%22%20fill=%22none%22%20stroke=%22%232f6a63%22%20stroke-width=%221.2%22/%3E%3C/svg%3E) 0% 0%/100% 100% no-repeat;}
+.msg-content[data-side="ai"]{border-radius:22px 22px 22px 6px}
+.msg-content[data-side="user"]{border-radius:22px 22px 6px 22px;background-position:0% 0%,100% 100%,100% 100%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{color:var(--b5,#e2f5f2) !important;text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b12,rgba(6,10,24,0.38)) 0%,var(--b13,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,33Q34,23,70,31Q98,37,120,29L120,40Z%22%20fill=%22%2304120f%22/%3E%3Cpath%20d=%22M30,33C30,24,32,17,35,11%22%20fill=%22none%22%20stroke=%22%2304120f%22%20stroke-width=%222%22/%3E%3Cpath%20d=%22M35,11q-11,-6,-17,-1q9,-1,17,3zM35,11q11,-6,17,-1q-9,-1,-17,3z%22%20fill=%22%2304120f%22/%3E%3Cpath%20d=%22M84,34C84,26,83,20,81,15%22%20fill=%22none%22%20stroke=%22%2304120f%22%20stroke-width=%221.6%22/%3E%3Cpath%20d=%22M81,15q-9,-5,-14,-1q8,-1,14,3zM81,15q9,-5,14,-1q-8,-1,-14,3z%22%20fill=%22%2304120f%22/%3E%3C/svg%3E) 0% 100%/100% 52% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,32%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,32L0,12Q15,5,30,12T60,12T90,12T120,12L120,32Z%22%20fill=%22%230a2530%22/%3E%3Cpath%20d=%22M0,32L0,22Q18,15,36,22T72,22T120,20L120,32Z%22%20fill=%22%2305161e%22/%3E%3C/svg%3E) 0% 100%/100% 38% no-repeat,linear-gradient(180deg,var(--b6,#061424),var(--b7,#0d2438) 50%,var(--b8,#153a44)) 0% 0%/100% 100% no-repeat var(--b8,#153a44) !important}
+:is(:scope.dark,.dark :scope) .msg-content *{color:var(--b5,#e2f5f2) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b9,#dcefee);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,30,12%22%3E%3Cpath%20d=%22M2,8q4,-5,8,0q4,-5,8,0%22%20fill=%22none%22%20stroke=%22%23dcefee%22%20stroke-width=%221.4%22/%3E%3Cpath%20d=%22M17,4q3,-4,6,0q3,-4,6,0%22%20fill=%22none%22%20stroke=%22%23dcefee%22%20stroke-width=%221.2%22/%3E%3C/svg%3E) 0% 0%/100% 100% no-repeat;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,100% 100%,0% 0% !important}
+}
+
+/* 299 Terraces */
+@keyframes b299-d299a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b299-d299b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="299"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#81a17e);--cai-tx:var(--bub-ai-tx,#152616)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#81a17e);--cai-tx:var(--bub-user-tx,#152616)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 0 rgba(255,255,255,0.6);background:linear-gradient(180deg,var(--b10,rgba(255,255,255,0.18)) 0%,var(--b11,rgba(255,255,255,0.38)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,42%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,42L0,12Q30,4,64,12Q94,19,120,10L120,42Z%22%20fill=%22%236f9f61%22/%3E%3Cpath%20d=%22M0,42L0,25Q34,17,68,25Q98,32,120,23L120,42Z%22%20fill=%22%234e7a49%22/%3E%3C/svg%3E) 0% 100%/100% 48% no-repeat,linear-gradient(180deg,var(--b1,#ffeac6),var(--b2,#d8e8ac) 50%,var(--b3,#9ac47f)) 0% 0%/100% 100% no-repeat var(--b3,#9ac47f) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:20px;width:53px;height:53px;border-radius:50%;animation:b299-d299b 32s ease-in-out infinite alternate;background:var(--b4,#dfae2e);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-20px;left:24%;width:47px;height:19px;animation:b299-d299a 30s ease-in-out infinite alternate;background:url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,30,12%22%3E%3Cpath%20d=%22M2,8q4,-5,8,0q4,-5,8,0%22%20fill=%22none%22%20stroke=%22%234e7a49%22%20stroke-width=%221.4%22/%3E%3Cpath%20d=%22M17,4q3,-4,6,0q3,-4,6,0%22%20fill=%22none%22%20stroke=%22%234e7a49%22%20stroke-width=%221.2%22/%3E%3C/svg%3E) 0% 0%/100% 100% no-repeat;}
+.msg-content[data-side="ai"]{border-radius:20px 20px 20px 6px}
+.msg-content[data-side="user"]{border-radius:20px 20px 6px 20px;background-position:0% 0%,100% 100%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{color:var(--b5,#e6f5e4) !important;text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b12,rgba(6,10,24,0.38)) 0%,var(--b13,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,42%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,42L0,12Q30,4,64,12Q94,19,120,10L120,42Z%22%20fill=%22%230d2016%22/%3E%3Cpath%20d=%22M0,42L0,25Q34,17,68,25Q98,32,120,23L120,42Z%22%20fill=%22%2306120b%22/%3E%3C/svg%3E) 0% 100%/100% 48% no-repeat,linear-gradient(180deg,var(--b6,#08150f),var(--b7,#0f2418) 50%,var(--b8,#183524)) 0% 0%/100% 100% no-repeat var(--b8,#183524) !important}
+:is(:scope.dark,.dark :scope) .msg-content *{color:var(--b5,#e6f5e4) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b9,#dfeecf);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,30,12%22%3E%3Cpath%20d=%22M2,8q4,-5,8,0q4,-5,8,0%22%20fill=%22none%22%20stroke=%22%23dfeecf%22%20stroke-width=%221.4%22/%3E%3Cpath%20d=%22M17,4q3,-4,6,0q3,-4,6,0%22%20fill=%22none%22%20stroke=%22%23dfeecf%22%20stroke-width=%221.2%22/%3E%3C/svg%3E) 0% 0%/100% 100% no-repeat;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,0% 0% !important}
+}
+
+/* 300 Bamboo Mist */
+@keyframes b300-d300a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b300-d300b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="300"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#96b4a3);--cai-tx:var(--bub-ai-tx,#16261f)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#96b4a3);--cai-tx:var(--bub-user-tx,#16261f)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 0 rgba(255,255,255,0.6);background:linear-gradient(180deg,var(--b12,rgba(255,255,255,0.18)) 0%,var(--b13,rgba(255,255,255,0.38)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,54,60%22%20preserveAspectRatio=%22none%22%3E%3Crect%20x=%2211%22%20y=%222%22%20width=%223.4%22%20height=%2258%22%20fill=%22%237fa48f%22/%3E%3Crect%20x=%2234%22%20y=%2215%22%20width=%222.3%22%20height=%2245%22%20fill=%22%237fa48f%22/%3E%3Cpath%20d=%22M11,22q-10,-5,-11,-12q8,2,11,8zM14,34q10,-4,12,-11q-8,1,-12,7zM34,30q9,-4,10,-10q-7,1,-10,6z%22%20fill=%22%237fa48f%22/%3E%3C/svg%3E) 0% 100%/54px 78% repeat-x,linear-gradient(180deg,transparent 0 40%,var(--b1,#e8f2ec) 58%,transparent 76%) 0% 0%/100% 100% no-repeat,linear-gradient(180deg,var(--b2,#eef6ef),var(--b3,#cfe4d6) 55%,var(--b4,#b0d1c0)) 0% 0%/100% 100% no-repeat var(--b4,#b0d1c0) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:22px;width:20px;height:56px;border-radius:7px 7px 0 0;animation:b300-d300b 40s ease-in-out infinite alternate;background:var(--b5,#7fa48f);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-22px;left:26%;width:22px;height:16px;border-radius:60% 10% 60% 10%;animation:b300-d300a 26s ease-in-out infinite alternate;background:var(--b1,#e8f2ec);}
+.msg-content[data-side="ai"]{border-radius:18px 18px 18px 5px}
+.msg-content[data-side="user"]{border-radius:18px 18px 5px 18px;background-position:0% 0%,100% 100%,100% 0%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{color:var(--b6,#e3f2ea) !important;text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b14,rgba(6,10,24,0.38)) 0%,var(--b15,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,54,60%22%20preserveAspectRatio=%22none%22%3E%3Crect%20x=%2211%22%20y=%222%22%20width=%223.4%22%20height=%2258%22%20fill=%22%230b1a16%22/%3E%3Crect%20x=%2234%22%20y=%2215%22%20width=%222.3%22%20height=%2245%22%20fill=%22%230b1a16%22/%3E%3Cpath%20d=%22M11,22q-10,-5,-11,-12q8,2,11,8zM14,34q10,-4,12,-11q-8,1,-12,7zM34,30q9,-4,10,-10q-7,1,-10,6z%22%20fill=%22%230b1a16%22/%3E%3C/svg%3E) 0% 100%/54px 78% repeat-x,linear-gradient(180deg,transparent 0 40%,var(--b7,#23433a) 58%,transparent 76%) 0% 0%/100% 100% no-repeat,linear-gradient(180deg,var(--b8,#08130f),var(--b9,#102220) 55%,var(--b10,#1a3029)) 0% 0%/100% 100% no-repeat var(--b10,#1a3029) !important}
+:is(:scope.dark,.dark :scope) .msg-content *{color:var(--b6,#e3f2ea) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b11,#9fc3b1);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b11,#9fc3b1);}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,100% 0%,0% 0% !important}
+}
+
+/* 301 Maple Hills */
+@keyframes b301-d301a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b301-d301b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="301"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#b37b70);--cai-tx:var(--bub-ai-tx,#2b1410)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#b37b70);--cai-tx:var(--bub-user-tx,#2b1410)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 0 rgba(255,255,255,0.6);background:linear-gradient(180deg,var(--b13,rgba(255,255,255,0.22)) 0%,var(--b14,rgba(255,255,255,0.42)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,50,32%22%20preserveAspectRatio=%22none%22%3E%3Ccircle%20cx=%2212%22%20cy=%2214%22%20r=%2211%22%20fill=%22%23b8543a%22/%3E%3Ccircle%20cx=%2233%22%20cy=%2211%22%20r=%2213%22%20fill=%22%238d3a2a%22/%3E%3Crect%20x=%220%22%20y=%2222%22%20width=%2250%22%20height=%2210%22%20fill=%22%23b8543a%22/%3E%3C/svg%3E) 0% 100%/50px 36% repeat-x,radial-gradient(circle closest-side,var(--b1,#fff4d8) 0 98%,transparent 99%) 76% 58%/44px 44px no-repeat,linear-gradient(180deg,var(--b2,#ffe9cf),var(--b3,#ffc2a0) 50%,var(--b4,#f39c7e)) 0% 0%/100% 100% no-repeat var(--b4,#f39c7e) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-28px;right:18px;width:40px;height:53px;clip-path:polygon(50% 0,100% 100%,0 100%);animation:b301-d301b 34s ease-in-out infinite alternate;background:var(--b5,#8d3a2a);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-22px;left:26%;width:22px;height:16px;border-radius:60% 10% 60% 10%;animation:b301-d301a 26s ease-in-out infinite alternate;background:var(--b6,#b8543a);}
+.msg-content[data-side="ai"]{border-radius:22px 22px 22px 6px}
+.msg-content[data-side="user"]{border-radius:22px 22px 6px 22px;background-position:0% 0%,100% 100%,24% 58%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{color:var(--b7,#f8e9e2) !important;text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b15,rgba(6,10,24,0.38)) 0%,var(--b16,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,50,32%22%20preserveAspectRatio=%22none%22%3E%3Ccircle%20cx=%2212%22%20cy=%2214%22%20r=%2211%22%20fill=%22%232a1018%22/%3E%3Ccircle%20cx=%2233%22%20cy=%2211%22%20r=%2213%22%20fill=%22%23180a10%22/%3E%3Crect%20x=%220%22%20y=%2222%22%20width=%2250%22%20height=%2210%22%20fill=%22%232a1018%22/%3E%3C/svg%3E) 0% 100%/50px 36% repeat-x,radial-gradient(circle closest-side,var(--b8,#957e82) 0 98%,transparent 99%) 76% 58%/36px 36px no-repeat,linear-gradient(180deg,var(--b9,#160f1e),var(--b10,#2a1730) 50%,var(--b11,#3a1f33)) 0% 0%/100% 100% no-repeat var(--b11,#3a1f33) !important}
+:is(:scope.dark,.dark :scope) .msg-content *{color:var(--b7,#f8e9e2) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b12,#f0dcd0);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b12,#f0dcd0);}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,24% 58%,0% 0% !important}
+}
+
+/* 302 Birch Snow */
+@keyframes b302-d302a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b302-d302b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="302"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#a2b6c7);--cai-tx:var(--bub-ai-tx,#152430)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#a2b6c7);--cai-tx:var(--bub-user-tx,#152430)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 0 rgba(255,255,255,0.6);background:linear-gradient(180deg,var(--b11,rgba(255,255,255,0.18)) 0%,var(--b12,rgba(255,255,255,0.38)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,42,60%22%20preserveAspectRatio=%22none%22%3E%3Crect%20x=%2219%22%20y=%221%22%20width=%223.6%22%20height=%2259%22%20fill=%22%238ea6bb%22/%3E%3Cpath%20d=%22M19,16L9,7L9,10L19,20ZM23,30L33,20L33,23L23,34Z%22%20fill=%22%238ea6bb%22/%3E%3C/svg%3E) 0% 100%/42px 70% repeat-x,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,40,18%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,18L0,10Q10,3,20,10Q30,16,40,8L40,18Z%22%20fill=%22%23dcebf5%22/%3E%3C/svg%3E) 0% 100%/40px 22% repeat-x,linear-gradient(180deg,var(--b1,#f0f6fb),var(--b2,#dae9f4) 55%,var(--b3,#c4dbec)) 0% 0%/100% 100% no-repeat var(--b3,#c4dbec) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:22px;width:20px;height:56px;border-radius:7px 7px 0 0;animation:b302-d302b 40s ease-in-out infinite alternate;background:var(--b4,#8ea6bb);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-22px;left:24%;width:43px;height:14px;border-radius:6px;animation:b302-d302a 26s ease-in-out infinite alternate;background:var(--b5,#dcebf5);box-shadow:16px -6px 0 -2px #dcebf5,-14px 3px 0 -3px #dcebf5;}
+.msg-content[data-side="ai"]{border-radius:18px 18px 18px 5px}
+.msg-content[data-side="user"]{border-radius:18px 18px 5px 18px;background-position:0% 0%,100% 100%,100% 100%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{color:var(--b6,#e9f1fb) !important;text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b13,rgba(6,10,24,0.44)) 0%,var(--b14,rgba(6,10,24,0.24)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,42,60%22%20preserveAspectRatio=%22none%22%3E%3Crect%20x=%2219%22%20y=%221%22%20width=%223.6%22%20height=%2259%22%20fill=%22%2374869f%22/%3E%3Cpath%20d=%22M19,16L9,7L9,10L19,20ZM23,30L33,20L33,23L23,34Z%22%20fill=%22%2374869f%22/%3E%3C/svg%3E) 0% 100%/42px 70% repeat-x,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,40,18%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,18L0,10Q10,3,20,10Q30,16,40,8L40,18Z%22%20fill=%22%2326355a%22/%3E%3C/svg%3E) 0% 100%/40px 22% repeat-x,linear-gradient(180deg,var(--b7,#070d1c),var(--b8,#101a33) 55%,var(--b9,#1a2745)) 0% 0%/100% 100% no-repeat var(--b9,#1a2745) !important}
+:is(:scope.dark,.dark :scope) .msg-content *{color:var(--b6,#e9f1fb) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b10,#c3d4e6);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b10,#c3d4e6);box-shadow:10px -4px 0 -1px #c3d4e6,-9px 2px 0 -2px #c3d4e6;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,100% 100%,0% 0% !important}
+}
+
+/* 303 Blossom Hill */
+@keyframes b303-d303a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b303-d303b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="303"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#cd90ad);--cai-tx:var(--bub-ai-tx,#2c1522)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#cd90ad);--cai-tx:var(--bub-user-tx,#2c1522)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 0 rgba(255,255,255,0.6);background:linear-gradient(180deg,var(--b11,rgba(255,255,255,0.18)) 0%,var(--b12,rgba(255,255,255,0.38)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,46,30%22%20preserveAspectRatio=%22none%22%3E%3Ccircle%20cx=%2212%22%20cy=%2213%22%20r=%2210%22%20fill=%22%23d97fa8%22/%3E%3Ccircle%20cx=%2230%22%20cy=%2211%22%20r=%2211%22%20fill=%22%23b8628c%22/%3E%3Crect%20x=%220%22%20y=%2221%22%20width=%2246%22%20height=%229%22%20fill=%22%23d97fa8%22/%3E%3C/svg%3E) 0% 100%/46px 34% repeat-x,linear-gradient(180deg,var(--b1,#fdf0f5),var(--b2,#f9d9e6) 50%,var(--b3,#f3c2d7)) 0% 0%/100% 100% no-repeat var(--b3,#f3c2d7) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:20px;width:53px;height:53px;border-radius:50%;animation:b303-d303b 32s ease-in-out infinite alternate;background:var(--b4,#e07fa6);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-22px;left:26%;width:22px;height:16px;border-radius:60% 10% 60% 10%;animation:b303-d303a 26s ease-in-out infinite alternate;background:var(--b5,#d97fa8);}
+.msg-content[data-side="ai"]{border-radius:22px 22px 22px 6px}
+.msg-content[data-side="user"]{border-radius:22px 22px 6px 22px;background-position:0% 0%,100% 100%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{color:var(--b6,#fbe9f3) !important;text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b13,rgba(6,10,24,0.38)) 0%,var(--b14,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,46,30%22%20preserveAspectRatio=%22none%22%3E%3Ccircle%20cx=%2212%22%20cy=%2213%22%20r=%2210%22%20fill=%22%232c1226%22/%3E%3Ccircle%20cx=%2230%22%20cy=%2211%22%20r=%2211%22%20fill=%22%231c0a18%22/%3E%3Crect%20x=%220%22%20y=%2221%22%20width=%2246%22%20height=%229%22%20fill=%22%232c1226%22/%3E%3C/svg%3E) 0% 100%/46px 34% repeat-x,linear-gradient(180deg,var(--b7,#150d1c),var(--b8,#261233) 50%,var(--b9,#361b3f)) 0% 0%/100% 100% no-repeat var(--b9,#361b3f) !important}
+:is(:scope.dark,.dark :scope) .msg-content *{color:var(--b6,#fbe9f3) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b10,#f2dbe8);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b10,#f2dbe8);}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,0% 0% !important}
+}
+
+/* 304 Lavender */
+@keyframes b304-d304a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b304-d304b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="304"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#a38fca);--cai-tx:var(--bub-ai-tx,#241a38)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#a38fca);--cai-tx:var(--bub-user-tx,#241a38)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 0 rgba(255,255,255,0.6);background:linear-gradient(180deg,var(--b13,rgba(255,255,255,0.18)) 0%,var(--b14,rgba(255,255,255,0.38)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,30,26%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M7,26L7,7%22%20fill=%22none%22%20stroke=%22%237d61b4%22%20stroke-width=%221.7%22/%3E%3Ccircle%20cx=%227%22%20cy=%225%22%20r=%222.9%22%20fill=%22%237d61b4%22/%3E%3Cpath%20d=%22M19,26L19,13%22%20fill=%22none%22%20stroke=%22%237d61b4%22%20stroke-width=%221.3%22/%3E%3Ccircle%20cx=%2219%22%20cy=%2211%22%20r=%222.3%22%20fill=%22%237d61b4%22/%3E%3C/svg%3E) 0% 100%/30px 32% repeat-x,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,22Q26,6,52,20Q78,33,120,14L120,40Z%22%20fill=%22%239d84cf%22/%3E%3Cpath%20d=%22M0,40L0,32Q30,20,60,31Q90,41,120,28L120,40Z%22%20fill=%22%237d61b4%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,radial-gradient(circle closest-side,var(--b1,#fff5e0) 0 98%,transparent 99%) 76% 58%/42px 42px no-repeat,linear-gradient(180deg,var(--b2,#f4edff),var(--b3,#dbcbf4) 50%,var(--b4,#c0a9e8)) 0% 0%/100% 100% no-repeat var(--b4,#c0a9e8) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-28px;right:18px;width:40px;height:53px;clip-path:polygon(50% 0,100% 100%,0 100%);animation:b304-d304b 34s ease-in-out infinite alternate;background:var(--b5,#7d61b4);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-22px;left:24%;width:43px;height:14px;border-radius:6px;animation:b304-d304a 26s ease-in-out infinite alternate;background:var(--b6,#9d84cf);box-shadow:16px -6px 0 -2px #9d84cf,-14px 3px 0 -3px #9d84cf;}
+.msg-content[data-side="ai"]{border-radius:20px 20px 20px 6px}
+.msg-content[data-side="user"]{border-radius:20px 20px 6px 20px;background-position:0% 0%,100% 100%,100% 100%,24% 58%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{color:var(--b7,#ece5ff) !important;text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b15,rgba(6,10,24,0.38)) 0%,var(--b16,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,30,26%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M7,26L7,7%22%20fill=%22none%22%20stroke=%22%230b0820%22%20stroke-width=%221.7%22/%3E%3Ccircle%20cx=%227%22%20cy=%225%22%20r=%222.9%22%20fill=%22%230b0820%22/%3E%3Cpath%20d=%22M19,26L19,13%22%20fill=%22none%22%20stroke=%22%230b0820%22%20stroke-width=%221.3%22/%3E%3Ccircle%20cx=%2219%22%20cy=%2211%22%20r=%222.3%22%20fill=%22%230b0820%22/%3E%3C/svg%3E) 0% 100%/30px 32% repeat-x,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,22Q26,6,52,20Q78,33,120,14L120,40Z%22%20fill=%22%23161034%22/%3E%3Cpath%20d=%22M0,40L0,32Q30,20,60,31Q90,41,120,28L120,40Z%22%20fill=%22%230b0820%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,radial-gradient(circle closest-side,var(--b8,#8176a1) 0 98%,transparent 99%) 76% 58%/34px 34px no-repeat,linear-gradient(180deg,var(--b9,#0d0a22),var(--b10,#191238) 50%,var(--b11,#241a4a)) 0% 0%/100% 100% no-repeat var(--b11,#241a4a) !important}
+:is(:scope.dark,.dark :scope) .msg-content *{color:var(--b7,#ece5ff) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b12,#ddd2f7);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b12,#ddd2f7);box-shadow:10px -4px 0 -1px #ddd2f7,-9px 2px 0 -2px #ddd2f7;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,100% 100%,24% 58%,0% 0% !important}
+}
+
+/* 305 Wheat Gold */
+@keyframes b305-d305a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b305-d305b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="305"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#c19e60);--cai-tx:var(--bub-ai-tx,#2b1e05)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#c19e60);--cai-tx:var(--bub-user-tx,#2b1e05)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 0 rgba(255,255,255,0.6);background:linear-gradient(180deg,var(--b10,rgba(255,255,255,0.18)) 0%,var(--b11,rgba(255,255,255,0.38)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,28,30%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M6,30L6,9%22%20fill=%22none%22%20stroke=%22%23a8761f%22%20stroke-width=%221.3%22/%3E%3Ccircle%20cx=%226%22%20cy=%227%22%20r=%222.8%22%20fill=%22%23a8761f%22/%3E%3Cpath%20d=%22M16,30L16,16%22%20fill=%22none%22%20stroke=%22%23a8761f%22%20stroke-width=%221%22/%3E%3Ccircle%20cx=%2216%22%20cy=%2214%22%20r=%222.2%22%20fill=%22%23a8761f%22/%3E%3Cpath%20d=%22M24,30L24,12%22%20fill=%22none%22%20stroke=%22%23a8761f%22%20stroke-width=%221.1%22/%3E%3Ccircle%20cx=%2224%22%20cy=%2210%22%20r=%222.4%22%20fill=%22%23a8761f%22/%3E%3C/svg%3E) 0% 100%/28px 30% repeat-x,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,22Q26,6,52,20Q78,33,120,14L120,40Z%22%20fill=%22%23cf9a30%22/%3E%3Cpath%20d=%22M0,40L0,32Q30,20,60,31Q90,41,120,28L120,40Z%22%20fill=%22%23a8761f%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,linear-gradient(180deg,var(--b1,#fff3d2),var(--b2,#ffdb93) 52%,var(--b3,#f4bf66)) 0% 0%/100% 100% no-repeat var(--b3,#f4bf66) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:20px;width:53px;height:53px;border-radius:50%;animation:b305-d305b 32s ease-in-out infinite alternate;background:var(--b4,#dc9c1e);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-20px;left:24%;width:47px;height:19px;animation:b305-d305a 30s ease-in-out infinite alternate;background:url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,30,12%22%3E%3Cpath%20d=%22M2,8q4,-5,8,0q4,-5,8,0%22%20fill=%22none%22%20stroke=%22%23a8761f%22%20stroke-width=%221.4%22/%3E%3Cpath%20d=%22M17,4q3,-4,6,0q3,-4,6,0%22%20fill=%22none%22%20stroke=%22%23a8761f%22%20stroke-width=%221.2%22/%3E%3C/svg%3E) 0% 0%/100% 100% no-repeat;}
+.msg-content[data-side="ai"]{border-radius:20px 20px 20px 6px}
+.msg-content[data-side="user"]{border-radius:20px 20px 6px 20px;background-position:0% 0%,100% 100%,100% 100%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{color:var(--b5,#f8f0dd) !important;text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b12,rgba(6,10,24,0.38)) 0%,var(--b13,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,28,30%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M6,30L6,9%22%20fill=%22none%22%20stroke=%22%23120c1c%22%20stroke-width=%221.3%22/%3E%3Ccircle%20cx=%226%22%20cy=%227%22%20r=%222.8%22%20fill=%22%23120c1c%22/%3E%3Cpath%20d=%22M16,30L16,16%22%20fill=%22none%22%20stroke=%22%23120c1c%22%20stroke-width=%221%22/%3E%3Ccircle%20cx=%2216%22%20cy=%2214%22%20r=%222.2%22%20fill=%22%23120c1c%22/%3E%3Cpath%20d=%22M24,30L24,12%22%20fill=%22none%22%20stroke=%22%23120c1c%22%20stroke-width=%221.1%22/%3E%3Ccircle%20cx=%2224%22%20cy=%2210%22%20r=%222.4%22%20fill=%22%23120c1c%22/%3E%3C/svg%3E) 0% 100%/28px 30% repeat-x,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,22Q26,6,52,20Q78,33,120,14L120,40Z%22%20fill=%22%23221830%22/%3E%3Cpath%20d=%22M0,40L0,32Q30,20,60,31Q90,41,120,28L120,40Z%22%20fill=%22%23120c1c%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,linear-gradient(180deg,var(--b6,#151027),var(--b7,#2a1e3c) 52%,var(--b8,#3b2a3f)) 0% 0%/100% 100% no-repeat var(--b8,#3b2a3f) !important}
+:is(:scope.dark,.dark :scope) .msg-content *{color:var(--b5,#f8f0dd) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b9,#f0e3c4);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,30,12%22%3E%3Cpath%20d=%22M2,8q4,-5,8,0q4,-5,8,0%22%20fill=%22none%22%20stroke=%22%23f0e3c4%22%20stroke-width=%221.4%22/%3E%3Cpath%20d=%22M17,4q3,-4,6,0q3,-4,6,0%22%20fill=%22none%22%20stroke=%22%23f0e3c4%22%20stroke-width=%221.2%22/%3E%3C/svg%3E) 0% 0%/100% 100% no-repeat;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,100% 100%,0% 0% !important}
+}
+
+/* 306 Plains Storm */
+@keyframes b306-d306a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b306-d306b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="306"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#5d6b7f);--cai-tx:var(--bub-ai-tx,#f2f6fb)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#5d6b7f);--cai-tx:var(--bub-user-tx,#f2f6fb)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 3px rgba(5,9,20,0.75);background:linear-gradient(180deg,var(--b11,rgba(6,10,24,0.63)) 0%,var(--b12,rgba(6,10,24,0.43)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,22Q26,6,52,20Q78,33,120,14L120,40Z%22%20fill=%22%232c3444%22/%3E%3Cpath%20d=%22M0,40L0,32Q30,20,60,31Q90,41,120,28L120,40Z%22%20fill=%22%231f2733%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,repeating-linear-gradient(104deg,transparent 0 7px,var(--b1,#9fb4cc) 7px 8px) 0% 0%/100% 100% no-repeat,linear-gradient(180deg,var(--b2,#3c4657),var(--b3,#59657a) 50%,var(--b4,#78849a)) 0% 0%/100% 100% no-repeat var(--b4,#78849a) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-28px;right:18px;width:40px;height:53px;clip-path:polygon(50% 0,100% 100%,0 100%);animation:b306-d306b 34s ease-in-out infinite alternate;background:var(--b5,#1f2733);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-22px;left:24%;width:43px;height:14px;border-radius:6px;animation:b306-d306a 26s ease-in-out infinite alternate;background:var(--b1,#9fb4cc);box-shadow:16px -6px 0 -2px #9fb4cc,-14px 3px 0 -3px #9fb4cc;}
+.msg-content[data-side="ai"]{border-radius:18px 18px 18px 5px}
+.msg-content[data-side="user"]{border-radius:18px 18px 5px 18px;background-position:0% 0%,100% 100%,100% 0%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b13,rgba(6,10,24,0.38)) 0%,var(--b14,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,22Q26,6,52,20Q78,33,120,14L120,40Z%22%20fill=%22%230b1018%22/%3E%3Cpath%20d=%22M0,40L0,32Q30,20,60,31Q90,41,120,28L120,40Z%22%20fill=%22%2305080e%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,repeating-linear-gradient(104deg,transparent 0 7px,var(--b6,#4f6480) 7px 8px) 0% 0%/100% 100% no-repeat,linear-gradient(180deg,var(--b7,#080c16),var(--b8,#131a29) 50%,var(--b9,#1e2738)) 0% 0%/100% 100% no-repeat var(--b9,#1e2738) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b10,#5d6d86);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b10,#5d6d86);box-shadow:10px -4px 0 -1px #5d6d86,-9px 2px 0 -2px #5d6d86;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,100% 0%,0% 0% !important}
+}
+
+/* 307 After Rain */
+@keyframes b307-d307a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b307-d307b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="307"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#779d92);--cai-tx:var(--bub-ai-tx,#0f2630)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#779d92);--cai-tx:var(--bub-user-tx,#0f2630)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 0 rgba(255,255,255,0.6);background:linear-gradient(180deg,var(--b18,rgba(255,255,255,0.18)) 0%,var(--b19,rgba(255,255,255,0.38)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,22Q26,6,52,20Q78,33,120,14L120,40Z%22%20fill=%22%235f9a86%22/%3E%3Cpath%20d=%22M0,40L0,32Q30,20,60,31Q90,41,120,28L120,40Z%22%20fill=%22%233f7565%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,radial-gradient(circle closest-side,transparent 0 58%,var(--b1,#d1705f) 58% 68%,var(--b2,#d9aa54) 68% 79%,var(--b3,#5f7fbf) 79% 90%,transparent 90%) 68% 116%/160px 160px no-repeat,radial-gradient(circle closest-side,var(--b4,#fff6da) 0 98%,transparent 99%) 20% 56%/40px 40px no-repeat,linear-gradient(180deg,var(--b5,#e3f2f8),var(--b6,#c2e4ef) 50%,var(--b7,#a5d6e8)) 0% 0%/100% 100% no-repeat var(--b7,#a5d6e8) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-28px;right:18px;width:40px;height:53px;clip-path:polygon(50% 0,100% 100%,0 100%);animation:b307-d307b 34s ease-in-out infinite alternate;background:var(--b8,#3f7565);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-22px;left:24%;width:43px;height:14px;border-radius:6px;animation:b307-d307a 26s ease-in-out infinite alternate;background:var(--b2,#d9aa54);box-shadow:16px -6px 0 -2px #d9aa54,-14px 3px 0 -3px #d9aa54;}
+.msg-content[data-side="ai"]{border-radius:22px 22px 22px 6px}
+.msg-content[data-side="user"]{border-radius:22px 22px 6px 22px;background-position:0% 0%,100% 100%,32% 116%,80% 56%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{color:var(--b9,#e2f1f8) !important;text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b20,rgba(6,10,24,0.41)) 0%,var(--b21,rgba(6,10,24,0.21)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,22Q26,6,52,20Q78,33,120,14L120,40Z%22%20fill=%22%230a1e1a%22/%3E%3Cpath%20d=%22M0,40L0,32Q30,20,60,31Q90,41,120,28L120,40Z%22%20fill=%22%23051210%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,radial-gradient(circle closest-side,transparent 0 58%,var(--b10,#7a3f38) 58% 68%,var(--b11,#7a5f30) 68% 79%,var(--b12,#3a4f75) 79% 90%,transparent 90%) 68% 116%/160px 160px no-repeat,radial-gradient(circle closest-side,var(--b13,#778e9e) 0 98%,transparent 99%) 20% 56%/34px 34px no-repeat,linear-gradient(180deg,var(--b14,#050f1c),var(--b15,#0c2030) 50%,var(--b16,#143046)) 0% 0%/100% 100% no-repeat var(--b16,#143046) !important}
+:is(:scope.dark,.dark :scope) .msg-content *{color:var(--b9,#e2f1f8) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b17,#d9ecf5);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b17,#d9ecf5);box-shadow:10px -4px 0 -1px #d9ecf5,-9px 2px 0 -2px #d9ecf5;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,32% 116%,80% 56%,0% 0% !important}
+}
+
+/* 308 Canyon */
+@keyframes b308-d308a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b308-d308b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="308"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#ad7e6e);--cai-tx:var(--bub-ai-tx,#2e1409)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ad7e6e);--cai-tx:var(--bub-user-tx,#2e1409)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 0 rgba(255,255,255,0.6);background:linear-gradient(180deg,var(--b10,rgba(255,255,255,0.19)) 0%,var(--b11,rgba(255,255,255,0.39)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,44%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,44L0,20L16,20L16,12L40,12L40,22L64,22L64,8L88,8L88,18L106,18L106,26L120,26L120,44Z%22%20fill=%22%23b25f3e%22/%3E%3Cpath%20d=%22M0,44L0,32L22,32L22,26L48,26L48,34L76,34L76,24L100,24L100,32L120,32L120,44Z%22%20fill=%22%238a4630%22/%3E%3C/svg%3E) 0% 100%/100% 50% no-repeat,linear-gradient(180deg,var(--b1,#ffe0b8),var(--b2,#ffb887) 50%,var(--b3,#f2946a)) 0% 0%/100% 100% no-repeat var(--b3,#f2946a) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:20px;width:53px;height:53px;border-radius:50%;animation:b308-d308b 32s ease-in-out infinite alternate;background:var(--b4,#df7238);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-20px;left:24%;width:47px;height:19px;animation:b308-d308a 30s ease-in-out infinite alternate;background:url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,30,12%22%3E%3Cpath%20d=%22M2,8q4,-5,8,0q4,-5,8,0%22%20fill=%22none%22%20stroke=%22%238a4630%22%20stroke-width=%221.4%22/%3E%3Cpath%20d=%22M17,4q3,-4,6,0q3,-4,6,0%22%20fill=%22none%22%20stroke=%22%238a4630%22%20stroke-width=%221.2%22/%3E%3C/svg%3E) 0% 0%/100% 100% no-repeat;}
+.msg-content[data-side="ai"]{border-radius:18px 18px 18px 5px}
+.msg-content[data-side="user"]{border-radius:18px 18px 5px 18px;background-position:0% 0%,100% 100%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{color:var(--b5,#f7e9e1) !important;text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b12,rgba(6,10,24,0.38)) 0%,var(--b13,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,44%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,44L0,20L16,20L16,12L40,12L40,22L64,22L64,8L88,8L88,18L106,18L106,26L120,26L120,44Z%22%20fill=%22%232a1520%22/%3E%3Cpath%20d=%22M0,44L0,32L22,32L22,26L48,26L48,34L76,34L76,24L100,24L100,32L120,32L120,44Z%22%20fill=%22%23180b12%22/%3E%3C/svg%3E) 0% 100%/100% 50% no-repeat,linear-gradient(180deg,var(--b6,#150e20),var(--b7,#2a1730) 50%,var(--b8,#3c2036)) 0% 0%/100% 100% no-repeat var(--b8,#3c2036) !important}
+:is(:scope.dark,.dark :scope) .msg-content *{color:var(--b5,#f7e9e1) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b9,#eeddd4);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,30,12%22%3E%3Cpath%20d=%22M2,8q4,-5,8,0q4,-5,8,0%22%20fill=%22none%22%20stroke=%22%23eeddd4%22%20stroke-width=%221.4%22/%3E%3Cpath%20d=%22M17,4q3,-4,6,0q3,-4,6,0%22%20fill=%22none%22%20stroke=%22%23eeddd4%22%20stroke-width=%221.2%22/%3E%3C/svg%3E) 0% 0%/100% 100% no-repeat;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,0% 0% !important}
+}
+
+/* 309 Volcano */
+@keyframes b309-d309a{0%{opacity:1}100%{opacity:0.78}}
+@keyframes b309-d309b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="309"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#905b41);--cai-tx:var(--bub-ai-tx,#ffeee2)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#905b41);--cai-tx:var(--bub-user-tx,#ffeee2)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 3px rgba(5,9,20,0.75);background:linear-gradient(180deg,var(--b12,rgba(6,10,24,0.49)) 0%,var(--b13,rgba(6,10,24,0.29)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,44%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,44L0,34L26,34L44,12L52,6L62,6L70,12L92,34L120,34L120,44Z%22%20fill=%22%232b0d1c%22/%3E%3Cpath%20d=%22M0,44L0,40L34,40L52,20L62,20L80,40L120,40L120,44Z%22%20fill=%22%237a2418%22/%3E%3C/svg%3E) 0% 100%/100% 52% no-repeat,radial-gradient(circle closest-side,var(--b1,#df8958) 0 98%,transparent 99%) 22% 52%/36px 36px no-repeat,linear-gradient(180deg,var(--b2,#3a1030),var(--b3,#7a1f34) 50%,var(--b4,#bf4326)) 0% 0%/100% 100% no-repeat var(--b4,#bf4326) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-28px;right:18px;width:40px;height:53px;clip-path:polygon(50% 0,100% 100%,0 100%);animation:b309-d309b 34s ease-in-out infinite alternate;background:var(--b5,#2b0d1c);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-18px;left:26%;width:6px;height:6px;border-radius:50%;animation:b309-d309a 11s ease-in-out infinite alternate;background:var(--b6,#7a2418);box-shadow:14px 9px 0 -2px #7a2418,-15px 6px 0 -2px #7a2418,23px -5px 0 -2px #7a2418;}
+.msg-content[data-side="ai"]{border-radius:20px 20px 20px 5px}
+.msg-content[data-side="user"]{border-radius:20px 20px 5px 20px;background-position:0% 0%,100% 100%,78% 52%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b14,rgba(6,10,24,0.38)) 0%,var(--b15,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,44%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,44L0,34L26,34L44,12L52,6L62,6L70,12L92,34L120,34L120,44Z%22%20fill=%22%230a0410%22/%3E%3Cpath%20d=%22M0,44L0,40L34,40L52,20L62,20L80,40L120,40L120,44Z%22%20fill=%22%23571812%22/%3E%3C/svg%3E) 0% 100%/100% 52% no-repeat,radial-gradient(circle closest-side,var(--b7,#976148) 0 98%,transparent 99%) 22% 52%/30px 30px no-repeat,linear-gradient(180deg,var(--b8,#0d0512),var(--b9,#210a1c) 50%,var(--b10,#3d1220)) 0% 0%/100% 100% no-repeat var(--b10,#3d1220) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b11,#f0b070);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b11,#f0b070);box-shadow:9px 6px 0 -1px #f0b070,-10px 4px 0 -1px #f0b070,15px -3px 0 -1px #f0b070;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,78% 52%,0% 0% !important}
+}
+
+/* 310 Falls */
+@keyframes b310-d310a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b310-d310b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="310"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#82a49c);--cai-tx:var(--bub-ai-tx,#0f251f)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#82a49c);--cai-tx:var(--bub-user-tx,#0f251f)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 0 rgba(255,255,255,0.6);background:linear-gradient(180deg,var(--b10,rgba(255,255,255,0.18)) 0%,var(--b11,rgba(255,255,255,0.38)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,46%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,46L0,9L46,9L46,46Z%22%20fill=%22%234f7f74%22/%3E%3Cpath%20d=%22M74,46L74,4L120,4L120,46Z%22%20fill=%22%234f7f74%22/%3E%3Cpath%20d=%22M48,11L72,11L70,46L50,46Z%22%20fill=%22%23cfeae4%22/%3E%3C/svg%3E) 0% 100%/100% 56% no-repeat,linear-gradient(180deg,var(--b1,#e4f3ed),var(--b2,#bde2d6) 50%,var(--b3,#95d0c1)) 0% 0%/100% 100% no-repeat var(--b3,#95d0c1) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-28px;right:18px;width:40px;height:53px;clip-path:polygon(50% 0,100% 100%,0 100%);animation:b310-d310b 34s ease-in-out infinite alternate;background:var(--b4,#4f7f74);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-20px;left:24%;width:47px;height:19px;animation:b310-d310a 30s ease-in-out infinite alternate;background:url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,30,12%22%3E%3Cpath%20d=%22M2,8q4,-5,8,0q4,-5,8,0%22%20fill=%22none%22%20stroke=%22%234f7f74%22%20stroke-width=%221.4%22/%3E%3Cpath%20d=%22M17,4q3,-4,6,0q3,-4,6,0%22%20fill=%22none%22%20stroke=%22%234f7f74%22%20stroke-width=%221.2%22/%3E%3C/svg%3E) 0% 0%/100% 100% no-repeat;}
+.msg-content[data-side="ai"]{border-radius:18px 18px 18px 5px}
+.msg-content[data-side="user"]{border-radius:18px 18px 5px 18px;background-position:0% 0%,100% 100%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{color:var(--b5,#e0f4ee) !important;text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b12,rgba(6,10,24,0.38)) 0%,var(--b13,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,46%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,46L0,9L46,9L46,46Z%22%20fill=%22%2304150f%22/%3E%3Cpath%20d=%22M74,46L74,4L120,4L120,46Z%22%20fill=%22%2304150f%22/%3E%3Cpath%20d=%22M48,11L72,11L70,46L50,46Z%22%20fill=%22%2331685c%22/%3E%3C/svg%3E) 0% 100%/100% 56% no-repeat,linear-gradient(180deg,var(--b6,#04120f),var(--b7,#0b241f) 50%,var(--b8,#123830)) 0% 0%/100% 100% no-repeat var(--b8,#123830) !important}
+:is(:scope.dark,.dark :scope) .msg-content *{color:var(--b5,#e0f4ee) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b9,#8fc4b6);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,30,12%22%3E%3Cpath%20d=%22M2,8q4,-5,8,0q4,-5,8,0%22%20fill=%22none%22%20stroke=%22%238fc4b6%22%20stroke-width=%221.4%22/%3E%3Cpath%20d=%22M17,4q3,-4,6,0q3,-4,6,0%22%20fill=%22none%22%20stroke=%22%238fc4b6%22%20stroke-width=%221.2%22/%3E%3C/svg%3E) 0% 0%/100% 100% no-repeat;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,0% 0% !important}
+}
+
+/* 311 Fog Wood */
+@keyframes b311-d311a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b311-d311b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="311"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#a3b4af);--cai-tx:var(--bub-ai-tx,#17251f)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#a3b4af);--cai-tx:var(--bub-user-tx,#17251f)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 0 rgba(255,255,255,0.6);background:linear-gradient(180deg,var(--b12,rgba(255,255,255,0.18)) 0%,var(--b13,rgba(255,255,255,0.38)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,18,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M9,5L13,17L11,17L16,28L12,28L17,40L1,40L6,28L2,28L7,17L5,17Z%22%20fill=%22%237d968f%22/%3E%3C/svg%3E) 4% 100%/18px 32% repeat-x,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,40,30%22%20preserveAspectRatio=%22none%22%3E%3Ccircle%20cx=%2211%22%20cy=%2215%22%20r=%2210%22%20fill=%22%239db2ac%22/%3E%3Ccircle%20cx=%2228%22%20cy=%2212%22%20r=%2212%22%20fill=%22%239db2ac%22/%3E%3Crect%20x=%220%22%20y=%2221%22%20width=%2240%22%20height=%229%22%20fill=%22%239db2ac%22/%3E%3C/svg%3E) 0% 100%/40px 34% repeat-x,linear-gradient(180deg,transparent 0 40%,var(--b1,#eef4f2) 58%,transparent 76%) 0% 0%/100% 100% no-repeat,linear-gradient(180deg,var(--b2,#eff3f1),var(--b3,#d7e2de) 55%,var(--b4,#bfd2cd)) 0% 0%/100% 100% no-repeat var(--b4,#bfd2cd) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:18px;width:34px;height:59px;clip-path:polygon(50% 0,72% 34%,60% 34%,86% 70%,70% 70%,100% 100%,0 100%,30% 70%,14% 70%,40% 34%,28% 34%);animation:b311-d311b 36s ease-in-out infinite alternate;background:var(--b5,#7d968f);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-22px;left:24%;width:43px;height:14px;border-radius:6px;animation:b311-d311a 26s ease-in-out infinite alternate;background:var(--b1,#eef4f2);box-shadow:16px -6px 0 -2px #eef4f2,-14px 3px 0 -3px #eef4f2;}
+.msg-content[data-side="ai"]{border-radius:20px 20px 20px 6px}
+.msg-content[data-side="user"]{border-radius:20px 20px 6px 20px;background-position:0% 0%,96% 100%,100% 100%,100% 0%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{color:var(--b6,#e5f0ee) !important;text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b14,rgba(6,10,24,0.38)) 0%,var(--b15,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,18,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M9,5L13,17L11,17L16,28L12,28L17,40L1,40L6,28L2,28L7,17L5,17Z%22%20fill=%22%23040a0a%22/%3E%3C/svg%3E) 4% 100%/18px 32% repeat-x,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,40,30%22%20preserveAspectRatio=%22none%22%3E%3Ccircle%20cx=%2211%22%20cy=%2215%22%20r=%2210%22%20fill=%22%230b1516%22/%3E%3Ccircle%20cx=%2228%22%20cy=%2212%22%20r=%2212%22%20fill=%22%230b1516%22/%3E%3Crect%20x=%220%22%20y=%2221%22%20width=%2240%22%20height=%229%22%20fill=%22%230b1516%22/%3E%3C/svg%3E) 0% 100%/40px 34% repeat-x,linear-gradient(180deg,transparent 0 40%,var(--b7,#26393a) 58%,transparent 76%) 0% 0%/100% 100% no-repeat,linear-gradient(180deg,var(--b8,#080f10),var(--b9,#121e1f) 55%,var(--b10,#1c2d2e)) 0% 0%/100% 100% no-repeat var(--b10,#1c2d2e) !important}
+:is(:scope.dark,.dark :scope) .msg-content *{color:var(--b6,#e5f0ee) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b11,#9fb5b3);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b11,#9fb5b3);box-shadow:10px -4px 0 -1px #9fb5b3,-9px 2px 0 -2px #9fb5b3;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,96% 100%,100% 100%,100% 0%,0% 0% !important}
+}
+
+/* 312 River Bend */
+@keyframes b312-d312a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b312-d312b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="312"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#95b795);--cai-tx:var(--bub-ai-tx,#12241a)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#95b795);--cai-tx:var(--bub-user-tx,#12241a)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 0 rgba(255,255,255,0.6);background:linear-gradient(180deg,var(--b12,rgba(255,255,255,0.18)) 0%,var(--b13,rgba(255,255,255,0.38)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,44%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,44L0,26Q30,14,60,24Q92,34,120,20L120,44Z%22%20fill=%22%236a9a6a%22/%3E%3Cpath%20d=%22M50,44L42,32Q38,24,48,19Q58,14,54,6L64,6Q69,15,60,21Q50,26,58,34L66,44Z%22%20fill=%22%23bfe4ea%22/%3E%3C/svg%3E) 0% 100%/100% 48% no-repeat,radial-gradient(circle closest-side,var(--b1,#fff7dc) 0 98%,transparent 99%) 24% 56%/42px 42px no-repeat,linear-gradient(180deg,var(--b2,#ebf5e2),var(--b3,#c9e4c3) 50%,var(--b4,#a3d0a7)) 0% 0%/100% 100% no-repeat var(--b4,#a3d0a7) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:18px;width:34px;height:59px;clip-path:polygon(50% 0,72% 34%,60% 34%,86% 70%,70% 70%,100% 100%,0 100%,30% 70%,14% 70%,40% 34%,28% 34%);animation:b312-d312b 36s ease-in-out infinite alternate;background:var(--b5,#6a9a6a);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-20px;left:24%;width:47px;height:19px;animation:b312-d312a 30s ease-in-out infinite alternate;background:url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,30,12%22%3E%3Cpath%20d=%22M2,8q4,-5,8,0q4,-5,8,0%22%20fill=%22none%22%20stroke=%22%236a9a6a%22%20stroke-width=%221.4%22/%3E%3Cpath%20d=%22M17,4q3,-4,6,0q3,-4,6,0%22%20fill=%22none%22%20stroke=%22%236a9a6a%22%20stroke-width=%221.2%22/%3E%3C/svg%3E) 0% 0%/100% 100% no-repeat;}
+.msg-content[data-side="ai"]{border-radius:22px 22px 22px 6px}
+.msg-content[data-side="user"]{border-radius:22px 22px 6px 22px;background-position:0% 0%,100% 100%,76% 56%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{color:var(--b6,#e6f3e6) !important;text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b14,rgba(6,10,24,0.4)) 0%,var(--b15,rgba(6,10,24,0.2)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,44%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,44L0,26Q30,14,60,24Q92,34,120,20L120,44Z%22%20fill=%22%230a170f%22/%3E%3Cpath%20d=%22M50,44L42,32Q38,24,48,19Q58,14,54,6L64,6Q69,15,60,21Q50,26,58,34L66,44Z%22%20fill=%22%232f5a68%22/%3E%3C/svg%3E) 0% 100%/100% 48% no-repeat,radial-gradient(circle closest-side,var(--b7,#7b8f7d) 0 98%,transparent 99%) 24% 56%/34px 34px no-repeat,linear-gradient(180deg,var(--b8,#070f0c),var(--b9,#0e1e17) 50%,var(--b10,#173023)) 0% 0%/100% 100% no-repeat var(--b10,#173023) !important}
+:is(:scope.dark,.dark :scope) .msg-content *{color:var(--b6,#e6f3e6) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b11,#dfeed6);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,30,12%22%3E%3Cpath%20d=%22M2,8q4,-5,8,0q4,-5,8,0%22%20fill=%22none%22%20stroke=%22%23dfeed6%22%20stroke-width=%221.4%22/%3E%3Cpath%20d=%22M17,4q3,-4,6,0q3,-4,6,0%22%20fill=%22none%22%20stroke=%22%23dfeed6%22%20stroke-width=%221.2%22/%3E%3C/svg%3E) 0% 0%/100% 100% no-repeat;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,76% 56%,0% 0% !important}
+}
+
+/* 313 Sailfar */
+@keyframes b313-d313a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b313-d313b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="313"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#7695a3);--cai-tx:var(--bub-ai-tx,#0e2530)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#7695a3);--cai-tx:var(--bub-user-tx,#0e2530)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 0 rgba(255,255,255,0.6);background:linear-gradient(180deg,var(--b11,rgba(255,255,255,0.23)) 0%,var(--b12,rgba(255,255,255,0.43)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,60,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M22,30L34,30L34,4Z%22%20fill=%22%232f5f73%22/%3E%3Cpath%20d=%22M36,30L48,30L36,10Z%22%20fill=%22%232f5f73%22/%3E%3Cpath%20d=%22M14,32L52,32L46,39L20,39Z%22%20fill=%22%232f5f73%22/%3E%3C/svg%3E) 70% 100%/48px 40% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,32%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,32L0,12Q15,5,30,12T60,12T90,12T120,12L120,32Z%22%20fill=%22%234b93a8%22/%3E%3Cpath%20d=%22M0,32L0,22Q18,15,36,22T72,22T120,20L120,32Z%22%20fill=%22%2333718a%22/%3E%3C/svg%3E) 0% 100%/100% 38% no-repeat,linear-gradient(180deg,var(--b1,#ffeccc),var(--b2,#ffd0a4) 50%,var(--b3,#a9dae4)) 0% 0%/100% 100% no-repeat var(--b3,#a9dae4) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:20px;width:53px;height:53px;border-radius:50%;animation:b313-d313b 32s ease-in-out infinite alternate;background:var(--b4,#ef9a44);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-22px;left:24%;width:43px;height:14px;border-radius:6px;animation:b313-d313a 26s ease-in-out infinite alternate;background:var(--b5,#4b93a8);box-shadow:16px -6px 0 -2px #4b93a8,-14px 3px 0 -3px #4b93a8;}
+.msg-content[data-side="ai"]{border-radius:18px 18px 18px 5px}
+.msg-content[data-side="user"]{border-radius:18px 18px 5px 18px;background-position:0% 0%,30% 100%,100% 100%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{color:var(--b6,#e4f0fa) !important;text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b13,rgba(6,10,24,0.38)) 0%,var(--b14,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,60,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M22,30L34,30L34,4Z%22%20fill=%22%2308202f%22/%3E%3Cpath%20d=%22M36,30L48,30L36,10Z%22%20fill=%22%2308202f%22/%3E%3Cpath%20d=%22M14,32L52,32L46,39L20,39Z%22%20fill=%22%2308202f%22/%3E%3C/svg%3E) 70% 100%/48px 40% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,32%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,32L0,12Q15,5,30,12T60,12T90,12T120,12L120,32Z%22%20fill=%22%230c2134%22/%3E%3Cpath%20d=%22M0,32L0,22Q18,15,36,22T72,22T120,20L120,32Z%22%20fill=%22%23061423%22/%3E%3C/svg%3E) 0% 100%/100% 38% no-repeat,linear-gradient(180deg,var(--b7,#060f1e),var(--b8,#0e2036) 50%,var(--b9,#173049)) 0% 0%/100% 100% no-repeat var(--b9,#173049) !important}
+:is(:scope.dark,.dark :scope) .msg-content *{color:var(--b6,#e4f0fa) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b10,#dae9f5);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b10,#dae9f5);box-shadow:10px -4px 0 -1px #dae9f5,-9px 2px 0 -2px #dae9f5;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,30% 100%,100% 100%,0% 0% !important}
+}
+
+/* 314 Beacon */
+@keyframes b314-d314a{0%{opacity:1}100%{opacity:0.78}}
+@keyframes b314-d314b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="314"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#796261);--cai-tx:var(--bub-ai-tx,#f7eef6)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#796261);--cai-tx:var(--bub-user-tx,#f7eef6)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 3px rgba(5,9,20,0.75);background:linear-gradient(180deg,var(--b12,rgba(6,10,24,0.52)) 0%,var(--b13,rgba(6,10,24,0.32)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,46%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,46L0,38Q28,29,58,35Q88,41,120,35L120,46Z%22%20fill=%22%231c2138%22/%3E%3Cpath%20d=%22M55,38L57,15L59,7L63,7L65,15L67,38Z%22%20fill=%22%231c2138%22/%3E%3C/svg%3E) 0% 100%/100% 50% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,32%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,32L0,12Q15,5,30,12T60,12T90,12T120,12L120,32Z%22%20fill=%22%233a3554%22/%3E%3Cpath%20d=%22M0,32L0,22Q18,15,36,22T72,22T120,20L120,32Z%22%20fill=%22%23262238%22/%3E%3C/svg%3E) 0% 100%/100% 38% no-repeat,radial-gradient(circle closest-side,var(--b1,#c59c91) 0 98%,transparent 99%) 76% 54%/34px 34px no-repeat,linear-gradient(180deg,var(--b2,#28324f),var(--b3,#4d4a72) 50%,var(--b4,#8a5f7a)) 0% 0%/100% 100% no-repeat var(--b4,#8a5f7a) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:22px;width:20px;height:56px;border-radius:7px 7px 0 0;animation:b314-d314b 40s ease-in-out infinite alternate;background:var(--b5,#1c2138);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-18px;left:26%;width:6px;height:6px;border-radius:50%;animation:b314-d314a 11s ease-in-out infinite alternate;background:var(--b6,#3a3554);box-shadow:14px 9px 0 -2px #3a3554,-15px 6px 0 -2px #3a3554,23px -5px 0 -2px #3a3554;}
+.msg-content[data-side="ai"]{border-radius:20px 20px 20px 5px}
+.msg-content[data-side="user"]{border-radius:20px 20px 5px 20px;background-position:0% 0%,100% 100%,100% 100%,24% 54%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b14,rgba(6,10,24,0.38)) 0%,var(--b15,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,46%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,46L0,38Q28,29,58,35Q88,41,120,35L120,46Z%22%20fill=%22%2303060e%22/%3E%3Cpath%20d=%22M55,38L57,15L59,7L63,7L65,15L67,38Z%22%20fill=%22%2303060e%22/%3E%3C/svg%3E) 0% 100%/100% 50% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,32%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,32L0,12Q15,5,30,12T60,12T90,12T120,12L120,32Z%22%20fill=%22%230a0f20%22/%3E%3Cpath%20d=%22M0,32L0,22Q18,15,36,22T72,22T120,20L120,32Z%22%20fill=%22%23050813%22/%3E%3C/svg%3E) 0% 100%/100% 38% no-repeat,radial-gradient(circle closest-side,var(--b7,#887264) 0 98%,transparent 99%) 76% 54%/30px 30px no-repeat,linear-gradient(180deg,var(--b8,#050914),var(--b9,#0d1428) 50%,var(--b10,#1d1a38)) 0% 0%/100% 100% no-repeat var(--b10,#1d1a38) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b11,#f2c98f);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b11,#f2c98f);box-shadow:9px 6px 0 -1px #f2c98f,-10px 4px 0 -1px #f2c98f,15px -3px 0 -1px #f2c98f;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,100% 100%,24% 54%,0% 0% !important}
+}
+
+/* 315 Skyline */
+@keyframes b315-d315a{0%{opacity:1}100%{opacity:0.78}}
+@keyframes b315-d315b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="315"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#7f6155);--cai-tx:var(--bub-ai-tx,#f6eefb)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#7f6155);--cai-tx:var(--bub-user-tx,#f6eefb)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 3px rgba(5,9,20,0.75);background:linear-gradient(180deg,var(--b11,rgba(6,10,24,0.56)) 0%,var(--b12,rgba(6,10,24,0.36)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,27L9,27L9,13L18,13L18,27L26,27L26,20L36,20L36,6L45,6L45,27L55,27L55,17L65,17L65,29L74,29L74,11L83,11L83,27L93,27L93,21L102,21L102,31L111,31L111,24L120,24L120,40Z%22%20fill=%22%231b1d38%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,radial-gradient(circle closest-side,var(--b1,#dca484) 0 98%,transparent 99%) 74% 58%/34px 34px no-repeat,linear-gradient(180deg,var(--b2,#2a2f52),var(--b3,#5b4a7a) 50%,var(--b4,#b8746e)) 0% 0%/100% 100% no-repeat var(--b4,#b8746e) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:22px;width:20px;height:56px;border-radius:7px 7px 0 0;animation:b315-d315b 40s ease-in-out infinite alternate;background:var(--b5,#1b1d38);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-18px;left:26%;width:6px;height:6px;border-radius:50%;animation:b315-d315a 11s ease-in-out infinite alternate;background:var(--b5,#1b1d38);box-shadow:14px 9px 0 -2px #1b1d38,-15px 6px 0 -2px #1b1d38,23px -5px 0 -2px #1b1d38;}
+.msg-content[data-side="ai"]{border-radius:16px 16px 16px 4px}
+.msg-content[data-side="user"]{border-radius:16px 16px 4px 16px;background-position:0% 0%,100% 100%,26% 58%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b13,rgba(6,10,24,0.38)) 0%,var(--b14,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,27L9,27L9,13L18,13L18,27L26,27L26,20L36,20L36,6L45,6L45,27L55,27L55,17L65,17L65,29L74,29L74,11L83,11L83,27L93,27L93,21L102,21L102,31L111,31L111,24L120,24L120,40Z%22%20fill=%22%2304060f%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,radial-gradient(circle closest-side,var(--b6,#7d84a8) 0 98%,transparent 99%) 74% 58%/28px 28px no-repeat,linear-gradient(180deg,var(--b7,#060a18),var(--b8,#101836) 50%,var(--b9,#1e2450)) 0% 0%/100% 100% no-repeat var(--b9,#1e2450) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b10,#dbe4ff);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b10,#dbe4ff);box-shadow:9px 6px 0 -1px #dbe4ff,-10px 4px 0 -1px #dbe4ff,15px -3px 0 -1px #dbe4ff;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,26% 58%,0% 0% !important}
+}
+
+/* 316 Balloons */
+@keyframes b316-d316a{0%{transform:translateX(-6px)}100%{transform:translateX(9px)}}
+@keyframes b316-d316b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="316"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#7c9cbe);--cai-tx:var(--bub-ai-tx,#152420)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#7c9cbe);--cai-tx:var(--bub-user-tx,#152420)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 0 rgba(255,255,255,0.6);background:linear-gradient(180deg,var(--b14,rgba(255,255,255,0.18)) 0%,var(--b15,rgba(255,255,255,0.38)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,64,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M15,3C22,3,26,9,26,15C26,22,19,27,15,31C11,27,4,22,4,15C4,9,8,3,15,3Z%22%20fill=%22%23c9705f%22/%3E%3Cpath%20d=%22M13,31L17,31L18,35L12,35Z%22%20fill=%22%23c9705f%22/%3E%3Cpath%20d=%22M46,12C51,12,54,16,54,20C54,25,49,28,46,31C43,28,38,25,38,20C38,16,41,12,46,12Z%22%20fill=%22%235f86b0%22/%3E%3Cpath%20d=%22M44,31L48,31L49,34L43,34Z%22%20fill=%22%235f86b0%22/%3E%3C/svg%3E) 0% 0%/64px 52% repeat-x,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,22Q26,6,52,20Q78,33,120,14L120,40Z%22%20fill=%22%2384a878%22/%3E%3Cpath%20d=%22M0,40L0,32Q30,20,60,31Q90,41,120,28L120,40Z%22%20fill=%22%235f8259%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,radial-gradient(circle closest-side,var(--b1,#fff8e6) 0 98%,transparent 99%) 80% 54%/38px 38px no-repeat,linear-gradient(180deg,var(--b2,#fff0dc),var(--b3,#ffd6b4) 50%,var(--b4,#bfe4ef)) 0% 0%/100% 100% no-repeat var(--b4,#bfe4ef) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:20px;width:37px;height:47px;border-radius:50% 50% 46% 46%/58% 58% 42% 42%;animation:b316-d316b 30s ease-in-out infinite alternate;background:var(--b5,#c9705f);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-26px;left:28%;width:26px;height:33px;border-radius:50% 50% 46% 46%/58% 58% 42% 42%;animation:b316-d316a 28s ease-in-out infinite alternate;background:var(--b6,#5f86b0);}
+.msg-content[data-side="ai"]{border-radius:22px 22px 22px 6px}
+.msg-content[data-side="user"]{border-radius:22px 22px 6px 22px;background-position:0% 0%,100% 0%,100% 100%,20% 54%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{color:var(--b7,#e9f0fb) !important;text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b16,rgba(6,10,24,0.42)) 0%,var(--b17,rgba(6,10,24,0.22)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,64,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M15,3C22,3,26,9,26,15C26,22,19,27,15,31C11,27,4,22,4,15C4,9,8,3,15,3Z%22%20fill=%22%235c3330%22/%3E%3Cpath%20d=%22M13,31L17,31L18,35L12,35Z%22%20fill=%22%235c3330%22/%3E%3Cpath%20d=%22M46,12C51,12,54,16,54,20C54,25,49,28,46,31C43,28,38,25,38,20C38,16,41,12,46,12Z%22%20fill=%22%232c3f5e%22/%3E%3Cpath%20d=%22M44,31L48,31L49,34L43,34Z%22%20fill=%22%232c3f5e%22/%3E%3C/svg%3E) 0% 0%/64px 52% repeat-x,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,22Q26,6,52,20Q78,33,120,14L120,40Z%22%20fill=%22%23122018%22/%3E%3Cpath%20d=%22M0,40L0,32Q30,20,60,31Q90,41,120,28L120,40Z%22%20fill=%22%2308130d%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,radial-gradient(circle closest-side,var(--b8,#838eaa) 0 98%,transparent 99%) 80% 54%/32px 32px no-repeat,linear-gradient(180deg,var(--b9,#0a0f22),var(--b10,#171f3e) 50%,var(--b11,#243055)) 0% 0%/100% 100% no-repeat var(--b11,#243055) !important}
+:is(:scope.dark,.dark :scope) .msg-content *{color:var(--b7,#e9f0fb) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b12,#e0907f);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b13,#9fb6e0);}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 0%,100% 100%,20% 54%,0% 0% !important}
+}
+
+/* 317 Star Meadow */
+@keyframes b317-d317a{0%{opacity:1}100%{opacity:0.78}}
+@keyframes b317-d317b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="317"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#3d4e70);--cai-tx:var(--bub-ai-tx,#eff4ff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#3d4e70);--cai-tx:var(--bub-user-tx,#eff4ff)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 3px rgba(5,9,20,0.75);background:linear-gradient(180deg,var(--b10,rgba(6,10,24,0.38)) 0%,var(--b11,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,40,18%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,18L0,10Q10,3,20,10Q30,16,40,8L40,18Z%22%20fill=%22%2316223a%22/%3E%3C/svg%3E) 0% 100%/40px 22% repeat-x,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,22Q26,6,52,20Q78,33,120,14L120,40Z%22%20fill=%22%23233355%22/%3E%3Cpath%20d=%22M0,40L0,32Q30,20,60,31Q90,41,120,28L120,40Z%22%20fill=%22%23182742%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,linear-gradient(180deg,var(--b1,#1b2a4a),var(--b2,#2f4368) 50%,var(--b3,#4a5f86)) 0% 0%/100% 100% no-repeat var(--b3,#4a5f86) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:20px;width:53px;height:53px;border-radius:50%;animation:b317-d317b 32s ease-in-out infinite alternate;background:var(--b4,#7a8ab5);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-18px;left:26%;width:6px;height:6px;border-radius:50%;animation:b317-d317a 11s ease-in-out infinite alternate;background:var(--b5,#233355);box-shadow:14px 9px 0 -2px #233355,-15px 6px 0 -2px #233355,23px -5px 0 -2px #233355;}
+.msg-content[data-side="ai"]{border-radius:20px 20px 20px 6px}
+.msg-content[data-side="user"]{border-radius:20px 20px 6px 20px;background-position:0% 0%,100% 100%,100% 100%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b10,rgba(6,10,24,0.38)) 0%,var(--b11,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,40,18%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,18L0,10Q10,3,20,10Q30,16,40,8L40,18Z%22%20fill=%22%2303060f%22/%3E%3C/svg%3E) 0% 100%/40px 22% repeat-x,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,22Q26,6,52,20Q78,33,120,14L120,40Z%22%20fill=%22%23080d22%22/%3E%3Cpath%20d=%22M0,40L0,32Q30,20,60,31Q90,41,120,28L120,40Z%22%20fill=%22%23040713%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,linear-gradient(180deg,var(--b6,#04081a),var(--b7,#0b1230) 50%,var(--b8,#141c46)) 0% 0%/100% 100% no-repeat var(--b8,#141c46) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b9,#cdd8f5);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b9,#cdd8f5);box-shadow:9px 6px 0 -1px #cdd8f5,-10px 4px 0 -1px #cdd8f5,15px -3px 0 -1px #cdd8f5;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,100% 100%,0% 0% !important}
+}
+
+/* 318 Moon Dunes */
+@keyframes b318-d318a{0%{opacity:1}100%{opacity:0.78}}
+@keyframes b318-d318b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="318"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#4a4565);--cai-tx:var(--bub-ai-tx,#f4f1ff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#4a4565);--cai-tx:var(--bub-user-tx,#f4f1ff)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 3px rgba(5,9,20,0.75);background:linear-gradient(180deg,var(--b10,rgba(6,10,24,0.38)) 0%,var(--b11,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,24Q30,8,62,22Q88,33,120,16L120,40Z%22%20fill=%22%23312f4e%22/%3E%3Cpath%20d=%22M0,40L0,34Q34,22,66,33Q94,41,120,30L120,40Z%22%20fill=%22%23221f38%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,linear-gradient(180deg,var(--b1,#1e2340),var(--b2,#37395e) 50%,var(--b3,#5b5378)) 0% 0%/100% 100% no-repeat var(--b3,#5b5378) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:20px;width:53px;height:53px;border-radius:50%;animation:b318-d318b 32s ease-in-out infinite alternate;background:var(--b4,#9a8dc2);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-18px;left:26%;width:6px;height:6px;border-radius:50%;animation:b318-d318a 11s ease-in-out infinite alternate;background:var(--b5,#312f4e);box-shadow:14px 9px 0 -2px #312f4e,-15px 6px 0 -2px #312f4e,23px -5px 0 -2px #312f4e;}
+.msg-content[data-side="ai"]{border-radius:20px 20px 20px 6px}
+.msg-content[data-side="user"]{border-radius:20px 20px 6px 20px;background-position:0% 0%,100% 100%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b10,rgba(6,10,24,0.38)) 0%,var(--b11,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,24Q30,8,62,22Q88,33,120,16L120,40Z%22%20fill=%22%230d1028%22/%3E%3Cpath%20d=%22M0,40L0,34Q34,22,66,33Q94,41,120,30L120,40Z%22%20fill=%22%23070a18%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,linear-gradient(180deg,var(--b6,#070a1e),var(--b7,#12163a) 50%,var(--b8,#1e2350)) 0% 0%/100% 100% no-repeat var(--b8,#1e2350) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b9,#d4cef0);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b9,#d4cef0);box-shadow:9px 6px 0 -1px #d4cef0,-10px 4px 0 -1px #d4cef0,15px -3px 0 -1px #d4cef0;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,0% 0% !important}
+}
+
+/* 319 Crescent */
+@keyframes b319-d319a{0%{opacity:1}100%{opacity:0.78}}
+@keyframes b319-d319b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="319"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#574b69);--cai-tx:var(--bub-ai-tx,#f8f2ff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#574b69);--cai-tx:var(--bub-user-tx,#f8f2ff)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 3px rgba(5,9,20,0.75);background:linear-gradient(180deg,var(--b9,rgba(6,10,24,0.38)) 0%,var(--b10,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,24Q30,8,62,22Q88,33,120,16L120,40Z%22%20fill=%22%233a3152%22/%3E%3Cpath%20d=%22M0,40L0,34Q34,22,66,33Q94,41,120,30L120,40Z%22%20fill=%22%2328213a%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,linear-gradient(180deg,var(--b1,#241f3e),var(--b2,#3d3560) 50%,var(--b3,#6b5b7d)) 0% 0%/100% 100% no-repeat var(--b3,#6b5b7d) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-30px;right:20px;width:50px;height:50px;border-radius:50%;animation:b319-d319b 38s ease-in-out infinite alternate;background:url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,34,34%22%3E%3Cpath%20d=%22M17,2A15,15,0,1,0,17,32A19,19,0,1,1,17,2Z%22%20fill=%22%23c2a862%22/%3E%3C/svg%3E) 0% 0%/100% 100% no-repeat;}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-18px;left:26%;width:6px;height:6px;border-radius:50%;animation:b319-d319a 11s ease-in-out infinite alternate;background:var(--b4,#3a3152);box-shadow:14px 9px 0 -2px #3a3152,-15px 6px 0 -2px #3a3152,23px -5px 0 -2px #3a3152;}
+.msg-content[data-side="ai"]{border-radius:20px 20px 20px 6px}
+.msg-content[data-side="user"]{border-radius:20px 20px 6px 20px;background-position:0% 0%,100% 100%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b9,rgba(6,10,24,0.38)) 0%,var(--b10,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,40%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,40L0,24Q30,8,62,22Q88,33,120,16L120,40Z%22%20fill=%22%23100c22%22/%3E%3Cpath%20d=%22M0,40L0,34Q34,22,66,33Q94,41,120,30L120,40Z%22%20fill=%22%23080614%22/%3E%3C/svg%3E) 0% 100%/100% 44% no-repeat,linear-gradient(180deg,var(--b5,#080718),var(--b6,#141031) 50%,var(--b7,#221a44)) 0% 0%/100% 100% no-repeat var(--b7,#221a44) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,34,34%22%3E%3Cpath%20d=%22M17,2A15,15,0,1,0,17,32A19,19,0,1,1,17,2Z%22%20fill=%22%23e2d6b8%22/%3E%3C/svg%3E) 0% 0%/100% 100% no-repeat;}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b8,#e2d6b8);box-shadow:9px 6px 0 -1px #e2d6b8,-10px 4px 0 -1px #e2d6b8,15px -3px 0 -1px #e2d6b8;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,0% 0% !important}
+}
+
+/* 320 Meteors */
+@keyframes b320-d320a{0%{opacity:1}100%{opacity:0.78}}
+@keyframes b320-d320b{0%{transform:translateY(3px)}100%{transform:translateY(-3px)}}
+@scope ([data-bubble="320"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#5b688a);--cai-tx:var(--bub-ai-tx,#eef2ff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#5b688a);--cai-tx:var(--bub-user-tx,#eef2ff)}
+.msg-content{position:relative;isolation:isolate;overflow:visible;border-radius:20px;color:var(--cai-tx) !important;text-shadow:0 1px 3px rgba(5,9,20,0.75);background:linear-gradient(180deg,var(--b12,rgba(6,10,24,0.6)) 0%,var(--b13,rgba(6,10,24,0.4)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,44%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,44L18,11L33,25L52,6L70,27L86,15L104,29L120,13L120,44Z%22%20fill=%22%23141d3c%22/%3E%3Cpath%20d=%22M0,44L15,28L31,37L49,23L67,35L83,27L101,39L120,26L120,44Z%22%20fill=%22%230c1329%22/%3E%3C/svg%3E) 0% 100%/100% 50% no-repeat,linear-gradient(212deg,transparent 0 46%,var(--b1,#93a7d6) 46% 47%,transparent 47%) 0% 0%/58px 58px repeat,radial-gradient(circle closest-side,var(--b2,#8993b7) 0 98%,transparent 99%) 80% 52%/30px 30px no-repeat,linear-gradient(180deg,var(--b3,#101a38),var(--b4,#1f2b52) 50%,var(--b5,#33406e)) 0% 0%/100% 100% no-repeat var(--b5,#33406e) !important}
+.msg-content *{color:var(--cai-tx) !important}
+.msg-content::before{content:"";position:absolute;pointer-events:none;z-index:-1;top:-28px;right:18px;width:40px;height:53px;clip-path:polygon(50% 0,100% 100%,0 100%);animation:b320-d320b 34s ease-in-out infinite alternate;background:var(--b6,#0c1329);}
+.msg-content::after{content:"";position:absolute;pointer-events:none;z-index:-1;top:-18px;left:26%;width:6px;height:6px;border-radius:50%;animation:b320-d320a 11s ease-in-out infinite alternate;background:var(--b1,#93a7d6);box-shadow:14px 9px 0 -2px #93a7d6,-15px 6px 0 -2px #93a7d6,23px -5px 0 -2px #93a7d6;}
+.msg-content[data-side="ai"]{border-radius:18px 18px 18px 5px}
+.msg-content[data-side="user"]{border-radius:18px 18px 5px 18px;background-position:0% 0%,100% 100%,100% 0%,20% 52%,0% 0% !important}
+.msg-content[data-side="user"]::before{right:auto;left:20px}
+.msg-content[data-side="user"]::after{left:auto;right:24%}
+:is(:scope.dark,.dark :scope) .msg-content{text-shadow:0 1px 3px rgba(3,6,16,0.8);background:linear-gradient(180deg,var(--b14,rgba(6,10,24,0.38)) 0%,var(--b15,rgba(6,10,24,0.18)) 100%) 0% 0%/100% 100% no-repeat,url(data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220,0,120,44%22%20preserveAspectRatio=%22none%22%3E%3Cpath%20d=%22M0,44L18,11L33,25L52,6L70,27L86,15L104,29L120,13L120,44Z%22%20fill=%22%23060b18%22/%3E%3Cpath%20d=%22M0,44L15,28L31,37L49,23L67,35L83,27L101,39L120,26L120,44Z%22%20fill=%22%2303060e%22/%3E%3C/svg%3E) 0% 100%/100% 50% no-repeat,linear-gradient(212deg,transparent 0 46%,var(--b7,#5c6d9c) 46% 47%,transparent 47%) 0% 0%/58px 58px repeat,radial-gradient(circle closest-side,var(--b8,#6c7694) 0 98%,transparent 99%) 80% 52%/26px 26px no-repeat,linear-gradient(180deg,var(--b9,#03060f),var(--b10,#080f24) 50%,var(--b3,#101a38)) 0% 0%/100% 100% no-repeat var(--b3,#101a38) !important}
+:is(:scope.dark,.dark :scope) .msg-content::before{background:var(--b11,#c8d2ef);}
+:is(:scope.dark,.dark :scope) .msg-content::after{background:var(--b11,#c8d2ef);box-shadow:9px 6px 0 -1px #c8d2ef,-10px 4px 0 -1px #c8d2ef,15px -3px 0 -1px #c8d2ef;}
+:is(:scope.dark,.dark :scope) .msg-content[data-side="user"]{background-position:0% 0%,100% 100%,100% 0%,20% 52%,0% 0% !important}
+}
+
+/* 321 Cat Paw */
+@keyframes b321-an321-knead{0%, 100% { transform: rotate(-2.5deg); } 50% { transform: rotate(2.5deg); }}
+@scope ([data-bubble="321"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#eef3ff);--cai-tx:var(--bub-ai-tx,#2f3550)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#dce8ff);--cai-tx:var(--bub-user-tx,#2f3550)}
+.msg-content{isolation: isolate; color: var(--b1,#2f3550); position: relative; overflow: visible; box-shadow: 0 2px 10px rgba(47,53,80,0.12);}
+.msg-content[data-side="ai"]{background: var(--b2,#eef3ff); border-radius: 18px 18px 18px 6px;}
+.msg-content[data-side="user"]{background: var(--b3,#dce8ff); border-radius: 18px 18px 6px 18px;}
+.msg-content::before{content: ""; position: absolute; top: -28px; left: 12px; width: 66px; height: 50px; z-index: -1; pointer-events: none; background: linear-gradient(180deg, var(--b4,#6d66a4) 0%, var(--b5,#b9b2d8) 7%, var(--b6,#fbfaff) 24%, var(--b7,#f4f1fc) 62%, var(--b8,#e4ddf5) 100%); -webkit-mask: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2064%2048%27%3E%3Cg%20fill%3D%27%2523fff%27%3E%20%3Cpath%20d%3D%27M4%2012%20Q7%202%2011%2012%20Z%27%2F%3E%3Cpath%20d%3D%27M19%205%20Q23%20-4%2027%205%20Z%27%2F%3E%20%3Cpath%20d%3D%27M39%205%20Q43%20-4%2047%205%20Z%27%2F%3E%3Cpath%20d%3D%27M55%2012%20Q59%202%2062%2012%20Z%27%2F%3E%20%3Cellipse%20cx%3D%279.5%27%20cy%3D%2717%27%20rx%3D%278.4%27%20ry%3D%2710.6%27%2F%3E%20%3Cellipse%20cx%3D%2724.5%27%20cy%3D%2710%27%20rx%3D%278.9%27%20ry%3D%2711.3%27%2F%3E%20%3Cellipse%20cx%3D%2741.5%27%20cy%3D%2710%27%20rx%3D%278.9%27%20ry%3D%2711.3%27%2F%3E%20%3Cellipse%20cx%3D%2756.5%27%20cy%3D%2717%27%20rx%3D%278.4%27%20ry%3D%2710.6%27%2F%3E%20%3Cellipse%20cx%3D%2733%27%20cy%3D%2737%27%20rx%3D%2720.5%27%20ry%3D%2715%27%2F%3E%20%3C%2Fg%3E%3C%2Fsvg%3E") no-repeat center / 100% 100%; mask: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2064%2048%27%3E%3Cg%20fill%3D%27%2523fff%27%3E%20%3Cpath%20d%3D%27M4%2012%20Q7%202%2011%2012%20Z%27%2F%3E%3Cpath%20d%3D%27M19%205%20Q23%20-4%2027%205%20Z%27%2F%3E%20%3Cpath%20d%3D%27M39%205%20Q43%20-4%2047%205%20Z%27%2F%3E%3Cpath%20d%3D%27M55%2012%20Q59%202%2062%2012%20Z%27%2F%3E%20%3Cellipse%20cx%3D%279.5%27%20cy%3D%2717%27%20rx%3D%278.4%27%20ry%3D%2710.6%27%2F%3E%20%3Cellipse%20cx%3D%2724.5%27%20cy%3D%2710%27%20rx%3D%278.9%27%20ry%3D%2711.3%27%2F%3E%20%3Cellipse%20cx%3D%2741.5%27%20cy%3D%2710%27%20rx%3D%278.9%27%20ry%3D%2711.3%27%2F%3E%20%3Cellipse%20cx%3D%2756.5%27%20cy%3D%2717%27%20rx%3D%278.4%27%20ry%3D%2710.6%27%2F%3E%20%3Cellipse%20cx%3D%2733%27%20cy%3D%2737%27%20rx%3D%2720.5%27%20ry%3D%2715%27%2F%3E%20%3C%2Fg%3E%3C%2Fsvg%3E") no-repeat center / 100% 100%; filter: drop-shadow(0 0 1px rgba(140,133,186,0.9)) drop-shadow(0 0 1px rgba(140,133,186,0.55)) drop-shadow(0 3px 4px rgba(88,82,132,0.30));}
+.msg-content::after{content: ""; position: absolute; top: -28px; left: 12px; width: 66px; height: 50px; z-index: -1; pointer-events: none; background: radial-gradient(ellipse 2.0px 2.0px at 23.6px 8.3px, var(--b13,rgba(255,255,255,0.92)) 0%, var(--b14,rgba(255,255,255,0)) 100%), radial-gradient(ellipse 3.2px 2.3px at 25.9px 14.6px, var(--b9,#ffb3d4) 0%, var(--b15,rgba(255,179,212,0)) 100%), radial-gradient(ellipse 5.9px 7.5px at 25.3px 10.8px, var(--b10,#8ff2ff) 0%, var(--b11,#35c9ee) 52%, var(--b12,#1892b9) 100%), radial-gradient(ellipse 2.0px 2.0px at 41.2px 8.3px, var(--b13,rgba(255,255,255,0.92)) 0%, var(--b14,rgba(255,255,255,0)) 100%), radial-gradient(ellipse 3.2px 2.3px at 43.4px 14.6px, var(--b9,#ffb3d4) 0%, var(--b15,rgba(255,179,212,0)) 100%), radial-gradient(ellipse 5.9px 7.5px at 42.8px 10.8px, var(--b10,#8ff2ff) 0%, var(--b11,#35c9ee) 52%, var(--b12,#1892b9) 100%), radial-gradient(ellipse 1.9px 1.9px at 8.3px 15.6px, var(--b13,rgba(255,255,255,0.92)) 0%, var(--b14,rgba(255,255,255,0)) 100%), radial-gradient(ellipse 3.0px 2.1px at 10.3px 21.6px, var(--b9,#ffb3d4) 0%, var(--b15,rgba(255,179,212,0)) 100%), radial-gradient(ellipse 5.5px 7.1px at 9.8px 18.0px, var(--b10,#8ff2ff) 0%, var(--b11,#35c9ee) 52%, var(--b12,#1892b9) 100%), radial-gradient(ellipse 1.9px 1.9px at 56.7px 15.6px, var(--b13,rgba(255,255,255,0.92)) 0%, var(--b14,rgba(255,255,255,0)) 100%), radial-gradient(ellipse 3.0px 2.1px at 58.8px 21.6px, var(--b9,#ffb3d4) 0%, var(--b15,rgba(255,179,212,0)) 100%), radial-gradient(ellipse 5.5px 7.1px at 58.3px 18.0px, var(--b10,#8ff2ff) 0%, var(--b11,#35c9ee) 52%, var(--b12,#1892b9) 100%), radial-gradient(ellipse 5.8px 3.0px at 29.2px 33.0px, var(--b13,rgba(255,255,255,0.92)) 0%, var(--b14,rgba(255,255,255,0)) 100%), radial-gradient(ellipse 9.4px 3.5px at 35.7px 42.7px, var(--b9,#ffb3d4) 0%, var(--b15,rgba(255,179,212,0)) 100%), radial-gradient(ellipse 17.1px 11.7px at 34.0px 36.9px, var(--b10,#8ff2ff) 0%, var(--b11,#35c9ee) 52%, var(--b12,#1892b9) 100%); -webkit-mask: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2064%2048%27%3E%3Cg%20fill%3D%27%2523fff%27%3E%20%3Cellipse%20cx%3D%279.5%27%20cy%3D%2717.5%27%20rx%3D%275.3%27%20ry%3D%276.9%27%2F%3E%20%3Cellipse%20cx%3D%2724.5%27%20cy%3D%2710.5%27%20rx%3D%275.7%27%20ry%3D%277.3%27%2F%3E%20%3Cellipse%20cx%3D%2741.5%27%20cy%3D%2710.5%27%20rx%3D%275.7%27%20ry%3D%277.3%27%2F%3E%20%3Cellipse%20cx%3D%2756.5%27%20cy%3D%2717.5%27%20rx%3D%275.3%27%20ry%3D%276.9%27%2F%3E%20%3Cpath%20d%3D%27M33%2024.5c9.5%200%2016.6%205.5%2016.6%2011.6S42.5%2047%2033%2047%2016.4%2042.2%2016.4%2036.1%2023.5%2024.5%2033%2024.5z%27%2F%3E%20%3C%2Fg%3E%3C%2Fsvg%3E") no-repeat center / 100% 100%; mask: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2064%2048%27%3E%3Cg%20fill%3D%27%2523fff%27%3E%20%3Cellipse%20cx%3D%279.5%27%20cy%3D%2717.5%27%20rx%3D%275.3%27%20ry%3D%276.9%27%2F%3E%20%3Cellipse%20cx%3D%2724.5%27%20cy%3D%2710.5%27%20rx%3D%275.7%27%20ry%3D%277.3%27%2F%3E%20%3Cellipse%20cx%3D%2741.5%27%20cy%3D%2710.5%27%20rx%3D%275.7%27%20ry%3D%277.3%27%2F%3E%20%3Cellipse%20cx%3D%2756.5%27%20cy%3D%2717.5%27%20rx%3D%275.3%27%20ry%3D%276.9%27%2F%3E%20%3Cpath%20d%3D%27M33%2024.5c9.5%200%2016.6%205.5%2016.6%2011.6S42.5%2047%2033%2047%2016.4%2042.2%2016.4%2036.1%2023.5%2024.5%2033%2024.5z%27%2F%3E%20%3C%2Fg%3E%3C%2Fsvg%3E") no-repeat center / 100% 100%;}
+.msg-content[data-side="user"]::before,.msg-content[data-side="user"]::after{left: auto; right: 12px;}
+.msg-content::before,.msg-content::after{transform-origin: 50% 100%; animation: b321-an321-knead 20s ease-in-out infinite;}
+}
+
+/* 322 Fox Ears */
+@scope ([data-bubble="322"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fff2e8);--cai-tx:var(--bub-ai-tx,#4a2a16)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffe3cf);--cai-tx:var(--bub-user-tx,#4a2a16)}
+.msg-content{isolation: isolate; color: var(--b1,#4a2a16); position: relative; overflow: visible;}
+.msg-content[data-side="ai"]{background: var(--b2,#fff2e8); border-radius: 16px 16px 16px 5px;}
+.msg-content[data-side="user"]{background: var(--b3,#ffe3cf); border-radius: 16px 16px 5px 16px;}
+.msg-content::before{content: ""; position: absolute; top: -13px; left: 16px; width: 48px; height: 17px; z-index: -1; pointer-events: none; background: var(--b4,#e2732e); clip-path: polygon(0% 100%, 15% 0%, 33% 100%, 67% 100%, 85% 0%, 100% 100%);}
+.msg-content::after{content: ""; position: absolute; top: -7px; left: 21px; width: 38px; height: 11px; z-index: -1; pointer-events: none; background: var(--b5,#ffc9a6); clip-path: polygon(0% 100%, 16% 8%, 32% 100%, 68% 100%, 84% 8%, 100% 100%);}
+.msg-content[data-side="user"]::before{left: auto; right: 16px;}
+.msg-content[data-side="user"]::after{left: auto; right: 21px;}
+}
+
+/* 323 Bear Ears */
+@keyframes b323-an323-perk{0%, 100% { transform: scaleY(1); } 50% { transform: scaleY(1.12); }}
+@scope ([data-bubble="323"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f6efe6);--cai-tx:var(--bub-ai-tx,#3f2d1c)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ece0d1);--cai-tx:var(--bub-user-tx,#3f2d1c)}
+.msg-content{isolation: isolate; color: var(--b1,#3f2d1c); position: relative; overflow: visible;}
+.msg-content[data-side="ai"]{background: var(--b2,#f6efe6); border-radius: 17px 17px 17px 6px;}
+.msg-content[data-side="user"]{background: var(--b3,#ece0d1); border-radius: 17px 17px 6px 17px;}
+.msg-content::before{content: ""; position: absolute; top: -12px; left: 14px; width: 48px; height: 22px; z-index: -1; pointer-events: none; background: radial-gradient(circle 4px at 11px 12px, var(--b4,#d8a05c) 92%, var(--b6,rgba(216,160,92,0)) 95%), radial-gradient(circle 4px at 37px 12px, var(--b4,#d8a05c) 92%, var(--b6,rgba(216,160,92,0)) 95%), radial-gradient(circle 8px at 11px 12px, var(--b5,#8a5a2b) 92%, var(--b7,rgba(138,90,43,0)) 95%), radial-gradient(circle 8px at 37px 12px, var(--b5,#8a5a2b) 92%, var(--b7,rgba(138,90,43,0)) 95%);}
+.msg-content[data-side="user"]::before{left: auto; right: 14px;}
+.msg-content::before{transform-origin: 50% 100%; animation: b323-an323-perk 19s ease-in-out infinite;}
+}
+
+/* 324 Bunny Ears */
+@keyframes b324-an324-swaya{0%, 100% { transform: rotate(-5deg); } 50% { transform: rotate(1deg); }}
+@keyframes b324-an324-swayb{0%, 100% { transform: rotate(-3deg); } 50% { transform: rotate(3deg); }}
+@scope ([data-bubble="324"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fff5f8);--cai-tx:var(--bub-ai-tx,#5a2740)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffe4ee);--cai-tx:var(--bub-user-tx,#5a2740)}
+.msg-content{isolation: isolate; color: var(--b1,#5a2740); position: relative; overflow: visible;}
+.msg-content[data-side="ai"]{background: var(--b2,#fff5f8); border-radius: 18px 18px 18px 6px;}
+.msg-content[data-side="user"]{background: var(--b3,#ffe4ee); border-radius: 18px 18px 6px 18px;}
+.msg-content::before{content: ""; position: absolute; top: -14px; left: 18px; width: 34px; height: 24px; z-index: -1; pointer-events: none; background: radial-gradient(ellipse 5px 12px at 8px 14px, var(--b4,#f6b8cf) 92%, var(--b6,rgba(246,184,207,0)) 95%), radial-gradient(ellipse 5px 12px at 26px 14px, var(--b4,#f6b8cf) 92%, var(--b6,rgba(246,184,207,0)) 95%); transform: rotate(-2deg);}
+.msg-content::after{content: ""; position: absolute; top: -11px; left: 20px; width: 30px; height: 19px; z-index: -1; pointer-events: none; background: radial-gradient(ellipse 2.4px 8px at 7px 12px, var(--b5,#ff9dc0) 90%, var(--b7,rgba(255,157,192,0)) 94%), radial-gradient(ellipse 2.4px 8px at 23px 12px, var(--b5,#ff9dc0) 90%, var(--b7,rgba(255,157,192,0)) 94%);}
+.msg-content[data-side="user"]::before{left: auto; right: 18px;}
+.msg-content[data-side="user"]::after{left: auto; right: 20px;}
+.msg-content::before{transform-origin: 50% 100%; animation: b324-an324-swaya 21s ease-in-out infinite;}
+.msg-content::after{transform-origin: 50% 100%; animation: b324-an324-swayb 21s ease-in-out infinite;}
+}
+
+/* 325 Little Horns */
+@keyframes b325-an325-ember{0%, 100% { background-position: 0% 0%; } 50% { background-position: 0% 100%; }}
+@scope ([data-bubble="325"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#2a1622);--cai-tx:var(--bub-ai-tx,#ffe6f2)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#3a1d2e);--cai-tx:var(--bub-user-tx,#ffe6f2)}
+.msg-content{isolation: isolate; color: var(--b1,#ffe6f2); position: relative; overflow: visible;}
+.msg-content[data-side="ai"]{background: var(--b2,#2a1622); border-radius: 16px 16px 16px 5px;}
+.msg-content[data-side="user"]{background: var(--b3,#3a1d2e); border-radius: 16px 16px 5px 16px;}
+.msg-content::before{content: ""; position: absolute; top: -12px; left: 16px; width: 44px; height: 16px; z-index: -1; pointer-events: none; background: linear-gradient(180deg, var(--b4,#ff4d7d) 0%, var(--b5,#a81742) 100%); clip-path: polygon(0% 100%, 13% 0%, 30% 100%, 70% 100%, 87% 0%, 100% 100%);}
+.msg-content[data-side="user"]::before{left: auto; right: 16px;}
+.msg-content::before{background-size: 100% 240%; animation: b325-an325-ember 26s ease-in-out infinite;}
+}
+
+/* 326 Halo */
+@keyframes b326-an326-float{0%, 100% { transform: translateY(0); } 50% { transform: translateY(-2px); }}
+@scope ([data-bubble="326"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f7f9ff);--cai-tx:var(--bub-ai-tx,#2c3350)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#e8edff);--cai-tx:var(--bub-user-tx,#2c3350)}
+.msg-content{isolation: isolate; color: var(--b1,#2c3350); position: relative; overflow: visible;}
+.msg-content[data-side="ai"]{background: var(--b2,#f7f9ff); border-radius: 18px 18px 18px 6px;}
+.msg-content[data-side="user"]{background: var(--b3,#e8edff); border-radius: 18px 18px 6px 18px;}
+.msg-content::before{content: ""; position: absolute; top: -11px; left: 20px; width: 42px; height: 14px; z-index: -1; pointer-events: none; border-radius: 50%; border: 3px solid var(--b4,#ffd357); box-shadow: 0 0 9px 1px rgba(255,211,87,0.75);}
+.msg-content::after{content: ""; position: absolute; top: -9px; left: 24px; width: 34px; height: 9px; z-index: -1; pointer-events: none; border-radius: 50%; background: var(--b5,#fff3c9); opacity: 0.5;}
+.msg-content[data-side="user"]::before{left: auto; right: 20px;}
+.msg-content[data-side="user"]::after{left: auto; right: 24px;}
+.msg-content::before,.msg-content::after{animation: b326-an326-float 12s ease-in-out infinite;}
+}
+
+/* 327 Tiny Crown */
+@keyframes b327-an327-gleam{0%, 100% { background-position: 0% 100%; } 50% { background-position: 0% 0%; }}
+@scope ([data-bubble="327"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#1e1b2e);--cai-tx:var(--bub-ai-tx,#f3ecff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#2a2542);--cai-tx:var(--bub-user-tx,#f3ecff)}
+.msg-content{isolation: isolate; color: var(--b1,#f3ecff); position: relative; overflow: visible;}
+.msg-content[data-side="ai"]{background: var(--b2,#1e1b2e); border-radius: 14px 14px 14px 4px;}
+.msg-content[data-side="user"]{background: var(--b3,#2a2542); border-radius: 14px 14px 4px 14px;}
+.msg-content::before{content: ""; position: absolute; top: -12px; left: 16px; width: 40px; height: 15px; z-index: -1; pointer-events: none; background: linear-gradient(180deg, var(--b4,#ffdf7e) 0%, var(--b5,#c9962a) 100%); clip-path: polygon(0% 100%, 0% 22%, 20% 62%, 38% 0%, 50% 40%, 62% 0%, 80% 62%, 100% 22%, 100% 100%);}
+.msg-content::after{content: ""; position: absolute; top: -3px; left: 16px; width: 40px; height: 5px; z-index: -1; pointer-events: none; border-radius: 2px; background: var(--b6,#8d6414);}
+.msg-content[data-side="user"]::before{left: auto; right: 16px;}
+.msg-content[data-side="user"]::after{left: auto; right: 16px;}
+.msg-content::before{background-size: 100% 260%; animation: b327-an327-gleam 23s ease-in-out infinite;}
+}
+
+/* 328 Ribbon Bow */
+@scope ([data-bubble="328"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#fffafc);--cai-tx:var(--bub-ai-tx,#5c2436)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#ffeaf1);--cai-tx:var(--bub-user-tx,#5c2436)}
+.msg-content{isolation: isolate; color: var(--b1,#5c2436); position: relative; overflow: visible;}
+.msg-content[data-side="ai"]{background: var(--b2,#fffafc); border-radius: 16px 16px 16px 5px;}
+.msg-content[data-side="user"]{background: var(--b3,#ffeaf1); border-radius: 16px 16px 5px 16px;}
+.msg-content::before{content: ""; position: absolute; top: -11px; left: 16px; width: 42px; height: 15px; z-index: -1; pointer-events: none; background: var(--b4,#ee5a86); clip-path: polygon(0% 8%, 42% 62%, 42% 100%, 0% 100%, 58% 100%, 58% 62%, 100% 8%, 100% 100%);}
+.msg-content::after{content: ""; position: absolute; top: -5px; left: 33px; width: 9px; height: 9px; z-index: -1; pointer-events: none; border-radius: 50%; background: var(--b5,#ffd0de);}
+.msg-content[data-side="user"]::before{left: auto; right: 16px;}
+.msg-content[data-side="user"]::after{left: auto; right: 33px;}
+}
+
+/* 329 Leaf Sprig */
+@keyframes b329-an329-breeze{0%, 100% { transform: rotate(-3deg); } 50% { transform: rotate(3deg); }}
+@scope ([data-bubble="329"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#f3f8f1);--cai-tx:var(--bub-ai-tx,#22331f)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#e3f0df);--cai-tx:var(--bub-user-tx,#22331f)}
+.msg-content{isolation: isolate; color: var(--b1,#22331f); position: relative; overflow: visible;}
+.msg-content[data-side="ai"]{background: var(--b2,#f3f8f1); border-radius: 16px 16px 16px 5px;}
+.msg-content[data-side="user"]{background: var(--b3,#e3f0df); border-radius: 16px 16px 5px 16px;}
+.msg-content::before{content: ""; position: absolute; top: -13px; left: 18px; width: 34px; height: 20px; z-index: -1; pointer-events: none; background: radial-gradient(ellipse 6px 10px at 9px 12px, var(--b4,#6aa84f) 92%, var(--b6,rgba(106,168,79,0)) 95%), radial-gradient(ellipse 6px 10px at 25px 12px, var(--b4,#6aa84f) 92%, var(--b6,rgba(106,168,79,0)) 95%);}
+.msg-content::after{content: ""; position: absolute; top: -8px; left: 25px; width: 3px; height: 12px; z-index: -1; pointer-events: none; border-radius: 2px; background: var(--b5,#3f6b2c);}
+.msg-content[data-side="user"]::before{left: auto; right: 18px;}
+.msg-content[data-side="user"]::after{left: auto; right: 25px;}
+.msg-content::before,.msg-content::after{transform-origin: 50% 100%; animation: b329-an329-breeze 20s ease-in-out infinite;}
+}
+
+/* 330 Star Pin */
+@keyframes b330-an330-turn{0% { transform: rotate(0deg); } 100% { transform: rotate(72deg); }}
+@keyframes b330-an330-halo{0%, 100% { transform: scale(1); opacity: 0.85; } 50% { transform: scale(1.14); opacity: 1; }}
+@scope ([data-bubble="330"]){
+.msg-content[data-side="ai"]{--cai-bg:var(--bub-ai-bg,#141a2e);--cai-tx:var(--bub-ai-tx,#e6ecff)}
+.msg-content[data-side="user"]{--cai-bg:var(--bub-user-bg,#1e2542);--cai-tx:var(--bub-user-tx,#e6ecff)}
+.msg-content{isolation: isolate; color: var(--b1,#e6ecff); position: relative; overflow: visible;}
+.msg-content[data-side="ai"]{background: var(--b2,#141a2e); border-radius: 15px 15px 15px 5px;}
+.msg-content[data-side="user"]{background: var(--b3,#1e2542); border-radius: 15px 15px 5px 15px;}
+.msg-content::before{content: ""; position: absolute; top: -12px; left: 18px; width: 20px; height: 20px; z-index: -1; pointer-events: none; background: var(--b4,#ffd95e); clip-path: polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%);}
+.msg-content::after{content: ""; position: absolute; top: -14px; left: 16px; width: 24px; height: 24px; z-index: -1; pointer-events: none; border-radius: 50%; background: radial-gradient(circle, var(--b5,#ffe9a3) 0%, var(--b6,rgba(255,233,163,0)) 68%);}
+.msg-content[data-side="user"]::before{left: auto; right: 18px;}
+.msg-content[data-side="user"]::after{left: auto; right: 16px;}
+.msg-content::before{animation: b330-an330-turn 30s linear infinite;}
+.msg-content::after{animation: b330-an330-halo 14s ease-in-out infinite;}
+}`;
+}
+// What the picker renders from. Fetched when the picker opens, never before.
+const BUBBLE_JSON = `[{"id":1,"name":"iOS Light","cat":"1. The Classics","font":"Poppins","ai":["#e5e5ea","#000000"],"user":["#0b93f6","#ffffff"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":2,"name":"iOS Dark Blue","cat":"1. The Classics","font":"Poppins","ai":["#0b93f6","#ffffff"],"user":["#e5e5ea","#000000"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":3,"name":"WhatsApp","cat":"1. The Classics","font":"Poppins","ai":["#ffffff","#000000"],"user":["#dcf8c6","#000000"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":4,"name":"Android/SMS","cat":"1. The Classics","font":"Poppins","ai":["#ffffff","#000000"],"user":["#0084ff","#ffffff"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":5,"name":"Messenger","cat":"1. The Classics","font":"Poppins","ai":["#f1f0f0","#000000"],"user":["#0084ff","#ffffff"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":6,"name":"Dark Mode","cat":"1. The Classics","font":"Poppins","ai":["#333333","#ffffff"],"user":["#555555","#ffffff"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":7,"name":"Wireframe","cat":"1. The Classics","font":"Poppins","ai":["#f1f0f0","#000000"],"user":["#ffffff","#000000"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":8,"name":"WeChat Green","cat":"1. The Classics","font":"Poppins","ai":["#ffffff","#000000"],"user":["#95ec69","#000000"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":9,"name":"Discord Blurple","cat":"1. The Classics","font":"Poppins","ai":["#5865F2","#ffffff"],"user":["#5865F2","#ffffff"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":10,"name":"Dating App Pink","cat":"1. The Classics","font":"Poppins","ai":["#FF3366","#ffffff"],"user":["#FF3366","#ffffff"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":11,"name":"Sunset","cat":"2. Gorgeous Gradients","font":"Poppins","ai":[null,"#333333"],"user":[null,"#333333"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#ff9a9e","Bubble fill 1"],["--b2","#fecfef","Bubble fill 2"]]},{"id":12,"name":"Ocean","cat":"2. Gorgeous Gradients","font":"Poppins","ai":[null,"#333333"],"user":[null,"#333333"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#a1c4fd","Bubble fill 1"],["--b2","#c2e9fb","Bubble fill 2"]]},{"id":13,"name":"Mango","cat":"2. Gorgeous Gradients","font":"Poppins","ai":[null,"#ffffff"],"user":[null,"#ffffff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#f6d365","Bubble fill 1"],["--b2","#fda085","Bubble fill 2"]]},{"id":14,"name":"Mint","cat":"2. Gorgeous Gradients","font":"Poppins","ai":[null,"#333333"],"user":[null,"#333333"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#84fab0","Bubble fill 1"],["--b2","#8fd3f4","Bubble fill 2"]]},{"id":15,"name":"Lavender","cat":"2. Gorgeous Gradients","font":"Poppins","ai":[null,"#ffffff"],"user":[null,"#ffffff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#a18cd1","Bubble fill 1"],["--b2","#fbc2eb","Bubble fill 2"]]},{"id":16,"name":"Cyber","cat":"2. Gorgeous Gradients","font":"Poppins","ai":[null,"#ffffff"],"user":[null,"#ffffff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#ff0844","Bubble fill 1"],["--b2","#ffb199","Bubble fill 2"]]},{"id":17,"name":"Twilight","cat":"2. Gorgeous Gradients","font":"Poppins","ai":[null,"#ffffff"],"user":[null,"#ffffff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#30cfd0","Bubble fill 1"],["--b2","#330867","Bubble fill 2"]]},{"id":18,"name":"Breeze","cat":"2. Gorgeous Gradients","font":"Poppins","ai":[null,"#ffffff"],"user":[null,"#ffffff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#4facfe","Bubble fill 1"],["--b2","#00f2fe","Bubble fill 2"]]},{"id":19,"name":"Forest","cat":"2. Gorgeous Gradients","font":"Poppins","ai":[null,"#333333"],"user":[null,"#333333"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#43e97b","Bubble fill 1"],["--b2","#38f9d7","Bubble fill 2"]]},{"id":20,"name":"Lemonade","cat":"2. Gorgeous Gradients","font":"Poppins","ai":[null,"#333333"],"user":[null,"#333333"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#fa709a","Bubble fill 1"],["--b2","#fee140","Bubble fill 2"]]},{"id":21,"name":"Neumorphic Light","cat":"3. Shadows & Neumorphism","font":"Poppins","ai":[null,"#333333"],"user":[null,"#333333"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#e0e5ec","Bubble fill"]]},{"id":22,"name":"Neumorphic Dark","cat":"3. Shadows & Neumorphism","font":"Poppins","ai":[null,"#dddddd"],"user":[null,"#dddddd"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#2b2b2b","Bubble fill"]]},{"id":23,"name":"Neumorphic Inset","cat":"3. Shadows & Neumorphism","font":"Poppins","ai":[null,"#333333"],"user":[null,"#333333"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#e0e5ec","Bubble fill"]]},{"id":24,"name":"Floating White","cat":"3. Shadows & Neumorphism","font":"Poppins","ai":["#ffffff","#333333"],"user":["#ffffff","#333333"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":25,"name":"Sharp Shadow Light","cat":"3. Shadows & Neumorphism","font":"Poppins","ai":["#ffffff","#333333"],"user":["#ffffff","#333333"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":26,"name":"Sharp Shadow Gold","cat":"3. Shadows & Neumorphism","font":"Poppins","ai":["#ffd700","#000000"],"user":["#ffd700","#000000"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":27,"name":"Clay Pink","cat":"3. Shadows & Neumorphism","font":"Poppins","ai":[null,"#000000"],"user":[null,"#000000"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#ffb6c1","Bubble fill"]]},{"id":28,"name":"Clay Blue","cat":"3. Shadows & Neumorphism","font":"Poppins","ai":[null,"#000000"],"user":[null,"#000000"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#87ceeb","Bubble fill"]]},{"id":29,"name":"Left Connected","cat":"3. Shadows & Neumorphism","font":"Poppins","ai":["#f3f4f6","#333333"],"user":["#f3f4f6","#333333"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":30,"name":"Right Connected","cat":"3. Shadows & Neumorphism","font":"Poppins","ai":["#f3f4f6","#333333"],"user":["#f3f4f6","#333333"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":31,"name":"Cotton Candy","cat":"4. Kawaii Soft & Sweet","font":"Poppins","ai":[null,"#4c1d95"],"user":[null,"#4c1d95"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#fbcfe8","Bubble fill 1"],["--b2","#bfdbfe","Bubble fill 2"]]},{"id":32,"name":"Strawberry Milk","cat":"4. Kawaii Soft & Sweet","font":"Poppins","ai":["#fdf2f8","#831843"],"user":["#fdf2f8","#831843"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":33,"name":"Blushing Cheeks","cat":"4. Kawaii Soft & Sweet","font":"Poppins","ai":["#ffffff","#333333"],"user":["#ffffff","#333333"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":34,"name":"Squishy Mochi","cat":"4. Kawaii Soft & Sweet","font":"Poppins","ai":["#dcfce7","#14532d"],"user":["#dcfce7","#14532d"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":35,"name":"Lemon Dashed","cat":"4. Kawaii Soft & Sweet","font":"Poppins","ai":["#fef9c3","#854d0e"],"user":["#fef9c3","#854d0e"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":36,"name":"Scalloped Lace","cat":"4. Kawaii Soft & Sweet","font":"Poppins","ai":["#e0e7ff","#312e81"],"user":["#e0e7ff","#312e81"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":37,"name":"Bubblegum Gloss","cat":"4. Kawaii Soft & Sweet","font":"Poppins","ai":[null,"#831843"],"user":[null,"#831843"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#fbcfe8","Bubble fill"]]},{"id":38,"name":"Caramel Pudding","cat":"4. Kawaii Soft & Sweet","font":"Poppins","ai":["#fef08a","#713f12"],"user":["#fef08a","#713f12"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":39,"name":"Fluffy Cloud","cat":"4. Kawaii Soft & Sweet","font":"Poppins","ai":["#ffffff","#333333"],"user":["#ffffff","#333333"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":40,"name":"Sweet Confetti","cat":"4. Kawaii Soft & Sweet","font":"Poppins","ai":["#ffffff","#333333"],"user":["#ffffff","#333333"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":41,"name":"Royal Crown","cat":"5. Badges & Add-ons","font":"Poppins","ai":["#ffffff","#333333"],"user":["#ffffff","#333333"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":42,"name":"Heart Ribbon","cat":"5. Badges & Add-ons","font":"Poppins","ai":["#ffffff","#333333"],"user":["#ffffff","#333333"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":43,"name":"Unread Dot","cat":"5. Badges & Add-ons","font":"Poppins","ai":["#e5e5ea","#333333"],"user":["#e5e5ea","#333333"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":44,"name":"Quoted Message","cat":"5. Badges & Add-ons","font":"Poppins","ai":["#ffffff","#333333"],"user":["#ffffff","#333333"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":45,"name":"Pinned Note","cat":"5. Badges & Add-ons","font":"Poppins","ai":["#fffbd5","#333333"],"user":["#fffbd5","#333333"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":46,"name":"VIP Star","cat":"5. Badges & Add-ons","font":"Poppins","ai":["#1a1a1a","#ffffff"],"user":["#1a1a1a","#ffffff"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":47,"name":"Spring Flower","cat":"5. Badges & Add-ons","font":"Poppins","ai":["#e0f7fa","#006064"],"user":["#e0f7fa","#006064"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":48,"name":"Sparkles","cat":"5. Badges & Add-ons","font":"Poppins","ai":["#ffffff","#333333"],"user":["#ffffff","#333333"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":49,"name":"Music Note","cat":"5. Badges & Add-ons","font":"Poppins","ai":["#fdf2f8","#831843"],"user":["#fdf2f8","#831843"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":50,"name":"Sleeping Zzz","cat":"5. Badges & Add-ons","font":"Poppins","ai":["#1e1b4b","#c7d2fe"],"user":["#1e1b4b","#c7d2fe"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":51,"name":"Polka Dots","cat":"6. Fun Patterns","font":"Poppins","ai":[null,"#333333"],"user":[null,"#333333"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#cbd5e1","Bubble fill 1"],["--b2","#f8fafc","Bubble fill 2"]]},{"id":52,"name":"Candy Stripes","cat":"6. Fun Patterns","font":"Poppins","ai":[null,"#991b1b"],"user":[null,"#991b1b"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#fecaca","Bubble fill 1"],["--b2","#fff","Bubble fill 2"]]},{"id":53,"name":"Graph Paper","cat":"6. Fun Patterns","font":"Poppins","ai":[null,"#333333"],"user":[null,"#333333"],"sp":null,"emoji":null,"locked":true,"vars":[["--b2","rgba(0,0,0,0.05)","Bubble fill 1"],["--b1","#fff","Bubble fill 2"]]},{"id":54,"name":"Sunburst","cat":"6. Fun Patterns","font":"Poppins","ai":[null,"#333333"],"user":[null,"#333333"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#e2e8f0","Bubble fill 1"],["--b2","#fff","Bubble fill 2"]]},{"id":55,"name":"Blue Chevron","cat":"6. Fun Patterns","font":"Poppins","ai":[null,"#1e3a8a"],"user":[null,"#1e3a8a"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#bfdbfe","Bubble fill 1"],["--b2","#fff","Bubble fill 2"]]},{"id":56,"name":"Yellow Zigzag","cat":"6. Fun Patterns","font":"Poppins","ai":[null,"#854d0e"],"user":[null,"#854d0e"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#fef08a","Bubble fill 1"],["--b2","#fff","Bubble fill 2"]]},{"id":57,"name":"Purple Waves","cat":"6. Fun Patterns","font":"Poppins","ai":[null,"#4c1d95"],"user":[null,"#4c1d95"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#e9d5ff","Bubble fill 1"],["--b2","#fff","Bubble fill 2"]]},{"id":58,"name":"TV Static Noise","cat":"6. Fun Patterns","font":"VT323","ai":[null,"#ffffff"],"user":[null,"#ffffff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#444","Bubble fill"]]},{"id":59,"name":"Tartan Plaid","cat":"6. Fun Patterns","font":"Poppins","ai":[null,"#333333"],"user":[null,"#333333"],"sp":null,"emoji":null,"locked":true,"vars":[["--b2","rgba(255,0,0,0.1)","Bubble fill 1"],["--b3","rgba(0,0,255,0.1)","Bubble fill 2"],["--b1","#fff","Bubble fill 3"]]},{"id":60,"name":"Honey Dots","cat":"6. Fun Patterns","font":"Poppins","ai":[null,"#b45309"],"user":[null,"#b45309"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#fff","Bubble fill 1"],["--b2","#fcd34d","Bubble fill 2"]]},{"id":61,"name":"Comic Book","cat":"7. Shapes & Outlines","font":"Comic Neue","ai":["#ffffff","#000000"],"user":["#ffffff","#000000"],"sp":["Màu Shadow","#ff3366"],"emoji":null,"locked":false,"vars":[]},{"id":62,"name":"Dashed Border","cat":"7. Shapes & Outlines","font":"Poppins","ai":["transparent","#333333"],"user":["transparent","#333333"],"sp":["Màu viền (Border Color)","#888888"],"emoji":null,"locked":false,"vars":[]},{"id":63,"name":"Dotted Border","cat":"7. Shapes & Outlines","font":"Poppins","ai":["#ffffff","#333333"],"user":["#ffffff","#333333"],"sp":["Màu chấm (Dot Color)","#3b82f6"],"emoji":null,"locked":false,"vars":[]},{"id":64,"name":"Double Line","cat":"7. Shapes & Outlines","font":"Poppins","ai":["#ffffff","#333333"],"user":["#ffffff","#333333"],"sp":["Màu viền (Border Color)","#10b981"],"emoji":null,"locked":false,"vars":[]},{"id":65,"name":"Leaf Cut","cat":"7. Shapes & Outlines","font":"Poppins","ai":["#34d399","#ffffff"],"user":["#34d399","#ffffff"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":66,"name":"Pill Shape","cat":"7. Shapes & Outlines","font":"Poppins","ai":["#f472b6","#ffffff"],"user":["#f472b6","#ffffff"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":67,"name":"Sharp Box","cat":"7. Shapes & Outlines","font":"Poppins","ai":["#333333","#ffffff"],"user":["#333333","#ffffff"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":68,"name":"Movie Ticket","cat":"7. Shapes & Outlines","font":"Poppins","ai":["#ffffff","#333333"],"user":["#ffffff","#333333"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":69,"name":"Folded Paper Corner","cat":"7. Shapes & Outlines","font":"Poppins","ai":["#fbbf24","#000000"],"user":["#fbbf24","#000000"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":70,"name":"Hexagon Cut","cat":"7. Shapes & Outlines","font":"Poppins","ai":["#8b5cf6","#ffffff"],"user":["#8b5cf6","#ffffff"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":71,"name":"Frosted Glass","cat":"8. Materials & Textures","font":"Poppins","ai":[null,"#333333"],"user":[null,"#333333"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","rgba(255,255,255,0.4)","Bubble fill"],["--b2","rgba(255,255,255,0.5)","Border"]]},{"id":72,"name":"Tinted Dark Glass","cat":"8. Materials & Textures","font":"Poppins","ai":[null,"#ffffff"],"user":[null,"#ffffff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","rgba(0,0,0,0.6)","Bubble fill"],["--b2","rgba(255,255,255,0.1)","Border"]]},{"id":73,"name":"Metallic Silver","cat":"8. Materials & Textures","font":"Poppins","ai":[null,"#333333"],"user":[null,"#333333"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#f5f5f5","Bubble fill 1"],["--b2","#e0e0e0","Bubble fill 2"],["--b3","#ccc","Border"]]},{"id":74,"name":"Gold Foil","cat":"8. Materials & Textures","font":"Poppins","ai":[null,"#4a3300"],"user":[null,"#4a3300"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#bf953f","Bubble fill 1"],["--b2","#fcf6ba","Bubble fill 2"],["--b3","#b38728","Bubble fill 3"],["--b4","#fbf5b7","Bubble fill 4"],["--b5","#aa771c","Bubble fill 5"]]},{"id":75,"name":"Wooden Board","cat":"8. Materials & Textures","font":"Comic Neue","ai":[null,"#5c3a21"],"user":[null,"#5c3a21"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#deb887","Bubble fill 1"],["--b3","rgba(0,0,0,0.05)","Bubble fill 2"],["--b2","#8b4513","Border"]]},{"id":76,"name":"Chalkboard","cat":"8. Materials & Textures","font":"Comic Neue","ai":[null,"#ffffff"],"user":[null,"#ffffff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#2f4f4f","Bubble fill"],["--b2","#8b4513","Border"]]},{"id":77,"name":"Notepad Paper","cat":"8. Materials & Textures","font":"Poppins","ai":[null,"#000000"],"user":[null,"#000000"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#fffacd","Bubble fill 1"],["--b2","#87ceeb","Bubble fill 2"],["--b3","#ff7f50","Accent"]]},{"id":78,"name":"Brown Leather","cat":"8. Materials & Textures","font":"Poppins","ai":["#8b4513","#ffffff"],"user":["#8b4513","#ffffff"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":79,"name":"Blue Denim","cat":"8. Materials & Textures","font":"Poppins","ai":["#1e3a8a","#ffffff"],"user":["#1e3a8a","#ffffff"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":80,"name":"Holographic Foil","cat":"8. Materials & Textures","font":"Poppins","ai":[null,"#ffffff"],"user":[null,"#ffffff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#ff2400","Bubble fill 1"],["--b2","#e81d1d","Bubble fill 2"],["--b3","#e8b71d","Bubble fill 3"],["--b4","#e3e81d","Bubble fill 4"],["--b5","#1de840","Bubble fill 5"],["--b6","#1ddde8","Bubble fill 6"],["--b7","#2b1de8","Bubble fill 7"],["--b8","#dd00f3","Bubble fill 8"]]},{"id":81,"name":"8-Bit Box","cat":"9. Sci-Fi & Retro","font":"VT323","ai":["#000000","#ffffff"],"user":["#000000","#ffffff"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":82,"name":"Cyberpunk Polygon","cat":"9. Sci-Fi & Retro","font":"VT323","ai":["#fdf100","#000000"],"user":["#fdf100","#000000"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":83,"name":"Vaporwave","cat":"9. Sci-Fi & Retro","font":"Poppins","ai":[null,"#ffffff"],"user":[null,"#ffffff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#ff71ce","Bubble fill 1"],["--b2","#01cdfe","Bubble fill 2"],["--b3","#05ffa1","Border"]]},{"id":84,"name":"Terminal Green","cat":"9. Sci-Fi & Retro","font":"VT323","ai":["#000000","#00ff00"],"user":["#000000","#00ff00"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":85,"name":"Retro Arcade","cat":"9. Sci-Fi & Retro","font":"VT323","ai":["#111827","#fde047"],"user":["#111827","#fde047"],"sp":["Màu Viền/Bóng","#ec4899"],"emoji":null,"locked":false,"vars":[]},{"id":86,"name":"Matrix Code","cat":"9. Sci-Fi & Retro","font":"VT323","ai":["#000000","#00ff00"],"user":["#000000","#00ff00"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":87,"name":"CRT Scanlines","cat":"9. Sci-Fi & Retro","font":"VT323","ai":["#222222","#88ff88"],"user":["#222222","#88ff88"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":88,"name":"Neon Magenta","cat":"9. Sci-Fi & Retro","font":"Poppins","ai":["#111111","#ffffff"],"user":["#111111","#ffffff"],"sp":["Màu Neon","#ff00ff"],"emoji":null,"locked":false,"vars":[]},{"id":89,"name":"Neon Cyan","cat":"9. Sci-Fi & Retro","font":"Poppins","ai":["#111111","#ffffff"],"user":["#111111","#ffffff"],"sp":["Màu Neon","#00ffff"],"emoji":null,"locked":false,"vars":[]},{"id":90,"name":"Windows 95 Classic","cat":"9. Sci-Fi & Retro","font":"VT323","ai":["#c0c0c0","#000000"],"user":["#c0c0c0","#000000"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":91,"name":"Cosmic Space","cat":"10. VIP & Animations","font":"Poppins","ai":[null,"#e2e8f0"],"user":[null,"#e2e8f0"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#0f172a","Bubble fill 1"],["--b3","rgba(255,255,255,.2)","Bubble fill 2"],["--b4","rgba(255,255,255,.15)","Bubble fill 3"],["--b2","#334155","Border"]]},{"id":92,"name":"Aurora Borealis","cat":"10. VIP & Animations","font":"Poppins","ai":[null,"#ffffff"],"user":[null,"#ffffff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#10b981","Bubble fill 1"],["--b2","#3b82f6","Bubble fill 2"],["--b3","#8b5cf6","Bubble fill 3"]]},{"id":93,"name":"Pulse Glow","cat":"10. VIP & Animations","font":"Poppins","ai":["#c084fc","#ffffff"],"user":["#c084fc","#ffffff"],"sp":["Màu Glow","#c084fc"],"emoji":null,"locked":false,"vars":[]},{"id":94,"name":"Shake on Hover","cat":"10. VIP & Animations","font":"Poppins","ai":["#fcd34d","#78350f"],"user":["#fcd34d","#78350f"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":95,"name":"Rainbow Text","cat":"10. VIP & Animations","font":"Poppins","ai":[null,"transparent"],"user":[null,"transparent"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#111","Bubble fill"],["--b2","#333","Border"]]},{"id":96,"name":"Color Shifting","cat":"10. VIP & Animations","font":"Poppins","ai":[null,"#ffffff"],"user":[null,"#ffffff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#3b82f6","Bubble fill"]]},{"id":97,"name":"Neon Pulse Border","cat":"10. VIP & Animations","font":"Poppins","ai":["#000000","#ffffff"],"user":["#000000","#ffffff"],"sp":["Màu Pulse","#a855f7"],"emoji":null,"locked":false,"vars":[]},{"id":98,"name":"Liquid Gold","cat":"10. VIP & Animations","font":"Poppins","ai":[null,"#ffffff"],"user":[null,"#ffffff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#f6d365","Bubble fill 1"],["--b2","#fda085","Bubble fill 2"],["--b3","rgba(255,255,255,0.4)","Decoration"]]},{"id":99,"name":"Party Confetti","cat":"10. VIP & Animations","font":"Poppins","ai":[null,"#333333"],"user":[null,"#333333"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#fff","Bubble fill"],["--b2","#ff0000","Decoration 1"],["--b3","#00ff00","Decoration 2"],["--b4","#0000ff","Decoration 3"]]},{"id":100,"name":"Ultimate Diamond VIP","cat":"10. VIP & Animations","font":"Poppins","ai":[null,"#ffd700"],"user":[null,"#ffd700"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#111","Bubble fill 1"],["--b2","#333","Bubble fill 2"],["--b3","#ffd700","Border"]]},{"id":101,"name":"Peaches","cat":"11. Emoji Backgrounds (iOS Style)","font":"Poppins","ai":["#fff5f5","#9a3412"],"user":["#fff5f5","#9a3412"],"sp":null,"emoji":"🍑","locked":false,"vars":[]},{"id":102,"name":"Cherry Blossoms","cat":"11. Emoji Backgrounds (iOS Style)","font":"Poppins","ai":["#fdf2f8","#831843"],"user":["#fdf2f8","#831843"],"sp":null,"emoji":"🌸","locked":false,"vars":[]},{"id":103,"name":"Strawberries","cat":"11. Emoji Backgrounds (iOS Style)","font":"Poppins","ai":["#fef2f2","#7f1d1d"],"user":["#fef2f2","#7f1d1d"],"sp":null,"emoji":"🍓","locked":false,"vars":[]},{"id":104,"name":"Puppies","cat":"11. Emoji Backgrounds (iOS Style)","font":"Poppins","ai":["#fffbeb","#78350f"],"user":["#fffbeb","#78350f"],"sp":null,"emoji":"🐶","locked":false,"vars":[]},{"id":105,"name":"Sparkles","cat":"11. Emoji Backgrounds (iOS Style)","font":"Poppins","ai":["#fafafa","#111111"],"user":["#fafafa","#111111"],"sp":null,"emoji":"✨","locked":false,"vars":[]},{"id":106,"name":"Avocados","cat":"11. Emoji Backgrounds (iOS Style)","font":"Poppins","ai":["#f0fdf4","#14532d"],"user":["#f0fdf4","#14532d"],"sp":null,"emoji":"🥑","locked":false,"vars":[]},{"id":107,"name":"Ghosts","cat":"11. Emoji Backgrounds (iOS Style)","font":"Poppins","ai":["#f8fafc","#334155"],"user":["#f8fafc","#334155"],"sp":null,"emoji":"👻","locked":false,"vars":[]},{"id":108,"name":"Clouds","cat":"11. Emoji Backgrounds (iOS Style)","font":"Poppins","ai":["#eff6ff","#1e3a8a"],"user":["#eff6ff","#1e3a8a"],"sp":null,"emoji":"☁️","locked":false,"vars":[]},{"id":109,"name":"Money Stack","cat":"11. Emoji Backgrounds (iOS Style)","font":"Poppins","ai":["#ecfdf5","#064e3b"],"user":["#ecfdf5","#064e3b"],"sp":null,"emoji":"💸","locked":false,"vars":[]},{"id":110,"name":"Dark Skulls","cat":"11. Emoji Backgrounds (iOS Style)","font":"Poppins","ai":["#0f172a","#f8fafc"],"user":["#0f172a","#f8fafc"],"sp":null,"emoji":"💀","locked":false,"vars":[]},{"id":201,"name":"Aurora Veil","cat":"12. Living Effects","font":"Poppins","ai":["#0b1020","#eaf2ff"],"user":["#151d38","#eaf2ff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b4","rgba(150,200,255,0.16)","Border"],["--b6","rgba(0,255,190,0.42)","Decoration 1"],["--b7","rgba(90,130,255,0.38)","Decoration 2"],["--b8","rgba(255,96,205,0.34)","Decoration 3"],["--b9","rgba(255,255,255,0.10)","Decoration 4"],["--b1","#0b1020","Bubble fill 1"],["--b2","#eaf2ff","Text"],["--b3","#151d38","Bubble fill 2"]]},{"id":202,"name":"Liquid Glass","cat":"12. Living Effects","font":"Inter","ai":["#1f2937","#f3f4f6"],"user":["#1d4ed8","#ffffff"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":203,"name":"Halo Ring","cat":"12. Living Effects","font":"Orbitron","ai":["#12142a","#e9ecff"],"user":["#1a1d3a","#e9ecff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#7cf9ff","Decoration 1"],["--b2","#8a5cff","Decoration 2"],["--b3","#ff5ce1","Decoration 3"],["--b4","#ffc46b","Decoration 4"],["--b5","#12142a","Bubble fill 1"],["--b6","#e9ecff","Text"],["--b7","#1a1d3a","Bubble fill 2"]]},{"id":204,"name":"Neon Pulse","cat":"12. Living Effects","font":"Rajdhani","ai":["#0a0a12","#ffeaf8"],"user":["#0f1020","#eafcff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b5","rgba(255,74,196,0.7)","Border"],["--b1","#0a0a12","Bubble fill 1"],["--b2","#ffeaf8","Text 1"],["--b3","#0f1020","Bubble fill 2"],["--b4","#eafcff","Text 2"]]},{"id":205,"name":"Silk Sheen","cat":"12. Living Effects","font":"Cormorant Garamond","ai":["#2a1436","#f5ecff"],"user":["#3a1c4a","#f5ecff"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":206,"name":"Starfield","cat":"12. Living Effects","font":"Manrope","ai":["#070b1a","#e6ecff"],"user":["#0d1330","#e6ecff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b7","rgba(120,150,220,0.18)","Border"],["--b1","#ffffff","Decoration 1"],["--b2","#cfe0ff","Decoration 2"],["--b3","#ffe9c9","Decoration 3"],["--b11","rgba(90,120,255,0.22)","Decoration 4"],["--b13","rgba(190,80,255,0.18)","Decoration 5"],["--b4","#070b1a","Bubble fill 1"],["--b5","#e6ecff","Text"],["--b6","#0d1330","Bubble fill 2"]]},{"id":207,"name":"Ember Glow","cat":"12. Living Effects","font":"Nunito","ai":["#150e08","#ffe9d2"],"user":["#1e130a","#ffe9d2"],"sp":null,"emoji":null,"locked":true,"vars":[["--b4","rgba(255,140,60,0.22)","Border"],["--b5","rgba(255,176,74,0.95)","Decoration 1"],["--b7","rgba(255,108,42,0.9)","Decoration 2"],["--b9","rgba(255,222,150,0.8)","Decoration 3"],["--b11","rgba(255,110,30,0.42)","Decoration 4"],["--b1","#150e08","Bubble fill 1"],["--b2","#ffe9d2","Text"],["--b3","#1e130a","Bubble fill 2"]]},{"id":208,"name":"Rain Glass","cat":"12. Living Effects","font":"Karla","ai":["#0d1725","#e6f1ff"],"user":["#122033","#e6f1ff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b4","rgba(170,205,255,0.2)","Border"],["--b6","rgba(190,220,255,0.5)","Decoration 1"],["--b8","rgba(210,235,255,0.28)","Decoration 2"],["--b1","#0d1725","Bubble fill 1"],["--b2","#e6f1ff","Text"],["--b3","#122033","Bubble fill 2"]]},{"id":209,"name":"Snowfall","cat":"12. Living Effects","font":"Quicksand","ai":["#cfe0f2","#14273f"],"user":["#dbe8f6","#14273f"],"sp":null,"emoji":null,"locked":true,"vars":[["--b5","rgba(255,255,255,0.85)","Border"],["--b1","#ffffff","Decoration 1"],["--b7","rgba(255,255,255,0.9)","Decoration 2"],["--b2","#cfe0f2","Bubble fill 1"],["--b3","#14273f","Text"],["--b4","#dbe8f6","Bubble fill 2"]]},{"id":210,"name":"Lava Lamp","cat":"12. Living Effects","font":"Fredoka","ai":["#170d2a","#ffe7f2"],"user":["#1f1236","#ffe7f2"],"sp":null,"emoji":null,"locked":true,"vars":[["--b7","rgba(255,120,80,0.18)","Border"],["--b1","#ff6a3d","Decoration 1"],["--b2","#ff2e83","Decoration 2"],["--b3","#ffb347","Decoration 3"],["--b4","#170d2a","Bubble fill 1"],["--b5","#ffe7f2","Text"],["--b6","#1f1236","Bubble fill 2"]]},{"id":211,"name":"Plasma Core","cat":"12. Living Effects","font":"Exo 2","ai":["#080d1c","#e8f3ff"],"user":["#0d1428","#e8f3ff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b4","rgba(120,180,255,0.18)","Border"],["--b5","rgba(0,229,255,0.5)","Decoration 1"],["--b7","rgba(122,92,255,0.5)","Decoration 2"],["--b9","rgba(255,62,165,0.45)","Decoration 3"],["--b11","rgba(255,255,255,0.10)","Decoration 4"],["--b1","#080d1c","Bubble fill 1"],["--b2","#e8f3ff","Text"],["--b3","#0d1428","Bubble fill 2"]]},{"id":212,"name":"Oil Slick","cat":"12. Living Effects","font":"Sora","ai":["#12141a","#eef2f7"],"user":["#181b23","#eef2f7"],"sp":null,"emoji":null,"locked":true,"vars":[["--b9","rgba(180,200,220,0.16)","Border"],["--b1","#00ffd5","Decoration 1"],["--b2","#7b5cff","Decoration 2"],["--b3","#ff4fd8","Decoration 3"],["--b4","#ffd166","Decoration 4"],["--b5","#3dff8b","Decoration 5"],["--b10","rgba(255,255,255,0.12)","Decoration 6"],["--b6","#12141a","Bubble fill 1"],["--b11","rgba(0,0,0,0.28)","Decoration 7"],["--b7","#eef2f7","Text"],["--b8","#181b23","Bubble fill 2"]]},{"id":213,"name":"Holo Foil","cat":"12. Living Effects","font":"Space Grotesk","ai":["#0b0b12","#f6f7ff"],"user":["#12121c","#f6f7ff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b9","rgba(255,255,255,0.2)","Border"],["--b10","rgba(8,8,16,0.55)","Decoration 1"],["--b1","#ff5f6d","Decoration 2"],["--b2","#ffc371","Decoration 3"],["--b3","#3ee6c4","Decoration 4"],["--b4","#4d8bff","Decoration 5"],["--b5","#b06bff","Decoration 6"],["--b12","rgba(255,255,255,0.4)","Decoration 7"],["--b6","#0b0b12","Bubble fill 1"],["--b7","#f6f7ff","Text"],["--b8","#12121c","Bubble fill 2"]]},{"id":214,"name":"CRT Drift","cat":"12. Living Effects","font":"Share Tech Mono","ai":["#04120a","#b8ffd0"],"user":["#07180e","#b8ffd0"],"sp":null,"emoji":null,"locked":true,"vars":[["--b4","rgba(120,255,170,0.22)","Border"],["--b5","rgba(0,0,0,0.42)","Decoration 1"],["--b8","rgba(180,255,210,0.16)","Decoration 2"],["--b1","#04120a","Bubble fill 1"],["--b2","#b8ffd0","Text"],["--b3","#07180e","Bubble fill 2"]]},{"id":215,"name":"Glitch Slice","cat":"12. Living Effects","font":"Chakra Petch","ai":["#0d0d16","#f1f2ff"],"user":["#14141f","#f1f2ff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b4","rgba(255,255,255,0.14)","Border"],["--b5","rgba(0,255,240,0.35)","Decoration 1"],["--b6","rgba(0,255,240,0.05)","Decoration 2"],["--b7","rgba(255,0,140,0.35)","Decoration 3"],["--b8","rgba(255,0,140,0.05)","Decoration 4"],["--b1","#0d0d16","Bubble fill 1"],["--b2","#f1f2ff","Text"],["--b3","#14141f","Bubble fill 2"]]},{"id":216,"name":"Matrix Rain","cat":"12. Living Effects","font":"Share Tech Mono","ai":["#020a05","#a8ffc6"],"user":["#04120a","#a8ffc6"],"sp":null,"emoji":null,"locked":true,"vars":[["--b4","rgba(0,255,120,0.22)","Border"],["--b5","rgba(150,255,190,0.75)","Decoration 1"],["--b7","rgba(0,255,120,0.6)","Decoration 2"],["--b8","rgba(0,255,120,0.14)","Decoration 3"],["--b1","#020a05","Bubble fill 1"],["--b2","#a8ffc6","Text"],["--b3","#04120a","Bubble fill 2"]]},{"id":217,"name":"Vapor Grid","cat":"12. Living Effects","font":"Righteous","ai":["#0d0524","#ffe9fb"],"user":["#150a30","#ffe9fb"],"sp":null,"emoji":null,"locked":true,"vars":[["--b9","rgba(255,110,199,0.25)","Border"],["--b1","#2b1055","Decoration 1"],["--b2","#6d2a8f","Decoration 2"],["--b3","#ff6ec7","Decoration 3"],["--b4","#ffb35c","Decoration 4"],["--b5","#170a33","Decoration 5"],["--b6","#0d0524","Decoration 6"],["--b10","rgba(255,110,199,0.55)","Decoration 7"],["--b12","rgba(120,220,255,0.35)","Decoration 8"],["--b7","#ffe9fb","Text"],["--b8","#150a30","Bubble fill"]]},{"id":218,"name":"Abyss Glow","cat":"12. Living Effects","font":"Lexend","ai":["#04141c","#cdf6ff"],"user":["#062029","#cdf6ff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b4","rgba(60,200,220,0.18)","Border"],["--b5","rgba(0,230,200,0.35)","Decoration 1"],["--b7","rgba(70,140,255,0.3)","Decoration 2"],["--b9","rgba(150,255,240,0.9)","Decoration 3"],["--b11","rgba(120,220,255,0.8)","Decoration 4"],["--b1","#04141c","Bubble fill 1"],["--b2","#cdf6ff","Text"],["--b3","#062029","Bubble fill 2"]]},{"id":219,"name":"Moon Ripple","cat":"12. Living Effects","font":"Cormorant Garamond","ai":["#e9eff8","#182a45"],"user":["#f2f5fb","#182a45"],"sp":null,"emoji":null,"locked":true,"vars":[["--b4","rgba(120,150,200,0.35)","Border"],["--b6","rgba(74,116,196,0.3)","Decoration 1"],["--b8","rgba(120,90,200,0.24)","Decoration 2"],["--b1","#e9eff8","Bubble fill 1"],["--b2","#182a45","Text"],["--b3","#f2f5fb","Bubble fill 2"]]},{"id":220,"name":"Tide Line","cat":"12. Living Effects","font":"Mulish","ai":["#07202e","#d9f4ff"],"user":["#0a2b3d","#d9f4ff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b4","rgba(110,200,220,0.22)","Border"],["--b6","rgba(14,90,120,0.55)","Decoration"],["--b1","#07202e","Bubble fill 1"],["--b2","#d9f4ff","Text"],["--b3","#0a2b3d","Bubble fill 2"]]},{"id":221,"name":"Gold Glint","cat":"12. Living Effects","font":"Cinzel","ai":["#241804","#ffe9b0"],"user":["#2e2008","#ffe9b0"],"sp":null,"emoji":null,"locked":true,"vars":[["--b4","rgba(214,168,74,0.5)","Border"],["--b5","rgba(120,84,20,0.35)","Decoration 1"],["--b6","rgba(214,168,74,0.35)","Decoration 2"],["--b7","rgba(255,240,190,0.5)","Decoration 3"],["--b8","rgba(255,246,214,0.95)","Decoration 4"],["--b10","rgba(255,236,180,0.9)","Decoration 5"],["--b1","#241804","Bubble fill 1"],["--b2","#ffe9b0","Text"],["--b3","#2e2008","Bubble fill 2"]]},{"id":222,"name":"Frost Breath","cat":"12. Living Effects","font":"Quicksand","ai":["#dfeaf6","#16283d"],"user":["#eaf2fa","#16283d"],"sp":null,"emoji":null,"locked":true,"vars":[["--b4","rgba(255,255,255,0.9)","Border"],["--b5","rgba(255,255,255,0.95)","Decoration 1"],["--b7","rgba(198,230,255,0.9)","Decoration 2"],["--b9","rgba(160,205,240,0.8)","Decoration 3"],["--b1","#dfeaf6","Bubble fill 1"],["--b2","#16283d","Text"],["--b3","#eaf2fa","Bubble fill 2"]]},{"id":223,"name":"Comet Trail","cat":"12. Living Effects","font":"Space Grotesk","ai":["#06070f","#eaefff"],"user":["#0b0d1c","#eaefff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b4","rgba(150,180,255,0.18)","Border"],["--b5","rgba(70,110,255,0.25)","Decoration 1"],["--b7","rgba(180,70,255,0.2)","Decoration 2"],["--b10","rgba(150,200,255,0.22)","Decoration 3"],["--b11","rgba(230,245,255,0.85)","Decoration 4"],["--b1","#06070f","Bubble fill 1"],["--b2","#eaefff","Text"],["--b3","#0b0d1c","Bubble fill 2"]]},{"id":224,"name":"Heartbeat","cat":"12. Living Effects","font":"Nunito","ai":["#360f22","#ffd9e6"],"user":["#42152b","#ffd9e6"],"sp":null,"emoji":null,"locked":true,"vars":[["--b4","rgba(255,120,160,0.28)","Border"],["--b5","rgba(255,64,120,0.4)","Decoration"],["--b1","#360f22","Bubble fill 1"],["--b2","#ffd9e6","Text"],["--b3","#42152b","Bubble fill 2"]]},{"id":225,"name":"Petal Fall","cat":"12. Living Effects","font":"Playfair Display","ai":["#fbe9ef","#4a1030"],"user":["#fdf1f5","#4a1030"],"sp":null,"emoji":null,"locked":true,"vars":[["--b4","rgba(240,170,200,0.55)","Border"],["--b5","rgba(246,130,175,0.55)","Decoration 1"],["--b7","rgba(255,170,200,0.6)","Decoration 2"],["--b9","rgba(232,110,160,0.4)","Decoration 3"],["--b1","#fbe9ef","Bubble fill 1"],["--b2","#4a1030","Text"],["--b3","#fdf1f5","Bubble fill 2"]]},{"id":226,"name":"Caustics","cat":"12. Living Effects","font":"Outfit","ai":["#04222b","#d7fbff"],"user":["#062c36","#d7fbff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b4","rgba(120,235,240,0.2)","Border"],["--b5","rgba(150,255,245,0.16)","Decoration 1"],["--b7","rgba(120,220,255,0.14)","Decoration 2"],["--b9","rgba(190,255,255,0.16)","Decoration 3"],["--b1","#04222b","Bubble fill 1"],["--b2","#d7fbff","Text"],["--b3","#062c36","Bubble fill 2"]]},{"id":227,"name":"Candy Gloss","cat":"12. Living Effects","font":"Fredoka","ai":["#6d0f3f","#ffe6f2"],"user":["#8a1450","#ffe6f2"],"sp":null,"emoji":null,"locked":true,"vars":[["--b4","rgba(255,255,255,0.28)","Border"],["--b5","rgba(255,255,255,0.42)","Decoration 1"],["--b6","rgba(255,255,255,0.08)","Decoration 2"],["--b7","rgba(0,0,0,0.16)","Decoration 3"],["--b8","rgba(255,255,255,0.55)","Decoration 4"],["--b1","#6d0f3f","Bubble fill 1"],["--b2","#ffe6f2","Text"],["--b3","#8a1450","Bubble fill 2"]]},{"id":228,"name":"Jelly Wobble","cat":"12. Living Effects","font":"Comfortaa","ai":["#0f2a24","#d9fff2"],"user":["#123328","#d9fff2"],"sp":null,"emoji":null,"locked":true,"vars":[["--b4","rgba(120,255,215,0.22)","Border"],["--b5","rgba(80,255,200,0.35)","Decoration 1"],["--b7","rgba(60,190,255,0.3)","Decoration 2"],["--b9","rgba(255,255,255,0.16)","Decoration 3"],["--b1","#0f2a24","Bubble fill 1"],["--b2","#d9fff2","Text"],["--b3","#123328","Bubble fill 2"]]},{"id":229,"name":"Sonar Ping","cat":"12. Living Effects","font":"Inter","ai":["#0f172a","#e2e8f0"],"user":["#134e4a","#ccfbf1"],"sp":null,"emoji":null,"locked":false,"vars":[]},{"id":230,"name":"Firefly Meadow","cat":"12. Living Effects","font":"Lexend","ai":["#0c1a0e","#e9ffe4"],"user":["#102213","#e9ffe4"],"sp":null,"emoji":null,"locked":true,"vars":[["--b4","rgba(160,220,120,0.18)","Border"],["--b5","rgba(90,200,110,0.28)","Decoration 1"],["--b7","rgba(40,90,60,0.5)","Decoration 2"],["--b9","rgba(255,238,140,0.95)","Decoration 3"],["--b11","rgba(214,255,150,0.85)","Decoration 4"],["--b13","rgba(255,224,120,0.8)","Decoration 5"],["--b1","#0c1a0e","Bubble fill 1"],["--b2","#e9ffe4","Text"],["--b3","#102213","Bubble fill 2"]]},{"id":231,"name":"Celadon","cat":"13. Craft & Material","font":"Poppins","ai":["#dfeae2","#17352c"],"user":["#cfe0d6","#17352c"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#17352c","Text"],["--b10","rgba(23,53,44,.18)","Border"],["--b12","rgba(23,53,44,.11)","Bubble fill 1"],["--b13","rgba(23,53,44,.09)","Bubble fill 2"],["--b2","#f4faf6","Bubble fill 3"],["--b3","#e2ece5","Bubble fill 4"],["--b4","#cfe0d5","Bubble fill 5"],["--b5","#dfeae2","Bubble fill 6"],["--b14","rgba(23,53,44,.13)","Bubble fill 7"],["--b15","rgba(23,53,44,.1)","Bubble fill 8"],["--b6","#e6f1ea","Bubble fill 9"],["--b7","#d3e4d9","Bubble fill 10"],["--b8","#bdd6c8","Bubble fill 11"],["--b9","#cfe0d6","Bubble fill 12"]]},{"id":232,"name":"Qinghua","cat":"13. Craft & Material","font":"Poppins","ai":["#f4f7fb","#12305a"],"user":["#e4edf8","#12305a"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#12305a","Text"],["--b2","#ffffff","Bubble fill 1"],["--b3","#f5f9fd","Bubble fill 2"],["--b4","#e8f0fa","Bubble fill 3"],["--b5","#f4f7fb","Bubble fill 4"],["--b6","#f8fbfe","Bubble fill 5"],["--b7","#eaf1fb","Bubble fill 6"],["--b8","#dae6f5","Bubble fill 7"],["--b9","#e4edf8","Bubble fill 8"]]},{"id":233,"name":"Chu Sa","cat":"13. Craft & Material","font":"Poppins","ai":["#f7f2e6","#39301f"],"user":["#efe7d3","#39301f"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#39301f","Text"],["--b10","rgba(57,48,31,.2)","Border"],["--b11","rgba(57,48,31,.06)","Bubble fill 1"],["--b2","#fbf7ee","Bubble fill 2"],["--b3","#f3ecda","Bubble fill 3"],["--b4","#f7f2e6","Bubble fill 4"],["--b13","rgba(57,48,31,.07)","Bubble fill 5"],["--b5","#f4ecdb","Bubble fill 6"],["--b6","#e9dfc7","Bubble fill 7"],["--b7","#efe7d3","Bubble fill 8"],["--b15","rgba(255,240,233,.9)","Decoration 1"],["--b8","#c73a30","Decoration 2"],["--b9","#a3211c","Decoration 3"]]},{"id":234,"name":"Sumi Mist","cat":"13. Craft & Material","font":"Poppins","ai":["#f7f5f0","#26262a"],"user":["#eae8e1","#26262a"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#26262a","Text"],["--b8","rgba(38,38,42,.14)","Border"],["--b9","rgba(38,38,42,.34)","Bubble fill 1"],["--b10","rgba(38,38,42,.12)","Bubble fill 2"],["--b12","rgba(38,38,42,.26)","Bubble fill 3"],["--b13","rgba(38,38,42,.08)","Bubble fill 4"],["--b14","rgba(38,38,42,.13)","Bubble fill 5"],["--b2","#fbfaf7","Bubble fill 6"],["--b3","#f2f0e9","Bubble fill 7"],["--b4","#f7f5f0","Bubble fill 8"],["--b5","#efeee7","Bubble fill 9"],["--b6","#e3e1d9","Bubble fill 10"],["--b7","#eae8e1","Bubble fill 11"]]},{"id":235,"name":"Bamboo Grove","cat":"13. Craft & Material","font":"Poppins","ai":["#e9f2e0","#1f3a19"],"user":["#dbe9cf","#1f3a19"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#1f3a19","Text"],["--b12","rgba(31,58,25,.18)","Border"],["--b14","rgba(31,58,25,.2)","Bubble fill 1"],["--b15","rgba(255,255,255,.55)","Bubble fill 2"],["--b16","rgba(31,58,25,.13)","Bubble fill 3"],["--b17","rgba(255,255,255,.4)","Bubble fill 4"],["--b2","#dbebc7","Bubble fill 5"],["--b3","#eff7e6","Bubble fill 6"],["--b4","#e3efd4","Bubble fill 7"],["--b5","#cfe3ba","Bubble fill 8"],["--b6","#e9f2e0","Bubble fill 9"],["--b18","rgba(31,58,25,.24)","Bubble fill 10"],["--b19","rgba(255,255,255,.5)","Bubble fill 11"],["--b20","rgba(31,58,25,.15)","Bubble fill 12"],["--b21","rgba(255,255,255,.36)","Bubble fill 13"],["--b7","#cbe2b6","Bubble fill 14"],["--b8","#e2eed2","Bubble fill 15"],["--b9","#d5e7c1","Bubble fill 16"],["--b10","#c1d9a9","Bubble fill 17"],["--b11","#dbe9cf","Bubble fill 18"]]},{"id":236,"name":"Hoa Mai","cat":"13. Craft & Material","font":"Poppins","ai":["#fbf2f2","#4a2130"],"user":["#f4e4e6","#4a2130"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#4a2130","Text"],["--b12","rgba(74,33,48,.16)","Border"],["--b2","#fdf8f8","Bubble fill 1"],["--b3","#f9eef0","Bubble fill 2"],["--b4","#f3e3e6","Bubble fill 3"],["--b5","#fbf2f2","Bubble fill 4"],["--b6","#f8eaec","Bubble fill 5"],["--b7","#f2e0e3","Bubble fill 6"],["--b8","#ecd6da","Bubble fill 7"],["--b9","#f4e4e6","Bubble fill 8"],["--b10","#5a3a2e","Decoration 1"],["--b11","#8a6252","Decoration 2"]]},{"id":237,"name":"Sakura Drift","cat":"13. Craft & Material","font":"Poppins","ai":["#fdf0f3","#5b2a3a"],"user":["#f8e2e8","#5b2a3a"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#5b2a3a","Text"],["--b10","rgba(91,42,58,.14)","Border"],["--b2","#fffafb","Bubble fill 1"],["--b3","#fdf1f4","Bubble fill 2"],["--b4","#f9e6eb","Bubble fill 3"],["--b5","#fdf0f3","Bubble fill 4"],["--b6","#fbeef2","Bubble fill 5"],["--b7","#f7e3e9","Bubble fill 6"],["--b8","#f2d8e0","Bubble fill 7"],["--b9","#f8e2e8","Bubble fill 8"]]},{"id":238,"name":"Lotus Sen","cat":"13. Craft & Material","font":"Poppins","ai":["#fcf2f0","#4a2c34"],"user":["#f5e6e6","#4a2c34"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#4a2c34","Text"],["--b8","rgba(74,44,52,.14)","Border"],["--b9","rgba(226,138,164,.34)","Bubble fill 1"],["--b11","rgba(226,138,164,.24)","Bubble fill 2"],["--b12","rgba(110,150,88,.3)","Bubble fill 3"],["--b2","#fffbfa","Bubble fill 4"],["--b3","#fbf0ef","Bubble fill 5"],["--b4","#fcf2f0","Bubble fill 6"],["--b14","rgba(204,116,142,.34)","Bubble fill 7"],["--b16","rgba(204,116,142,.24)","Bubble fill 8"],["--b17","rgba(96,136,76,.3)","Bubble fill 9"],["--b5","#faeeee","Bubble fill 10"],["--b6","#f2e0e0","Bubble fill 11"],["--b7","#f5e6e6","Bubble fill 12"]]},{"id":239,"name":"Koi Pond","cat":"13. Craft & Material","font":"Poppins","ai":["#12474a","#e6f5f2"],"user":["#0e3a3e","#e6f5f2"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#e6f5f2","Text"],["--b9","rgba(230,245,242,.12)","Bubble fill 1"],["--b10","rgba(240,124,52,.8)","Bubble fill 2"],["--b12","rgba(250,206,158,.45)","Bubble fill 3"],["--b2","#186a6d","Bubble fill 4"],["--b3","#12474a","Bubble fill 5"],["--b4","#0b2f32","Bubble fill 6"],["--b14","rgba(230,106,44,.75)","Bubble fill 7"],["--b16","rgba(244,196,146,.4)","Bubble fill 8"],["--b5","#135b5f","Bubble fill 9"],["--b6","#0e3a3e","Bubble fill 10"],["--b7","#082629","Bubble fill 11"],["--b18","rgba(230,245,242,.45)","Decoration"]]},{"id":240,"name":"Jade Bi","cat":"13. Craft & Material","font":"Poppins","ai":["#17453a","#dff0e6"],"user":["#1f5a49","#dff0e6"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#dff0e6","Text"],["--b8","rgba(223,240,230,.16)","Border"],["--b10","rgba(226,255,240,.3)","Bubble fill 1"],["--b11","rgba(186,238,210,.34)","Bubble fill 2"],["--b2","#1e5546","Bubble fill 3"],["--b3","#17453a","Bubble fill 4"],["--b4","#0f3127","Bubble fill 5"],["--b13","rgba(226,255,240,.28)","Bubble fill 6"],["--b14","rgba(196,244,218,.32)","Bubble fill 7"],["--b5","#286b56","Bubble fill 8"],["--b6","#1f5a49","Bubble fill 9"],["--b7","#164033","Bubble fill 10"]]},{"id":241,"name":"Maki-e","cat":"13. Craft & Material","font":"Poppins","ai":["#17110d","#f0dcae"],"user":["#241a12","#f0dcae"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#f0dcae","Text"],["--b8","rgba(238,201,122,.85)","Bubble fill 1"],["--b10","rgba(238,201,122,.55)","Bubble fill 2"],["--b11","rgba(255,229,168,.5)","Bubble fill 3"],["--b2","#2c211a","Bubble fill 4"],["--b3","#17110d","Bubble fill 5"],["--b4","#0b0705","Bubble fill 6"],["--b5","#3b2a1d","Bubble fill 7"],["--b6","#241a12","Bubble fill 8"],["--b7","#150e09","Bubble fill 9"]]},{"id":242,"name":"Raden","cat":"13. Craft & Material","font":"Poppins","ai":["#1c1b28","#eef0fa"],"user":["#26243a","#eef0fa"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#eef0fa","Text"],["--b7","rgba(120,220,220,.3)","Bubble fill 1"],["--b8","rgba(178,150,240,.28)","Bubble fill 2"],["--b9","rgba(255,190,150,.24)","Bubble fill 3"],["--b10","rgba(150,240,190,.28)","Bubble fill 4"],["--b11","rgba(255,255,255,.14)","Bubble fill 5"],["--b2","#26243a","Bubble fill 6"],["--b3","#1c1b28","Bubble fill 7"],["--b4","#111019","Bubble fill 8"],["--b5","#332f4c","Bubble fill 9"],["--b6","#191727","Bubble fill 10"]]},{"id":243,"name":"Nishiki","cat":"13. Craft & Material","font":"Poppins","ai":["#5c1626","#f6e3c0"],"user":["#47101f","#f6e3c0"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#f6e3c0","Text"],["--b7","rgba(214,176,104,.16)","Bubble fill 1"],["--b9","rgba(214,176,104,.12)","Bubble fill 2"],["--b10","rgba(214,176,104,.24)","Bubble fill 3"],["--b2","#701c2f","Bubble fill 4"],["--b3","#5c1626","Bubble fill 5"],["--b4","#47101f","Bubble fill 6"],["--b11","rgba(214,176,104,.22)","Bubble fill 7"],["--b5","#5a1526","Bubble fill 8"],["--b6","#340a17","Bubble fill 9"]]},{"id":244,"name":"Sashiko","cat":"13. Craft & Material","font":"Poppins","ai":["#f5f0e4","#1f3b57"],"user":["#e9e2d1","#1f3b57"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#1f3b57","Text"],["--b8","rgba(31,59,87,.18)","Border 1"],["--b9","rgba(31,59,87,.4)","Border 2"],["--b10","rgba(31,59,87,.05)","Bubble fill 1"],["--b2","#f9f5ec","Bubble fill 2"],["--b3","#f0ebdb","Bubble fill 3"],["--b4","#f5f0e4","Bubble fill 4"],["--b12","rgba(168,72,62,.42)","Border 3"],["--b13","rgba(31,59,87,.06)","Bubble fill 5"],["--b5","#efe9d9","Bubble fill 6"],["--b6","#e3dbc7","Bubble fill 7"],["--b7","#e9e2d1","Bubble fill 8"]]},{"id":245,"name":"Washi","cat":"13. Craft & Material","font":"Poppins","ai":["#f8f4ea","#3a3327"],"user":["#efe9db","#3a3327"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#3a3327","Text"],["--b8","rgba(58,51,39,.16)","Border"],["--b10","rgba(150,130,95,.17)","Bubble fill 1"],["--b11","rgba(150,130,95,.13)","Bubble fill 2"],["--b12","rgba(150,130,95,.1)","Bubble fill 3"],["--b2","#fcf9f1","Bubble fill 4"],["--b3","#f3eee1","Bubble fill 5"],["--b4","#f8f4ea","Bubble fill 6"],["--b13","rgba(150,130,95,.19)","Bubble fill 7"],["--b14","rgba(150,130,95,.14)","Bubble fill 8"],["--b15","rgba(150,130,95,.11)","Bubble fill 9"],["--b5","#f4efe3","Bubble fill 10"],["--b6","#eae2d1","Bubble fill 11"],["--b7","#efe9db","Bubble fill 12"]]},{"id":246,"name":"Origami","cat":"13. Craft & Material","font":"Poppins","ai":["#eef2f7","#22303f"],"user":["#e2e9f2","#22303f"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#22303f","Text"],["--b2","#ffffff","Bubble fill 1"],["--b3","#eef2f7","Bubble fill 2"],["--b4","#dfe6ef","Bubble fill 3"],["--b5","#f3f6fa","Bubble fill 4"],["--b6","#e5ebf3","Bubble fill 5"],["--b7","#f7fafd","Bubble fill 6"],["--b8","#e6ecf4","Bubble fill 7"],["--b9","#d4dde9","Bubble fill 8"],["--b10","#eaf0f7","Bubble fill 9"],["--b11","#dbe3ee","Bubble fill 10"],["--b12","#e2e9f2","Bubble fill 11"],["--b13","#d5dee9","Decoration 1"],["--b14","#c8d4e3","Decoration 2"]]},{"id":247,"name":"Tatami","cat":"13. Craft & Material","font":"Poppins","ai":["#e8dcb8","#2e3a1d"],"user":["#ddd0a8","#2e3a1d"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#2e3a1d","Text"],["--b8","rgba(96,84,42,.15)","Bubble fill 1"],["--b10","rgba(96,84,42,.08)","Bubble fill 2"],["--b2","#f0e5c5","Bubble fill 3"],["--b3","#e1d3a9","Bubble fill 4"],["--b4","#e8dcb8","Bubble fill 5"],["--b5","#e5d8b3","Bubble fill 6"],["--b6","#d6c79c","Bubble fill 7"],["--b7","#ddd0a8","Bubble fill 8"]]},{"id":248,"name":"Shoji","cat":"13. Craft & Material","font":"Poppins","ai":["#f8f3e6","#4a3a24"],"user":["#f0e9d7","#4a3a24"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#4a3a24","Text"],["--b11","rgba(150,110,66,.3)","Bubble fill 1"],["--b2","#fffdf4","Bubble fill 2"],["--b3","#f9f4e8","Bubble fill 3"],["--b4","#efe7d2","Bubble fill 4"],["--b5","#f8f3e6","Bubble fill 5"],["--b6","#faf6ea","Bubble fill 6"],["--b7","#f1ebda","Bubble fill 7"],["--b8","#e6dcc3","Bubble fill 8"],["--b9","#f0e9d7","Bubble fill 9"]]},{"id":249,"name":"Den Long","cat":"13. Craft & Material","font":"Poppins","ai":["#a01f26","#ffe9c6"],"user":["#8a1720","#ffe9c6"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#ffe9c6","Text"],["--b8","rgba(0,0,0,.16)","Bubble fill 1"],["--b10","rgba(255,220,170,.1)","Bubble fill 2"],["--b2","#c4343c","Bubble fill 3"],["--b3","#a01f26","Bubble fill 4"],["--b4","#7c1218","Bubble fill 5"],["--b11","rgba(0,0,0,.18)","Bubble fill 6"],["--b12","rgba(255,220,170,.09)","Bubble fill 7"],["--b5","#ab2830","Bubble fill 8"],["--b6","#8a1720","Bubble fill 9"],["--b7","#680b12","Bubble fill 10"]]},{"id":250,"name":"Li Xi","cat":"13. Craft & Material","font":"Poppins","ai":["#9c0f1c","#f7dfa0"],"user":["#7d0c17","#f7dfa0"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#f7dfa0","Text"],["--b11","rgba(240,206,124,.32)","Bubble fill 1"],["--b13","rgba(240,206,124,.09)","Bubble fill 2"],["--b2","#b41827","Bubble fill 3"],["--b3","#9c0f1c","Bubble fill 4"],["--b4","#7a0a14","Bubble fill 5"],["--b14","rgba(240,206,124,.28)","Bubble fill 6"],["--b5","#93131f","Bubble fill 7"],["--b6","#7d0c17","Bubble fill 8"],["--b7","#5e0710","Bubble fill 9"],["--b8","#f8dd93","Decoration 1"],["--b9","#cb9d3e","Decoration 2"],["--b10","#a97d24","Decoration 3"]]},{"id":251,"name":"Yuanbao","cat":"13. Craft & Material","font":"Poppins","ai":["#f0c862","#3c2a06"],"user":["#e0b448","#3c2a06"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#3c2a06","Text"],["--b11","rgba(255,252,228,.75)","Bubble fill 1"],["--b2","#fae2a0","Bubble fill 2"],["--b3","#f0c862","Bubble fill 3"],["--b4","#d8a83e","Bubble fill 4"],["--b5","#f2cd75","Bubble fill 5"],["--b12","rgba(255,252,228,.7)","Bubble fill 6"],["--b6","#f0ca72","Bubble fill 7"],["--b7","#e0b448","Bubble fill 8"],["--b8","#c4952c","Bubble fill 9"],["--b9","#e6bd5c","Bubble fill 10"]]},{"id":252,"name":"Cloud Scroll","cat":"13. Craft & Material","font":"Poppins","ai":["#1d3557","#e9eff8"],"user":["#16283f","#e9eff8"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#e9eff8","Text"],["--b2","#2a4a75","Bubble fill 1"],["--b3","#1d3557","Bubble fill 2"],["--b4","#132441","Bubble fill 3"],["--b5","#213b5e","Bubble fill 4"],["--b6","#16283f","Bubble fill 5"],["--b7","#0d1a2c","Bubble fill 6"]]},{"id":253,"name":"Seigaiha","cat":"13. Craft & Material","font":"Poppins","ai":["#1c4f6b","#e8f2f7"],"user":["#153e56","#e8f2f7"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#e8f2f7","Text"],["--b9","rgba(232,242,247,.34)","Bubble fill 1"],["--b10","rgba(232,242,247,.26)","Bubble fill 2"],["--b11","rgba(232,242,247,.2)","Bubble fill 3"],["--b2","#26657f","Bubble fill 4"],["--b3","#1c4f6b","Bubble fill 5"],["--b4","#143c53","Bubble fill 6"],["--b12","rgba(232,242,247,.3)","Bubble fill 7"],["--b13","rgba(232,242,247,.22)","Bubble fill 8"],["--b14","rgba(232,242,247,.17)","Bubble fill 9"],["--b5","#1d5470","Bubble fill 10"],["--b6","#153e56","Bubble fill 11"],["--b7","#0e2c3e","Bubble fill 12"]]},{"id":254,"name":"Asanoha","cat":"13. Craft & Material","font":"Poppins","ai":["#f2eee3","#25355c"],"user":["#e7e1d1","#25355c"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#25355c","Text"],["--b8","rgba(37,53,92,.18)","Border"],["--b10","rgba(37,53,92,.17)","Bubble fill 1"],["--b11","rgba(37,53,92,.13)","Bubble fill 2"],["--b12","rgba(37,53,92,.34)","Bubble fill 3"],["--b2","#f8f4ea","Bubble fill 4"],["--b3","#ece6d8","Bubble fill 5"],["--b4","#f2eee3","Bubble fill 6"],["--b13","rgba(37,53,92,.19)","Bubble fill 7"],["--b14","rgba(37,53,92,.15)","Bubble fill 8"],["--b15","rgba(37,53,92,.36)","Bubble fill 9"],["--b5","#ede7d9","Bubble fill 10"],["--b6","#e0d8c5","Bubble fill 11"],["--b7","#e7e1d1","Bubble fill 12"]]},{"id":255,"name":"Shibori","cat":"13. Craft & Material","font":"Poppins","ai":["#1b3159","#e4ecf7"],"user":["#142645","#e4ecf7"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#e4ecf7","Text"],["--b9","rgba(228,236,247,.28)","Bubble fill 1"],["--b10","rgba(228,236,247,.16)","Bubble fill 2"],["--b11","rgba(228,236,247,.22)","Bubble fill 3"],["--b12","rgba(228,236,247,.13)","Bubble fill 4"],["--b2","#2b4a7c","Bubble fill 5"],["--b3","#1b3159","Bubble fill 6"],["--b4","#122443","Bubble fill 7"],["--b13","rgba(228,236,247,.26)","Bubble fill 8"],["--b14","rgba(228,236,247,.15)","Bubble fill 9"],["--b15","rgba(228,236,247,.2)","Bubble fill 10"],["--b16","rgba(228,236,247,.12)","Bubble fill 11"],["--b5","#20396a","Bubble fill 12"],["--b6","#142645","Bubble fill 13"],["--b7","#0c1a33","Bubble fill 14"]]},{"id":256,"name":"Matcha","cat":"13. Craft & Material","font":"Poppins","ai":["#4e6a27","#f7f8ec"],"user":["#3e5a1d","#f7f8ec"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#f7f8ec","Text"],["--b8","rgba(235,242,198,.5)","Bubble fill 1"],["--b10","rgba(235,242,198,.36)","Bubble fill 2"],["--b11","rgba(255,255,255,.05)","Bubble fill 3"],["--b13","rgba(190,214,120,.45)","Bubble fill 4"],["--b2","#5d7d2f","Bubble fill 5"],["--b3","#4e6a27","Bubble fill 6"],["--b4","#3f5a1e","Bubble fill 7"],["--b15","rgba(235,242,198,.46)","Bubble fill 8"],["--b16","rgba(235,242,198,.32)","Bubble fill 9"],["--b17","rgba(176,202,106,.4)","Bubble fill 10"],["--b5","#4c6c26","Bubble fill 11"],["--b6","#3e5a1d","Bubble fill 12"],["--b7","#314916","Bubble fill 13"]]},{"id":257,"name":"Mooncake","cat":"13. Craft & Material","font":"Poppins","ai":["#8f5a24","#fdf1dc"],"user":["#7a4a1b","#fdf1dc"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#fdf1dc","Text"],["--b8","rgba(255,236,200,.14)","Bubble fill 1"],["--b10","rgba(60,30,8,.16)","Bubble fill 2"],["--b2","#ab6d2e","Bubble fill 3"],["--b3","#8f5a24","Bubble fill 4"],["--b4","#74471a","Bubble fill 5"],["--b11","rgba(255,236,200,.13)","Bubble fill 6"],["--b5","#935a22","Bubble fill 7"],["--b6","#7a4a1b","Bubble fill 8"],["--b7","#603812","Bubble fill 9"]]},{"id":258,"name":"Boba Pearl","cat":"13. Craft & Material","font":"Poppins","ai":["#d9ba95","#38230f"],"user":["#c9a67d","#38230f"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#38230f","Text"],["--b2","#3b2415","Bubble fill 1"],["--b3","#43291a","Bubble fill 2"],["--b4","#33200f","Bubble fill 3"],["--b5","#40271a","Bubble fill 4"],["--b6","#3a2415","Bubble fill 5"],["--b7","#e8d2b4","Bubble fill 6"],["--b8","#d9ba95","Bubble fill 7"],["--b9","#cbab84","Bubble fill 8"],["--b10","#dcc09b","Bubble fill 9"],["--b11","#c9a67d","Bubble fill 10"],["--b12","#b8926a","Bubble fill 11"]]},{"id":259,"name":"Ao Dai","cat":"13. Craft & Material","font":"Poppins","ai":["#f3e2ea","#4c2138"],"user":["#ead2de","#4c2138"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#4c2138","Text"],["--b11","rgba(255,255,255,.5)","Bubble fill 1"],["--b12","rgba(120,50,86,.07)","Bubble fill 2"],["--b2","#f9edf3","Bubble fill 3"],["--b3","#f1dfe9","Bubble fill 4"],["--b4","#e7cedc","Bubble fill 5"],["--b5","#f3e2ea","Bubble fill 6"],["--b14","rgba(255,255,255,.45)","Bubble fill 7"],["--b15","rgba(120,50,86,.08)","Bubble fill 8"],["--b6","#f0dbe6","Bubble fill 9"],["--b7","#e8cfdc","Bubble fill 10"],["--b8","#dcbecf","Bubble fill 11"],["--b9","#ead2de","Bubble fill 12"],["--b17","rgba(178,120,150,.6)","Decoration"]]},{"id":260,"name":"Dong Ho","cat":"13. Craft & Material","font":"Poppins","ai":["#f4ead2","#2f2a20"],"user":["#ebdfc0","#2f2a20"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#2f2a20","Text"],["--b12","rgba(47,42,32,.42)","Border"],["--b13","rgba(255,255,255,.8)","Bubble fill 1"],["--b15","rgba(214,190,140,.55)","Bubble fill 2"],["--b2","#faf1da","Bubble fill 3"],["--b3","#efe4c6","Bubble fill 4"],["--b4","#f4ead2","Bubble fill 5"],["--b17","rgba(255,255,255,.75)","Bubble fill 6"],["--b18","rgba(196,170,116,.55)","Bubble fill 7"],["--b5","#f2e7c9","Bubble fill 8"],["--b6","#e5d7b3","Bubble fill 9"],["--b7","#ebdfc0","Bubble fill 10"],["--b8","#b8392b","Decoration 1"],["--b9","#22301f","Decoration 2"],["--b10","#2d7a4d","Decoration 3"],["--b11","#cf9f22","Decoration 4"]]},{"id":261,"name":"Strawberry Milk","cat":"14. Sweet & Luxe","font":"Comic Neue","ai":["#ffe2ee","#6b243f"],"user":["#ffcfe1","#5e1c35"],"sp":null,"emoji":null,"locked":true,"vars":[["--b8","rgba(255,255,255,0.85)","Border"],["--b1","#6b243f","Text 1"],["--b2","#fff7fa","Bubble fill 1"],["--b3","#ffe2ee","Bubble fill 2"],["--b4","#ffc6db","Bubble fill 3"],["--b5","#5e1c35","Text 2"],["--b6","#ffcfe1","Bubble fill 4"],["--b7","#ffb3d0","Bubble fill 5"]]},{"id":262,"name":"Peach Soda","cat":"14. Sweet & Luxe","font":"Comic Neue","ai":["#ffe2cd","#6b3013"],"user":["#ffcba6","#5e2a10"],"sp":null,"emoji":null,"locked":true,"vars":[["--b8","rgba(255,255,255,0.85)","Border"],["--b1","#6b3013","Text 1"],["--b10","rgba(255,255,255,0.55)","Bubble fill 1"],["--b11","rgba(255,255,255,0.1)","Bubble fill 2"],["--b2","#fff6ee","Bubble fill 3"],["--b3","#ffe2cd","Bubble fill 4"],["--b4","#ffcba6","Bubble fill 5"],["--b5","#5e2a10","Text 2"],["--b6","#ffeadb","Bubble fill 6"],["--b7","#f7b183","Bubble fill 7"]]},{"id":263,"name":"Macaron","cat":"14. Sweet & Luxe","font":"Comic Neue","ai":["#ffd8e8","#5e2340"],"user":["#ddd2fb","#33265e"],"sp":null,"emoji":null,"locked":true,"vars":[["--b11","rgba(255,255,255,0.7)","Border"],["--b1","#5e2340","Text 1"],["--b12","rgba(255,255,255,0.8)","Bubble fill 1"],["--b2","#f6bcd6","Bubble fill 2"],["--b3","#fff2d2","Bubble fill 3"],["--b4","#ffe4ae","Bubble fill 4"],["--b5","#ffeef5","Bubble fill 5"],["--b6","#ffd8e8","Bubble fill 6"],["--b7","#33265e","Text 2"],["--b8","#c3b3f2","Bubble fill 7"],["--b9","#f2edff","Bubble fill 8"],["--b10","#ddd2fb","Bubble fill 9"]]},{"id":264,"name":"Mochi","cat":"14. Sweet & Luxe","font":"Comic Neue","ai":["#f3e6fb","#45285a"],"user":["#dcf2e6","#14402e"],"sp":null,"emoji":null,"locked":true,"vars":[["--b9","rgba(255,255,255,0.8)","Border"],["--b1","#45285a","Text 1"],["--b10","rgba(255,255,255,0.75)","Bubble fill 1"],["--b2","#fdf6ff","Bubble fill 2"],["--b3","#f3e6fb","Bubble fill 3"],["--b4","#e2cdf2","Bubble fill 4"],["--b5","#14402e","Text 2"],["--b6","#f4fdf8","Bubble fill 5"],["--b7","#dcf2e6","Bubble fill 6"],["--b8","#bfe4d2","Bubble fill 7"]]},{"id":265,"name":"Cotton Candy","cat":"14. Sweet & Luxe","font":"Comic Neue","ai":["#fbdcf3","#4d2350"],"user":["#dfe9ff","#24356b"],"sp":null,"emoji":null,"locked":true,"vars":[["--b8","rgba(255,255,255,0.9)","Border"],["--b1","#4d2350","Text 1"],["--b9","rgba(255,255,255,0.26)","Bubble fill 1"],["--b2","#fff2fb","Bubble fill 2"],["--b3","#fbdcf3","Bubble fill 3"],["--b4","#ecdcff","Bubble fill 4"],["--b5","#24356b","Text 2"],["--b6","#f4f8ff","Bubble fill 5"],["--b7","#dfe9ff","Bubble fill 6"]]},{"id":266,"name":"Boba Pearls","cat":"14. Sweet & Luxe","font":"Comic Neue","ai":["#f7e9d6","#4a2f1c"],"user":["#f0dcc0","#4a2f1c"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#4a2f1c","Bubble text"],["--b2","#f7e9d6","Their tea top"],["--b3","#e6cca6","Their tea bottom"],["--b4","#f0dcc0","Your tea top"],["--b5","#d9bb90","Your tea bottom"],["--b7","rgba(255,255,255,0.55)","Pearl shine"],["--b6","#452a17","Pearl"],["--b11","rgba(90,58,30,0.16)","Pearl shadow"]]},{"id":267,"name":"Honey Drip","cat":"14. Sweet & Luxe","font":"Comic Neue","ai":["#fff8e6","#57370a"],"user":["#ffe9b4","#513307"],"sp":null,"emoji":null,"locked":true,"vars":[["--b11","rgba(255,255,255,0.75)","Border"],["--b1","#57370a","Text 1"],["--b2","#ffc93c","Bubble fill 1"],["--b13","rgba(255,255,255,0.42)","Bubble fill 2"],["--b3","#fffdf4","Bubble fill 3"],["--b4","#fff8e6","Bubble fill 4"],["--b5","#ffedbf","Bubble fill 5"],["--b6","#513307","Text 2"],["--b7","#f0ae21","Bubble fill 6"],["--b8","#fff6dc","Bubble fill 7"],["--b9","#ffe9b4","Bubble fill 8"],["--b10","#ffd88a","Bubble fill 9"]]},{"id":268,"name":"Lemon Fizz","cat":"14. Sweet & Luxe","font":"Poppins","ai":["#fff5cc","#4a4106"],"user":["#ffe98f","#463d05"],"sp":null,"emoji":null,"locked":true,"vars":[["--b9","rgba(255,255,255,0.85)","Border"],["--b1","#4a4106","Text 1"],["--b10","rgba(255,255,255,0.5)","Bubble fill 1"],["--b2","#fffdf0","Bubble fill 2"],["--b3","#fff5cc","Bubble fill 3"],["--b4","#463d05","Text 2"],["--b5","#fff7d5","Bubble fill 4"],["--b6","#ffe98f","Bubble fill 5"],["--b7","#fff6c8","Decoration 1"],["--b8","#f2d24a","Decoration 2"]]},{"id":269,"name":"Matcha Foam","cat":"14. Sweet & Luxe","font":"Poppins","ai":["#cfe3ae","#1e3b16"],"user":["#b6d494","#142a0f"],"sp":null,"emoji":null,"locked":true,"vars":[["--b10","rgba(255,255,255,0.5)","Border"],["--b1","#1e3b16","Text 1"],["--b11","rgba(255,255,255,0.72)","Bubble fill 1"],["--b2","#fdf6e4","Bubble fill 2"],["--b13","rgba(90,70,30,0.16)","Bubble fill 3"],["--b3","#dcecc4","Bubble fill 4"],["--b4","#cfe3ae","Bubble fill 5"],["--b5","#aecd88","Bubble fill 6"],["--b6","#142a0f","Text 2"],["--b7","#c8dfa2","Bubble fill 7"],["--b8","#b6d494","Bubble fill 8"],["--b9","#9bc072","Bubble fill 9"]]},{"id":270,"name":"Caramel Swirl","cat":"14. Sweet & Luxe","font":"Poppins","ai":["#f6dcb2","#3f2409"],"user":["#e2b880","#38200a"],"sp":null,"emoji":null,"locked":true,"vars":[["--b8","rgba(255,255,255,0.45)","Border"],["--b1","#3f2409","Text 1"],["--b9","rgba(255,255,255,0.8)","Bubble fill 1"],["--b11","rgba(255,255,255,0.4)","Bubble fill 2"],["--b12","rgba(255,255,255,0.28)","Bubble fill 3"],["--b13","rgba(255,255,255,0.36)","Bubble fill 4"],["--b2","#fdeed6","Bubble fill 5"],["--b3","#f6dcb2","Bubble fill 6"],["--b4","#e2b880","Bubble fill 7"],["--b5","#38200a","Text 2"],["--b14","rgba(255,255,255,0.66)","Bubble fill 8"],["--b6","#f2d3a4","Bubble fill 9"],["--b7","#c9954f","Bubble fill 10"]]},{"id":271,"name":"Marshmallow","cat":"14. Sweet & Luxe","font":"Comic Neue","ai":["#f7f2f5","#4a3b46"],"user":["#ffe4ed","#4d2536"],"sp":null,"emoji":null,"locked":true,"vars":[["--b9","rgba(224,212,220,0.85)","Border"],["--b1","#4a3b46","Text 1"],["--b10","rgba(255,255,255,0.6)","Bubble fill 1"],["--b2","#ffffff","Bubble fill 2"],["--b3","#f7f2f5","Bubble fill 3"],["--b4","#eae0e7","Bubble fill 4"],["--b5","#4d2536","Text 2"],["--b6","#fff5f8","Bubble fill 5"],["--b7","#ffe4ed","Bubble fill 6"],["--b8","#f8cbdc","Bubble fill 7"]]},{"id":272,"name":"Sprinkles","cat":"14. Sweet & Luxe","font":"Comic Neue","ai":["#fbeaf2","#4a3550"],"user":["#ffdaeb","#4a1f3c"],"sp":null,"emoji":null,"locked":true,"vars":[["--b11","rgba(255,255,255,0.9)","Border"],["--b1","#4a3550","Text 1"],["--b2","#ff7fae","Bubble fill 1"],["--b3","#64c8ff","Bubble fill 2"],["--b4","#ffcf4d","Bubble fill 3"],["--b5","#ffffff","Bubble fill 4"],["--b6","#fffaf6","Bubble fill 5"],["--b13","rgba(255,255,255,0.62)","Bubble fill 6"],["--b7","#fbeaf2","Bubble fill 7"],["--b8","#4a1f3c","Text 2"],["--b9","#fff0f7","Bubble fill 8"],["--b10","#ffdaeb","Bubble fill 9"]]},{"id":273,"name":"Rainbow Sherbet","cat":"14. Sweet & Luxe","font":"Poppins","ai":["#f3f8d4","#3f2a46"],"user":["#e3ecc6","#38243e"],"sp":null,"emoji":null,"locked":true,"vars":[["--b8","rgba(255,255,255,0.9)","Border"],["--b1","#3f2a46","Text 1"],["--b9","rgba(255,255,255,0.78)","Bubble fill 1"],["--b10","rgba(255,255,255,0.12)","Bubble fill 2"],["--b2","#ffe0e8","Bubble fill 3"],["--b3","#ffeacd","Bubble fill 4"],["--b4","#f3f8d4","Bubble fill 5"],["--b5","#d9f0f5","Bubble fill 6"],["--b6","#e6dcfa","Bubble fill 7"],["--b7","#38243e","Text 2"],["--b12","rgba(255,255,255,0.5)","Bubble fill 8"],["--b13","rgba(255,255,255,0.08)","Bubble fill 9"],["--b14","rgba(94,74,124,0.16)","Bubble fill 10"]]},{"id":274,"name":"Jelly Gummy","cat":"14. Sweet & Luxe","font":"Comic Neue","ai":["#ffb3d4","#4f0f31"],"user":["#a4ead2","#0c3d30"],"sp":null,"emoji":null,"locked":true,"vars":[["--b9","rgba(255,255,255,0.5)","Border"],["--b1","#4f0f31","Text 1"],["--b10","rgba(255,255,255,0.92)","Bubble fill 1"],["--b11","rgba(255,255,255,0.16)","Bubble fill 2"],["--b2","#ffe3ef","Bubble fill 3"],["--b3","#ffb3d4","Bubble fill 4"],["--b4","#ff8cbe","Bubble fill 5"],["--b5","#0c3d30","Text 2"],["--b6","#dcf8ee","Bubble fill 6"],["--b7","#a4ead2","Bubble fill 7"],["--b8","#74d9bd","Bubble fill 8"]]},{"id":275,"name":"Kitty Ears","cat":"14. Sweet & Luxe","font":"Comic Neue","ai":["#fff3e6","#4d3320"],"user":["#ffdcc4","#52301a"],"sp":null,"emoji":null,"locked":true,"vars":[["--b12","rgba(255,255,255,0.8)","Border"],["--b1","#4d3320","Text 1"],["--b2","#fffaf3","Bubble fill 1"],["--b3","#fff3e6","Bubble fill 2"],["--b4","#ffe2cb","Bubble fill 3"],["--b5","#52301a","Text 2"],["--b6","#ffece0","Bubble fill 4"],["--b7","#ffdcc4","Bubble fill 5"],["--b8","#ffc7a4","Bubble fill 6"],["--b9","#e79b7e","Decoration 1"],["--b10","#f7c4a4","Decoration 2"],["--b11","#f0ab84","Decoration 3"]]},{"id":276,"name":"Bunny Ears","cat":"14. Sweet & Luxe","font":"Comic Neue","ai":["#fff4f8","#4d2b3d"],"user":["#ffdfec","#4d2035"],"sp":null,"emoji":null,"locked":true,"vars":[["--b11","rgba(255,255,255,0.9)","Border"],["--b1","#4d2b3d","Text 1"],["--b2","#ffffff","Bubble fill 1"],["--b3","#fff4f8","Bubble fill 2"],["--b4","#ffe7f0","Bubble fill 3"],["--b5","#4d2035","Text 2"],["--b6","#fff0f6","Bubble fill 4"],["--b7","#ffdfec","Bubble fill 5"],["--b8","#ffc9df","Bubble fill 6"],["--b9","#ffb0cd","Decoration 1"],["--b10","#ffdcea","Decoration 2"]]},{"id":277,"name":"Panda Pal","cat":"14. Sweet & Luxe","font":"Poppins","ai":["#f4f5f8","#1f2124"],"user":["#e4e7ec","#1b1d20"],"sp":null,"emoji":null,"locked":true,"vars":[["--b12","rgba(38,40,46,0.14)","Border"],["--b1","#1f2124","Text 1"],["--b2","#ffffff","Bubble fill 1"],["--b3","#f4f5f8","Bubble fill 2"],["--b4","#e9ebef","Bubble fill 3"],["--b5","#1b1d20","Text 2"],["--b6","#eff1f5","Bubble fill 4"],["--b7","#e4e7ec","Bubble fill 5"],["--b8","#d3d7de","Bubble fill 6"],["--b9","#6e7583","Decoration 1"],["--b10","#3a3d45","Decoration 2"],["--b11","#24262c","Decoration 3"]]},{"id":278,"name":"Buttercream","cat":"14. Sweet & Luxe","font":"Comic Neue","ai":["#fff2cf","#4d3d05"],"user":["#ffe19a","#473805"],"sp":null,"emoji":null,"locked":true,"vars":[["--b11","rgba(255,255,255,0.8)","Border"],["--b1","#4d3d05","Text 1"],["--b12","rgba(255,255,255,0.85)","Bubble fill 1"],["--b14","rgba(190,150,60,0.11)","Bubble fill 2"],["--b2","#fffdf2","Bubble fill 3"],["--b15","rgba(190,150,60,0.2)","Bubble fill 4"],["--b3","#fffaea","Bubble fill 5"],["--b4","#fff2cf","Bubble fill 6"],["--b5","#ffe6ab","Bubble fill 7"],["--b6","#473805","Text 2"],["--b7","#fff6d8","Bubble fill 8"],["--b8","#fff1cd","Bubble fill 9"],["--b9","#ffe19a","Bubble fill 10"],["--b10","#f8cd6c","Bubble fill 11"]]},{"id":279,"name":"Cloud Fluff","cat":"14. Sweet & Luxe","font":"Comic Neue","ai":["#f0f5ff","#333a4d"],"user":["#e4ecfb","#2a3149"],"sp":null,"emoji":null,"locked":true,"vars":[["--b9","rgba(218,226,244,0.9)","Border"],["--b1","#333a4d","Text 1"],["--b2","#f7faff","Bubble fill 1"],["--b3","#f0f5ff","Bubble fill 2"],["--b4","#e4ebf9","Bubble fill 3"],["--b5","#2a3149","Text 2"],["--b6","#eef3fe","Bubble fill 4"],["--b7","#e4ecfb","Bubble fill 5"],["--b8","#d3ddf4","Bubble fill 6"]]},{"id":280,"name":"Bear Paw","cat":"14. Sweet & Luxe","font":"Comic Neue","ai":["#f2e0c9","#45260f"],"user":["#ddbf98","#3a1f08"],"sp":null,"emoji":null,"locked":true,"vars":[["--b11","rgba(255,255,255,0.5)","Border"],["--b1","#45260f","Text 1"],["--b2","#fdf5ec","Bubble fill 1"],["--b3","#f2e0c9","Bubble fill 2"],["--b4","#e4cba9","Bubble fill 3"],["--b5","#3a1f08","Text 2"],["--b6","#eddbc0","Bubble fill 4"],["--b7","#ddbf98","Bubble fill 5"],["--b8","#caa675","Bubble fill 6"],["--b9","#a9754a","Decoration 1"],["--b10","#8a5a32","Decoration 2"]]},{"id":281,"name":"Star Jar","cat":"14. Sweet & Luxe","font":"VT323","ai":["#1b2048","#dfe4ff"],"user":["#241d4a","#f0e6ff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b12","rgba(255,255,255,0.16)","Border"],["--b1","#dfe4ff","Text 1"],["--b2","#ffffff","Bubble fill 1"],["--b3","#ffe9a8","Bubble fill 2"],["--b4","#b9c8ff","Bubble fill 3"],["--b13","rgba(255,255,255,0.14)","Bubble fill 4"],["--b5","#2b3168","Bubble fill 5"],["--b6","#1b2048","Bubble fill 6"],["--b7","#101430","Bubble fill 7"],["--b8","#f0e6ff","Text 2"],["--b9","#3a2c6b","Bubble fill 8"],["--b10","#241d4a","Bubble fill 9"],["--b11","#150f2c","Bubble fill 10"]]},{"id":282,"name":"Heart Locket","cat":"14. Sweet & Luxe","font":"Poppins","ai":["#e8dbf2","#3d2350"],"user":["#d5c1ea","#35204a"],"sp":null,"emoji":null,"locked":true,"vars":[["--b11","rgba(255,255,255,0.7)","Border"],["--b1","#3d2350","Text 1"],["--b12","rgba(255,255,255,0.55)","Bubble fill 1"],["--b14","rgba(255,255,255,0.28)","Bubble fill 2"],["--b2","#f7f1fb","Bubble fill 3"],["--b3","#e8dbf2","Bubble fill 4"],["--b4","#d5c1ea","Bubble fill 5"],["--b5","#35204a","Text 2"],["--b6","#e6d9f1","Bubble fill 6"],["--b7","#bda4d8","Bubble fill 7"],["--b8","#f2c8b6","Decoration 1"],["--b9","#d68f76","Decoration 2"],["--b10","#b06a52","Decoration 3"]]},{"id":283,"name":"Ribbon Wrap","cat":"14. Sweet & Luxe","font":"Poppins","ai":["#f9ece2","#4a3327"],"user":["#f4dee4","#4a2430"],"sp":null,"emoji":null,"locked":true,"vars":[["--b11","rgba(255,255,255,0.85)","Border"],["--b1","#4a3327","Text 1"],["--b12","rgba(255,255,255,0.6)","Bubble fill 1"],["--b2","#fffaf6","Bubble fill 2"],["--b3","#f9ece2","Bubble fill 3"],["--b4","#f0dbcd","Bubble fill 4"],["--b5","#4a2430","Text 2"],["--b6","#fdf3f6","Bubble fill 5"],["--b7","#f4dee4","Bubble fill 6"],["--b8","#e9c7d2","Bubble fill 7"],["--b9","#e7a3b6","Decoration 1"],["--b10","#cd7a92","Decoration 2"],["--b14","rgba(255,255,255,0.5)","Decoration 3"]]},{"id":284,"name":"Gift Box","cat":"14. Sweet & Luxe","font":"Poppins","ai":["#f7eeda","#4a3512"],"user":["#eddcb0","#45300c"],"sp":null,"emoji":null,"locked":true,"vars":[["--b13","rgba(255,255,255,0.7)","Border"],["--b1","#4a3512","Text 1"],["--b14","rgba(120,90,30,0.28)","Bubble fill 1"],["--b16","rgba(255,246,220,0.75)","Bubble fill 2"],["--b2","#e6c684","Bubble fill 3"],["--b17","rgba(150,115,50,0.1)","Bubble fill 4"],["--b3","#fffaf0","Bubble fill 5"],["--b4","#f7eeda","Bubble fill 6"],["--b5","#ecdcbb","Bubble fill 7"],["--b6","#45300c","Text 2"],["--b7","#d9b062","Bubble fill 8"],["--b8","#f8efd6","Bubble fill 9"],["--b9","#eddcb0","Bubble fill 10"],["--b10","#dcc68d","Bubble fill 11"],["--b11","#8f6a22","Decoration 1"],["--b12","#f0d089","Decoration 2"]]},{"id":285,"name":"Crown VIP","cat":"14. Sweet & Luxe","font":"Poppins","ai":["#16130d","#f6e3ae"],"user":["#241c10","#ffeec2"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#f6e3ae","Text 1"],["--b15","rgba(255,226,150,0.12)","Bubble fill 1"],["--b2","#1e1912","Bubble fill 2"],["--b3","#16130d","Bubble fill 3"],["--b4","#0d0b07","Bubble fill 4"],["--b5","#f7e39a","Bubble fill 5"],["--b6","#b8862f","Bubble fill 6"],["--b7","#fff2c4","Bubble fill 7"],["--b8","#a9762a","Bubble fill 8"],["--b9","#ffeec2","Text 2"],["--b10","#2e2415","Bubble fill 9"],["--b11","#241c10","Bubble fill 10"],["--b12","#150f07","Bubble fill 11"],["--b13","#e0b756","Decoration"]]},{"id":286,"name":"Diamond Facet","cat":"14. Sweet & Luxe","font":"Poppins","ai":["#e4eefc","#14263d"],"user":["#cadef5","#10203a"],"sp":null,"emoji":null,"locked":true,"vars":[["--b11","rgba(255,255,255,0.95)","Border"],["--b1","#14263d","Text 1"],["--b12","rgba(255,255,255,0.55)","Bubble fill 1"],["--b2","#f8fcff","Bubble fill 2"],["--b3","#e4eefc","Bubble fill 3"],["--b4","#ffffff","Bubble fill 4"],["--b5","#dae8fa","Bubble fill 5"],["--b6","#f2f8ff","Bubble fill 6"],["--b7","#10203a","Text 2"],["--b8","#eef6ff","Bubble fill 7"],["--b14","rgba(255,255,255,0.45)","Bubble fill 8"],["--b9","#cadef5","Bubble fill 9"],["--b10","#bed6f1","Bubble fill 10"]]},{"id":287,"name":"Rose Gold","cat":"14. Sweet & Luxe","font":"Poppins","ai":["#eec0ab","#4a2318"],"user":["#e0a68e","#411c12"],"sp":null,"emoji":null,"locked":true,"vars":[["--b10","rgba(255,255,255,0.55)","Border"],["--b1","#4a2318","Text 1"],["--b12","rgba(255,255,255,0.5)","Bubble fill 1"],["--b13","rgba(255,255,255,0.08)","Bubble fill 2"],["--b2","#fbe6dc","Bubble fill 3"],["--b3","#eec0ab","Bubble fill 4"],["--b4","#d9977e","Bubble fill 5"],["--b5","#c9866c","Bubble fill 6"],["--b6","#411c12","Text 2"],["--b7","#f5d3c5","Bubble fill 7"],["--b8","#e0a68e","Bubble fill 8"],["--b9","#b57058","Bubble fill 9"]]},{"id":288,"name":"Champagne","cat":"14. Sweet & Luxe","font":"Poppins","ai":["#f4e2b0","#453409"],"user":["#e6cd8c","#3f2f08"],"sp":null,"emoji":null,"locked":true,"vars":[["--b9","rgba(255,244,205,0.8)","Border"],["--b1","#453409","Text 1"],["--b10","rgba(255,255,255,0.9)","Bubble fill 1"],["--b12","rgba(255,255,255,0.7)","Bubble fill 2"],["--b13","rgba(255,255,255,0.55)","Bubble fill 3"],["--b14","rgba(255,255,255,0.32)","Bubble fill 4"],["--b15","rgba(255,255,255,0.62)","Bubble fill 5"],["--b2","#fff8e3","Bubble fill 6"],["--b3","#f4e2b0","Bubble fill 7"],["--b4","#d9b96e","Bubble fill 8"],["--b5","#3f2f08","Text 2"],["--b6","#f8ecc6","Bubble fill 9"],["--b7","#e6cd8c","Bubble fill 10"],["--b8","#c9a352","Bubble fill 11"]]},{"id":289,"name":"Onyx Marble","cat":"14. Sweet & Luxe","font":"Poppins","ai":["#1c1c21","#f0e3c2"],"user":["#26252d","#f7ecd0"],"sp":null,"emoji":null,"locked":true,"vars":[["--b9","rgba(214,178,92,0.32)","Border"],["--b1","#f0e3c2","Text 1"],["--b11","rgba(232,200,118,0.6)","Bubble fill 1"],["--b12","rgba(232,200,118,0.26)","Bubble fill 2"],["--b13","rgba(184,148,63,0.34)","Bubble fill 3"],["--b14","rgba(232,200,118,0.16)","Bubble fill 4"],["--b15","rgba(255,255,255,0.11)","Bubble fill 5"],["--b2","#2b2b33","Bubble fill 6"],["--b3","#1c1c21","Bubble fill 7"],["--b4","#0c0c0f","Bubble fill 8"],["--b5","#f7ecd0","Text 2"],["--b6","#37363f","Bubble fill 9"],["--b7","#26252d","Bubble fill 10"],["--b8","#141419","Bubble fill 11"]]},{"id":290,"name":"Velvet Pearl","cat":"14. Sweet & Luxe","font":"Poppins","ai":["#2e1a34","#f6e6ef"],"user":["#3d2030","#ffeaf0"],"sp":null,"emoji":null,"locked":true,"vars":[["--b13","rgba(255,255,255,0.14)","Border"],["--b1","#f6e6ef","Text 1"],["--b14","rgba(255,214,238,0.11)","Bubble fill 1"],["--b16","rgba(255,214,238,0.09)","Bubble fill 2"],["--b17","rgba(255,214,238,0.21)","Bubble fill 3"],["--b2","#452551","Bubble fill 4"],["--b3","#2e1a34","Bubble fill 5"],["--b4","#1a0e1f","Bubble fill 6"],["--b5","#ffeaf0","Text 2"],["--b6","#572c43","Bubble fill 7"],["--b7","#3d2030","Bubble fill 8"],["--b8","#231320","Bubble fill 9"],["--b9","#ffffff","Decoration 1"],["--b10","#fbf1f6","Decoration 2"],["--b11","#e2ccda","Decoration 3"],["--b12","#b193a4","Decoration 4"]]},{"id":291,"name":"Dawn Ridge","cat":"15. Vector Scenery","font":"Poppins","ai":["#8794ac","#16232e"],"user":["#8794ac","#16232e"],"sp":null,"emoji":null,"locked":true,"vars":[["--b13","rgba(255,255,255,0.18)","Bubble fill 1"],["--b14","rgba(255,255,255,0.38)","Bubble fill 2"],["--b1","#fff3d0","Bubble fill 3"],["--b2","#b9d6ea","Bubble fill 4"],["--b3","#ffd0a6","Bubble fill 5"],["--b4","#ffb489","Bubble fill 6"],["--b5","#56688a","Decoration 1"],["--b6","#7f92b0","Decoration 2"],["--b7","#eaf1ff","Text"],["--b15","rgba(6,10,24,0.42)","Bubble fill 7"],["--b16","rgba(6,10,24,0.22)","Bubble fill 8"],["--b8","#888cae","Bubble fill 9"],["--b9","#0a1230","Bubble fill 10"],["--b10","#1b2551","Bubble fill 11"],["--b11","#33305c","Bubble fill 12"],["--b12","#dde7ff","Decoration 3"]]},{"id":292,"name":"Gold Vale","cat":"15. Vector Scenery","font":"Quicksand","ai":["#a38867","#2b1a08"],"user":["#a38867","#2b1a08"],"sp":null,"emoji":null,"locked":true,"vars":[["--b10","rgba(255,255,255,0.21)","Bubble fill 1"],["--b11","rgba(255,255,255,0.41)","Bubble fill 2"],["--b1","#ffe7b0","Bubble fill 3"],["--b2","#ffc178","Bubble fill 4"],["--b3","#f79f6a","Bubble fill 5"],["--b4","#ef9f3c","Decoration 1"],["--b5","#f6eddd","Text"],["--b12","rgba(6,10,24,0.38)","Bubble fill 6"],["--b13","rgba(6,10,24,0.18)","Bubble fill 7"],["--b6","#12102a","Bubble fill 8"],["--b7","#2a1f45","Bubble fill 9"],["--b8","#43264a","Bubble fill 10"],["--b9","#f2e5c6","Decoration 2"]]},{"id":293,"name":"Dusk Lake","cat":"15. Vector Scenery","font":"Nunito","ai":["#806451","#fdf3ff"],"user":["#806451","#fdf3ff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b12","rgba(6,10,24,0.62)","Bubble fill 1"],["--b13","rgba(6,10,24,0.42)","Bubble fill 2"],["--b1","#f8bd89","Bubble fill 3"],["--b2","#5d4a7a","Bubble fill 4"],["--b3","#c0648a","Bubble fill 5"],["--b4","#f0a06e","Bubble fill 6"],["--b5","#33244a","Decoration 1"],["--b6","#7a4f74","Decoration 2"],["--b14","rgba(6,10,24,0.4)","Bubble fill 7"],["--b15","rgba(6,10,24,0.2)","Bubble fill 8"],["--b7","#8b81a8","Bubble fill 9"],["--b8","#0a0c22","Bubble fill 10"],["--b9","#1c1a3f","Bubble fill 11"],["--b10","#2f2450","Bubble fill 12"],["--b11","#e6ddff","Decoration 3"]]},{"id":294,"name":"Pine Night","cat":"15. Vector Scenery","font":"Manrope","ai":["#626a7f","#f1f5ff"],"user":["#626a7f","#f1f5ff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b12","rgba(6,10,24,0.62)","Bubble fill 1"],["--b13","rgba(6,10,24,0.42)","Bubble fill 2"],["--b1","#bcc9e4","Bubble fill 3"],["--b2","#2b3a63","Bubble fill 4"],["--b3","#4a5c8c","Bubble fill 5"],["--b4","#8fa3c9","Bubble fill 6"],["--b5","#1c2742","Decoration 1"],["--b6","#33436b","Decoration 2"],["--b14","rgba(6,10,24,0.38)","Bubble fill 7"],["--b15","rgba(6,10,24,0.18)","Bubble fill 8"],["--b7","#757f9d","Bubble fill 9"],["--b8","#050a1c","Bubble fill 10"],["--b9","#0e1734","Bubble fill 11"],["--b10","#1b2547","Bubble fill 12"],["--b11","#cfd9f2","Decoration 3"]]},{"id":295,"name":"Aurora","cat":"15. Vector Scenery","font":"Outfit","ai":["#2f7768","#eafaff"],"user":["#2f7768","#eafaff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b13","rgba(6,10,24,0.47)","Bubble fill 1"],["--b14","rgba(6,10,24,0.27)","Bubble fill 2"],["--b1","#3e9f86","Bubble fill 3"],["--b2","#4a76b8","Bubble fill 4"],["--b3","#0f2a44","Bubble fill 5"],["--b4","#1c3f5e","Bubble fill 6"],["--b5","#2d5878","Bubble fill 7"],["--b6","#5f93a8","Decoration 1"],["--b15","rgba(6,10,24,0.38)","Bubble fill 8"],["--b16","rgba(6,10,24,0.18)","Bubble fill 9"],["--b7","#2c7a66","Bubble fill 10"],["--b8","#33558c","Bubble fill 11"],["--b9","#040c1a","Bubble fill 12"],["--b10","#08182c","Bubble fill 13"],["--b11","#0d2740","Bubble fill 14"],["--b12","#cfe6f2","Decoration 2"]]},{"id":296,"name":"Low Dune","cat":"15. Vector Scenery","font":"Rubik","ai":["#c2997c","#2e1a0c"],"user":["#c2997c","#2e1a0c"],"sp":null,"emoji":null,"locked":true,"vars":[["--b10","rgba(255,255,255,0.18)","Bubble fill 1"],["--b11","rgba(255,255,255,0.38)","Bubble fill 2"],["--b1","#ffe1b3","Bubble fill 3"],["--b2","#ffbe86","Bubble fill 4"],["--b3","#f5a06c","Bubble fill 5"],["--b4","#ef9a53","Decoration 1"],["--b5","#f3ecff","Text"],["--b12","rgba(6,10,24,0.38)","Bubble fill 6"],["--b13","rgba(6,10,24,0.18)","Bubble fill 7"],["--b6","#12122e","Bubble fill 8"],["--b7","#2a2148","Bubble fill 9"],["--b8","#3d2a4e","Bubble fill 10"],["--b9","#e7dcf5","Decoration 2"]]},{"id":297,"name":"Sea Line","cat":"15. Vector Scenery","font":"Karla","ai":["#6999b4","#0f2430"],"user":["#6999b4","#0f2430"],"sp":null,"emoji":null,"locked":true,"vars":[["--b11","rgba(255,255,255,0.18)","Bubble fill 1"],["--b12","rgba(255,255,255,0.38)","Bubble fill 2"],["--b1","#c5e9f4","Bubble fill 3"],["--b2","#93d2e8","Bubble fill 4"],["--b3","#63b6d6","Bubble fill 5"],["--b4","#efab2e","Decoration 1"],["--b5","#3f8fb5","Decoration 2"],["--b6","#e6f2fb","Text"],["--b13","rgba(6,10,24,0.38)","Bubble fill 6"],["--b14","rgba(6,10,24,0.18)","Bubble fill 7"],["--b7","#050f22","Bubble fill 8"],["--b8","#0d2140","Bubble fill 9"],["--b9","#153053","Bubble fill 10"],["--b10","#d7e8f7","Decoration 3"]]},{"id":298,"name":"Palm Isle","cat":"15. Vector Scenery","font":"Mulish","ai":["#749b96","#0e2b28"],"user":["#749b96","#0e2b28"],"sp":null,"emoji":null,"locked":true,"vars":[["--b10","rgba(255,255,255,0.22)","Bubble fill 1"],["--b11","rgba(255,255,255,0.42)","Bubble fill 2"],["--b1","#ffe3c0","Bubble fill 3"],["--b2","#ffc19a","Bubble fill 4"],["--b3","#86d2da","Bubble fill 5"],["--b4","#ef9a53","Decoration 1"],["--b5","#e2f5f2","Text"],["--b12","rgba(6,10,24,0.38)","Bubble fill 6"],["--b13","rgba(6,10,24,0.18)","Bubble fill 7"],["--b6","#061424","Bubble fill 8"],["--b7","#0d2438","Bubble fill 9"],["--b8","#153a44","Bubble fill 10"],["--b9","#dcefee","Decoration 2"]]},{"id":299,"name":"Terraces","cat":"15. Vector Scenery","font":"Work Sans","ai":["#81a17e","#152616"],"user":["#81a17e","#152616"],"sp":null,"emoji":null,"locked":true,"vars":[["--b10","rgba(255,255,255,0.18)","Bubble fill 1"],["--b11","rgba(255,255,255,0.38)","Bubble fill 2"],["--b1","#ffeac6","Bubble fill 3"],["--b2","#d8e8ac","Bubble fill 4"],["--b3","#9ac47f","Bubble fill 5"],["--b4","#dfae2e","Decoration 1"],["--b5","#e6f5e4","Text"],["--b12","rgba(6,10,24,0.38)","Bubble fill 6"],["--b13","rgba(6,10,24,0.18)","Bubble fill 7"],["--b6","#08150f","Bubble fill 8"],["--b7","#0f2418","Bubble fill 9"],["--b8","#183524","Bubble fill 10"],["--b9","#dfeecf","Decoration 2"]]},{"id":300,"name":"Bamboo Mist","cat":"15. Vector Scenery","font":"Urbanist","ai":["#96b4a3","#16261f"],"user":["#96b4a3","#16261f"],"sp":null,"emoji":null,"locked":true,"vars":[["--b12","rgba(255,255,255,0.18)","Bubble fill 1"],["--b13","rgba(255,255,255,0.38)","Bubble fill 2"],["--b1","#e8f2ec","Bubble fill 3"],["--b2","#eef6ef","Bubble fill 4"],["--b3","#cfe4d6","Bubble fill 5"],["--b4","#b0d1c0","Bubble fill 6"],["--b5","#7fa48f","Decoration 1"],["--b6","#e3f2ea","Text"],["--b14","rgba(6,10,24,0.38)","Bubble fill 7"],["--b15","rgba(6,10,24,0.18)","Bubble fill 8"],["--b7","#23433a","Bubble fill 9"],["--b8","#08130f","Bubble fill 10"],["--b9","#102220","Bubble fill 11"],["--b10","#1a3029","Bubble fill 12"],["--b11","#9fc3b1","Decoration 2"]]},{"id":301,"name":"Maple Hills","cat":"15. Vector Scenery","font":"Figtree","ai":["#b37b70","#2b1410"],"user":["#b37b70","#2b1410"],"sp":null,"emoji":null,"locked":true,"vars":[["--b13","rgba(255,255,255,0.22)","Bubble fill 1"],["--b14","rgba(255,255,255,0.42)","Bubble fill 2"],["--b1","#fff4d8","Bubble fill 3"],["--b2","#ffe9cf","Bubble fill 4"],["--b3","#ffc2a0","Bubble fill 5"],["--b4","#f39c7e","Bubble fill 6"],["--b5","#8d3a2a","Decoration 1"],["--b6","#b8543a","Decoration 2"],["--b7","#f8e9e2","Text"],["--b15","rgba(6,10,24,0.38)","Bubble fill 7"],["--b16","rgba(6,10,24,0.18)","Bubble fill 8"],["--b8","#957e82","Bubble fill 9"],["--b9","#160f1e","Bubble fill 10"],["--b10","#2a1730","Bubble fill 11"],["--b11","#3a1f33","Bubble fill 12"],["--b12","#f0dcd0","Decoration 3"]]},{"id":302,"name":"Birch Snow","cat":"15. Vector Scenery","font":"Lexend","ai":["#a2b6c7","#152430"],"user":["#a2b6c7","#152430"],"sp":null,"emoji":null,"locked":true,"vars":[["--b11","rgba(255,255,255,0.18)","Bubble fill 1"],["--b12","rgba(255,255,255,0.38)","Bubble fill 2"],["--b1","#f0f6fb","Bubble fill 3"],["--b2","#dae9f4","Bubble fill 4"],["--b3","#c4dbec","Bubble fill 5"],["--b4","#8ea6bb","Decoration 1"],["--b5","#dcebf5","Decoration 2"],["--b6","#e9f1fb","Text"],["--b13","rgba(6,10,24,0.44)","Bubble fill 6"],["--b14","rgba(6,10,24,0.24)","Bubble fill 7"],["--b7","#070d1c","Bubble fill 8"],["--b8","#101a33","Bubble fill 9"],["--b9","#1a2745","Bubble fill 10"],["--b10","#c3d4e6","Decoration 3"]]},{"id":303,"name":"Blossom Hill","cat":"15. Vector Scenery","font":"Comfortaa","ai":["#cd90ad","#2c1522"],"user":["#cd90ad","#2c1522"],"sp":null,"emoji":null,"locked":true,"vars":[["--b11","rgba(255,255,255,0.18)","Bubble fill 1"],["--b12","rgba(255,255,255,0.38)","Bubble fill 2"],["--b1","#fdf0f5","Bubble fill 3"],["--b2","#f9d9e6","Bubble fill 4"],["--b3","#f3c2d7","Bubble fill 5"],["--b4","#e07fa6","Decoration 1"],["--b5","#d97fa8","Decoration 2"],["--b6","#fbe9f3","Text"],["--b13","rgba(6,10,24,0.38)","Bubble fill 6"],["--b14","rgba(6,10,24,0.18)","Bubble fill 7"],["--b7","#150d1c","Bubble fill 8"],["--b8","#261233","Bubble fill 9"],["--b9","#361b3f","Bubble fill 10"],["--b10","#f2dbe8","Decoration 3"]]},{"id":304,"name":"Lavender","cat":"15. Vector Scenery","font":"Josefin Sans","ai":["#a38fca","#241a38"],"user":["#a38fca","#241a38"],"sp":null,"emoji":null,"locked":true,"vars":[["--b13","rgba(255,255,255,0.18)","Bubble fill 1"],["--b14","rgba(255,255,255,0.38)","Bubble fill 2"],["--b1","#fff5e0","Bubble fill 3"],["--b2","#f4edff","Bubble fill 4"],["--b3","#dbcbf4","Bubble fill 5"],["--b4","#c0a9e8","Bubble fill 6"],["--b5","#7d61b4","Decoration 1"],["--b6","#9d84cf","Decoration 2"],["--b7","#ece5ff","Text"],["--b15","rgba(6,10,24,0.38)","Bubble fill 7"],["--b16","rgba(6,10,24,0.18)","Bubble fill 8"],["--b8","#8176a1","Bubble fill 9"],["--b9","#0d0a22","Bubble fill 10"],["--b10","#191238","Bubble fill 11"],["--b11","#241a4a","Bubble fill 12"],["--b12","#ddd2f7","Decoration 3"]]},{"id":305,"name":"Wheat Gold","cat":"15. Vector Scenery","font":"Cabin","ai":["#c19e60","#2b1e05"],"user":["#c19e60","#2b1e05"],"sp":null,"emoji":null,"locked":true,"vars":[["--b10","rgba(255,255,255,0.18)","Bubble fill 1"],["--b11","rgba(255,255,255,0.38)","Bubble fill 2"],["--b1","#fff3d2","Bubble fill 3"],["--b2","#ffdb93","Bubble fill 4"],["--b3","#f4bf66","Bubble fill 5"],["--b4","#dc9c1e","Decoration 1"],["--b5","#f8f0dd","Text"],["--b12","rgba(6,10,24,0.38)","Bubble fill 6"],["--b13","rgba(6,10,24,0.18)","Bubble fill 7"],["--b6","#151027","Bubble fill 8"],["--b7","#2a1e3c","Bubble fill 9"],["--b8","#3b2a3f","Bubble fill 10"],["--b9","#f0e3c4","Decoration 2"]]},{"id":306,"name":"Plains Storm","cat":"15. Vector Scenery","font":"Barlow","ai":["#5d6b7f","#f2f6fb"],"user":["#5d6b7f","#f2f6fb"],"sp":null,"emoji":null,"locked":true,"vars":[["--b11","rgba(6,10,24,0.63)","Bubble fill 1"],["--b12","rgba(6,10,24,0.43)","Bubble fill 2"],["--b1","#9fb4cc","Bubble fill 3"],["--b2","#3c4657","Bubble fill 4"],["--b3","#59657a","Bubble fill 5"],["--b4","#78849a","Bubble fill 6"],["--b5","#1f2733","Decoration 1"],["--b13","rgba(6,10,24,0.38)","Bubble fill 7"],["--b14","rgba(6,10,24,0.18)","Bubble fill 8"],["--b6","#4f6480","Bubble fill 9"],["--b7","#080c16","Bubble fill 10"],["--b8","#131a29","Bubble fill 11"],["--b9","#1e2738","Bubble fill 12"],["--b10","#5d6d86","Decoration 2"]]},{"id":307,"name":"After Rain","cat":"15. Vector Scenery","font":"Asap","ai":["#779d92","#0f2630"],"user":["#779d92","#0f2630"],"sp":null,"emoji":null,"locked":true,"vars":[["--b18","rgba(255,255,255,0.18)","Bubble fill 1"],["--b19","rgba(255,255,255,0.38)","Bubble fill 2"],["--b1","#d1705f","Bubble fill 3"],["--b2","#d9aa54","Bubble fill 4"],["--b3","#5f7fbf","Bubble fill 5"],["--b4","#fff6da","Bubble fill 6"],["--b5","#e3f2f8","Bubble fill 7"],["--b6","#c2e4ef","Bubble fill 8"],["--b7","#a5d6e8","Bubble fill 9"],["--b8","#3f7565","Decoration 1"],["--b9","#e2f1f8","Text"],["--b20","rgba(6,10,24,0.41)","Bubble fill 10"],["--b21","rgba(6,10,24,0.21)","Bubble fill 11"],["--b10","#7a3f38","Bubble fill 12"],["--b11","#7a5f30","Bubble fill 13"],["--b12","#3a4f75","Bubble fill 14"],["--b13","#778e9e","Bubble fill 15"],["--b14","#050f1c","Bubble fill 16"],["--b15","#0c2030","Bubble fill 17"],["--b16","#143046","Bubble fill 18"],["--b17","#d9ecf5","Decoration 2"]]},{"id":308,"name":"Canyon","cat":"15. Vector Scenery","font":"Raleway","ai":["#ad7e6e","#2e1409"],"user":["#ad7e6e","#2e1409"],"sp":null,"emoji":null,"locked":true,"vars":[["--b10","rgba(255,255,255,0.19)","Bubble fill 1"],["--b11","rgba(255,255,255,0.39)","Bubble fill 2"],["--b1","#ffe0b8","Bubble fill 3"],["--b2","#ffb887","Bubble fill 4"],["--b3","#f2946a","Bubble fill 5"],["--b4","#df7238","Decoration 1"],["--b5","#f7e9e1","Text"],["--b12","rgba(6,10,24,0.38)","Bubble fill 6"],["--b13","rgba(6,10,24,0.18)","Bubble fill 7"],["--b6","#150e20","Bubble fill 8"],["--b7","#2a1730","Bubble fill 9"],["--b8","#3c2036","Bubble fill 10"],["--b9","#eeddd4","Decoration 2"]]},{"id":309,"name":"Volcano","cat":"15. Vector Scenery","font":"Sora","ai":["#905b41","#ffeee2"],"user":["#905b41","#ffeee2"],"sp":null,"emoji":null,"locked":true,"vars":[["--b12","rgba(6,10,24,0.49)","Bubble fill 1"],["--b13","rgba(6,10,24,0.29)","Bubble fill 2"],["--b1","#df8958","Bubble fill 3"],["--b2","#3a1030","Bubble fill 4"],["--b3","#7a1f34","Bubble fill 5"],["--b4","#bf4326","Bubble fill 6"],["--b5","#2b0d1c","Decoration 1"],["--b6","#7a2418","Decoration 2"],["--b14","rgba(6,10,24,0.38)","Bubble fill 7"],["--b15","rgba(6,10,24,0.18)","Bubble fill 8"],["--b7","#976148","Bubble fill 9"],["--b8","#0d0512","Bubble fill 10"],["--b9","#210a1c","Bubble fill 11"],["--b10","#3d1220","Bubble fill 12"],["--b11","#f0b070","Decoration 3"]]},{"id":310,"name":"Falls","cat":"15. Vector Scenery","font":"Epilogue","ai":["#82a49c","#0f251f"],"user":["#82a49c","#0f251f"],"sp":null,"emoji":null,"locked":true,"vars":[["--b10","rgba(255,255,255,0.18)","Bubble fill 1"],["--b11","rgba(255,255,255,0.38)","Bubble fill 2"],["--b1","#e4f3ed","Bubble fill 3"],["--b2","#bde2d6","Bubble fill 4"],["--b3","#95d0c1","Bubble fill 5"],["--b4","#4f7f74","Decoration 1"],["--b5","#e0f4ee","Text"],["--b12","rgba(6,10,24,0.38)","Bubble fill 6"],["--b13","rgba(6,10,24,0.18)","Bubble fill 7"],["--b6","#04120f","Bubble fill 8"],["--b7","#0b241f","Bubble fill 9"],["--b8","#123830","Bubble fill 10"],["--b9","#8fc4b6","Decoration 2"]]},{"id":311,"name":"Fog Wood","cat":"15. Vector Scenery","font":"Jost","ai":["#a3b4af","#17251f"],"user":["#a3b4af","#17251f"],"sp":null,"emoji":null,"locked":true,"vars":[["--b12","rgba(255,255,255,0.18)","Bubble fill 1"],["--b13","rgba(255,255,255,0.38)","Bubble fill 2"],["--b1","#eef4f2","Bubble fill 3"],["--b2","#eff3f1","Bubble fill 4"],["--b3","#d7e2de","Bubble fill 5"],["--b4","#bfd2cd","Bubble fill 6"],["--b5","#7d968f","Decoration 1"],["--b6","#e5f0ee","Text"],["--b14","rgba(6,10,24,0.38)","Bubble fill 7"],["--b15","rgba(6,10,24,0.18)","Bubble fill 8"],["--b7","#26393a","Bubble fill 9"],["--b8","#080f10","Bubble fill 10"],["--b9","#121e1f","Bubble fill 11"],["--b10","#1c2d2e","Bubble fill 12"],["--b11","#9fb5b3","Decoration 2"]]},{"id":312,"name":"River Bend","cat":"15. Vector Scenery","font":"Commissioner","ai":["#95b795","#12241a"],"user":["#95b795","#12241a"],"sp":null,"emoji":null,"locked":true,"vars":[["--b12","rgba(255,255,255,0.18)","Bubble fill 1"],["--b13","rgba(255,255,255,0.38)","Bubble fill 2"],["--b1","#fff7dc","Bubble fill 3"],["--b2","#ebf5e2","Bubble fill 4"],["--b3","#c9e4c3","Bubble fill 5"],["--b4","#a3d0a7","Bubble fill 6"],["--b5","#6a9a6a","Decoration 1"],["--b6","#e6f3e6","Text"],["--b14","rgba(6,10,24,0.4)","Bubble fill 7"],["--b15","rgba(6,10,24,0.2)","Bubble fill 8"],["--b7","#7b8f7d","Bubble fill 9"],["--b8","#070f0c","Bubble fill 10"],["--b9","#0e1e17","Bubble fill 11"],["--b10","#173023","Bubble fill 12"],["--b11","#dfeed6","Decoration 2"]]},{"id":313,"name":"Sailfar","cat":"15. Vector Scenery","font":"Hind","ai":["#7695a3","#0e2530"],"user":["#7695a3","#0e2530"],"sp":null,"emoji":null,"locked":true,"vars":[["--b11","rgba(255,255,255,0.23)","Bubble fill 1"],["--b12","rgba(255,255,255,0.43)","Bubble fill 2"],["--b1","#ffeccc","Bubble fill 3"],["--b2","#ffd0a4","Bubble fill 4"],["--b3","#a9dae4","Bubble fill 5"],["--b4","#ef9a44","Decoration 1"],["--b5","#4b93a8","Decoration 2"],["--b6","#e4f0fa","Text"],["--b13","rgba(6,10,24,0.38)","Bubble fill 6"],["--b14","rgba(6,10,24,0.18)","Bubble fill 7"],["--b7","#060f1e","Bubble fill 8"],["--b8","#0e2036","Bubble fill 9"],["--b9","#173049","Bubble fill 10"],["--b10","#dae9f5","Decoration 3"]]},{"id":314,"name":"Beacon","cat":"15. Vector Scenery","font":"Chivo","ai":["#796261","#f7eef6"],"user":["#796261","#f7eef6"],"sp":null,"emoji":null,"locked":true,"vars":[["--b12","rgba(6,10,24,0.52)","Bubble fill 1"],["--b13","rgba(6,10,24,0.32)","Bubble fill 2"],["--b1","#c59c91","Bubble fill 3"],["--b2","#28324f","Bubble fill 4"],["--b3","#4d4a72","Bubble fill 5"],["--b4","#8a5f7a","Bubble fill 6"],["--b5","#1c2138","Decoration 1"],["--b6","#3a3554","Decoration 2"],["--b14","rgba(6,10,24,0.38)","Bubble fill 7"],["--b15","rgba(6,10,24,0.18)","Bubble fill 8"],["--b7","#887264","Bubble fill 9"],["--b8","#050914","Bubble fill 10"],["--b9","#0d1428","Bubble fill 11"],["--b10","#1d1a38","Bubble fill 12"],["--b11","#f2c98f","Decoration 3"]]},{"id":315,"name":"Skyline","cat":"15. Vector Scenery","font":"Archivo","ai":["#7f6155","#f6eefb"],"user":["#7f6155","#f6eefb"],"sp":null,"emoji":null,"locked":true,"vars":[["--b11","rgba(6,10,24,0.56)","Bubble fill 1"],["--b12","rgba(6,10,24,0.36)","Bubble fill 2"],["--b1","#dca484","Bubble fill 3"],["--b2","#2a2f52","Bubble fill 4"],["--b3","#5b4a7a","Bubble fill 5"],["--b4","#b8746e","Bubble fill 6"],["--b5","#1b1d38","Decoration 1"],["--b13","rgba(6,10,24,0.38)","Bubble fill 7"],["--b14","rgba(6,10,24,0.18)","Bubble fill 8"],["--b6","#7d84a8","Bubble fill 9"],["--b7","#060a18","Bubble fill 10"],["--b8","#101836","Bubble fill 11"],["--b9","#1e2450","Bubble fill 12"],["--b10","#dbe4ff","Decoration 2"]]},{"id":316,"name":"Balloons","cat":"15. Vector Scenery","font":"Baloo 2","ai":["#7c9cbe","#152420"],"user":["#7c9cbe","#152420"],"sp":null,"emoji":null,"locked":true,"vars":[["--b14","rgba(255,255,255,0.18)","Bubble fill 1"],["--b15","rgba(255,255,255,0.38)","Bubble fill 2"],["--b1","#fff8e6","Bubble fill 3"],["--b2","#fff0dc","Bubble fill 4"],["--b3","#ffd6b4","Bubble fill 5"],["--b4","#bfe4ef","Bubble fill 6"],["--b5","#c9705f","Decoration 1"],["--b6","#5f86b0","Decoration 2"],["--b7","#e9f0fb","Text"],["--b16","rgba(6,10,24,0.42)","Bubble fill 7"],["--b17","rgba(6,10,24,0.22)","Bubble fill 8"],["--b8","#838eaa","Bubble fill 9"],["--b9","#0a0f22","Bubble fill 10"],["--b10","#171f3e","Bubble fill 11"],["--b11","#243055","Bubble fill 12"],["--b12","#e0907f","Decoration 3"],["--b13","#9fb6e0","Decoration 4"]]},{"id":317,"name":"Star Meadow","cat":"15. Vector Scenery","font":"Spline Sans","ai":["#3d4e70","#eff4ff"],"user":["#3d4e70","#eff4ff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b10","rgba(6,10,24,0.38)","Bubble fill 1"],["--b11","rgba(6,10,24,0.18)","Bubble fill 2"],["--b1","#1b2a4a","Bubble fill 3"],["--b2","#2f4368","Bubble fill 4"],["--b3","#4a5f86","Bubble fill 5"],["--b4","#7a8ab5","Decoration 1"],["--b5","#233355","Decoration 2"],["--b6","#04081a","Bubble fill 6"],["--b7","#0b1230","Bubble fill 7"],["--b8","#141c46","Bubble fill 8"],["--b9","#cdd8f5","Decoration 3"]]},{"id":318,"name":"Moon Dunes","cat":"15. Vector Scenery","font":"Albert Sans","ai":["#4a4565","#f4f1ff"],"user":["#4a4565","#f4f1ff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b10","rgba(6,10,24,0.38)","Bubble fill 1"],["--b11","rgba(6,10,24,0.18)","Bubble fill 2"],["--b1","#1e2340","Bubble fill 3"],["--b2","#37395e","Bubble fill 4"],["--b3","#5b5378","Bubble fill 5"],["--b4","#9a8dc2","Decoration 1"],["--b5","#312f4e","Decoration 2"],["--b6","#070a1e","Bubble fill 6"],["--b7","#12163a","Bubble fill 7"],["--b8","#1e2350","Bubble fill 8"],["--b9","#d4cef0","Decoration 3"]]},{"id":319,"name":"Crescent","cat":"15. Vector Scenery","font":"Onest","ai":["#574b69","#f8f2ff"],"user":["#574b69","#f8f2ff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b9","rgba(6,10,24,0.38)","Bubble fill 1"],["--b10","rgba(6,10,24,0.18)","Bubble fill 2"],["--b1","#241f3e","Bubble fill 3"],["--b2","#3d3560","Bubble fill 4"],["--b3","#6b5b7d","Bubble fill 5"],["--b4","#3a3152","Decoration 1"],["--b5","#080718","Bubble fill 6"],["--b6","#141031","Bubble fill 7"],["--b7","#221a44","Bubble fill 8"],["--b8","#e2d6b8","Decoration 2"]]},{"id":320,"name":"Meteors","cat":"15. Vector Scenery","font":"Plus Jakarta Sans","ai":["#5b688a","#eef2ff"],"user":["#5b688a","#eef2ff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b12","rgba(6,10,24,0.6)","Bubble fill 1"],["--b13","rgba(6,10,24,0.4)","Bubble fill 2"],["--b1","#93a7d6","Bubble fill 3"],["--b2","#8993b7","Bubble fill 4"],["--b3","#101a38","Bubble fill 5"],["--b4","#1f2b52","Bubble fill 6"],["--b5","#33406e","Bubble fill 7"],["--b6","#0c1329","Decoration 1"],["--b14","rgba(6,10,24,0.38)","Bubble fill 8"],["--b15","rgba(6,10,24,0.18)","Bubble fill 9"],["--b7","#5c6d9c","Bubble fill 10"],["--b8","#6c7694","Bubble fill 11"],["--b9","#03060f","Bubble fill 12"],["--b10","#080f24","Bubble fill 13"],["--b11","#c8d2ef","Decoration 2"]]},{"id":321,"name":"Cat Paw","cat":"16. Companions","font":"Comic Neue","ai":["#eef3ff","#2f3550"],"user":["#dce8ff","#2f3550"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#2f3550","Bubble text"],["--b2","#eef3ff","Their fill"],["--b3","#dce8ff","Your fill"],["--b4","#6d66a4","Claw tips"],["--b5","#b9b2d8","Fur shade"],["--b6","#fbfaff","Fur"],["--b7","#f4f1fc","Fur mid"],["--b8","#e4ddf5","Fur base"],["--b13","rgba(255,255,255,0.92)","Pad shine"],["--b9","#ffb3d4","Pad blush"],["--b10","#8ff2ff","Pad light"],["--b11","#35c9ee","Pad mid"],["--b12","#1892b9","Pad deep"]]},{"id":322,"name":"Fox Ears","cat":"16. Companions","font":"Comic Neue","ai":["#fff2e8","#4a2a16"],"user":["#ffe3cf","#4a2a16"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#4a2a16","Bubble text"],["--b2","#fff2e8","Their fill"],["--b3","#ffe3cf","Your fill"],["--b4","#e2732e","Ear outer"],["--b5","#ffc9a6","Ear inner"]]},{"id":323,"name":"Bear Ears","cat":"16. Companions","font":"Comic Neue","ai":["#f6efe6","#3f2d1c"],"user":["#ece0d1","#3f2d1c"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#3f2d1c","Bubble text"],["--b2","#f6efe6","Their fill"],["--b3","#ece0d1","Your fill"],["--b4","#d8a05c","Ear inner"],["--b5","#8a5a2b","Ear outer"]]},{"id":324,"name":"Bunny Ears","cat":"16. Companions","font":"Comic Neue","ai":["#fff5f8","#5a2740"],"user":["#ffe4ee","#5a2740"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#5a2740","Bubble text"],["--b2","#fff5f8","Their fill"],["--b3","#ffe4ee","Your fill"],["--b4","#f6b8cf","Ear outer"],["--b5","#ff9dc0","Ear inner"]]},{"id":325,"name":"Little Horns","cat":"16. Companions","font":"Poppins","ai":["#2a1622","#ffe6f2"],"user":["#3a1d2e","#ffe6f2"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#ffe6f2","Bubble text"],["--b2","#2a1622","Their fill"],["--b3","#3a1d2e","Your fill"],["--b4","#ff4d7d","Horn tip"],["--b5","#a81742","Horn base"]]},{"id":326,"name":"Halo","cat":"16. Companions","font":"Poppins","ai":["#f7f9ff","#2c3350"],"user":["#e8edff","#2c3350"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#2c3350","Bubble text"],["--b2","#f7f9ff","Their fill"],["--b3","#e8edff","Your fill"],["--b4","#ffd357","Halo ring"],["--b5","#fff3c9","Halo glow"]]},{"id":327,"name":"Tiny Crown","cat":"16. Companions","font":"Poppins","ai":["#1e1b2e","#f3ecff"],"user":["#2a2542","#f3ecff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#f3ecff","Bubble text"],["--b2","#1e1b2e","Their fill"],["--b3","#2a2542","Your fill"],["--b4","#ffdf7e","Crown top"],["--b5","#c9962a","Crown bottom"],["--b6","#8d6414","Crown band"]]},{"id":328,"name":"Ribbon Bow","cat":"16. Companions","font":"Comic Neue","ai":["#fffafc","#5c2436"],"user":["#ffeaf1","#5c2436"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#5c2436","Bubble text"],["--b2","#fffafc","Their fill"],["--b3","#ffeaf1","Your fill"],["--b4","#ee5a86","Ribbon"],["--b5","#ffd0de","Knot"]]},{"id":329,"name":"Leaf Sprig","cat":"16. Companions","font":"Poppins","ai":["#f3f8f1","#22331f"],"user":["#e3f0df","#22331f"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#22331f","Bubble text"],["--b2","#f3f8f1","Their fill"],["--b3","#e3f0df","Your fill"],["--b4","#6aa84f","Leaf"],["--b5","#3f6b2c","Stem"]]},{"id":330,"name":"Star Pin","cat":"16. Companions","font":"Poppins","ai":["#141a2e","#e6ecff"],"user":["#1e2542","#e6ecff"],"sp":null,"emoji":null,"locked":true,"vars":[["--b1","#e6ecff","Bubble text"],["--b2","#141a2e","Their fill"],["--b3","#1e2542","Your fill"],["--b4","#ffd95e","Star"],["--b5","#ffe9a3","Star glow"]]}]`;
+
+// ── THEME STYLESHEET ─────────────────────────────────────────────────
+// Served from its own immutable URL rather than inlined in the shell: the
+// shell is already 128KB and is revalidated on every visit, while this is
+// fetched once per build and then lives in the browser (and the colo) cache.
+let _themeCSS = null;
+function getThemeCSS() {
+  return _themeCSS ??= `/* ─────────────────────────────────────────────────────────────────────
+   SKIN LAYER — colour/material identity only. Shared markup, no DOM per
+   skin. Every skin defines the full token contract so nothing falls back
+   to another skin's value.
+
+   Contrast ratios in the comments are measured text-on-surface, and were
+   verified rather than estimated. Every body text pair is AAA (>=7:1).
+   ───────────────────────────────────────────────────────────────────── */
+
+/* ── token contract ─────────────────────────────────────────────────── */
+:root{
+  --bg:#0B0C0E; --bg-art:none; --surface:#131518; --surface-2:#1B1E22;
+  --sidebar-bg:#0B0C0E; --header-bg:#0B0C0E; --composer-bg:#131518;
+  --border:#24282E; --border-strong:#343A42; --text:#EDEFF2; --text-dim:#9AA1AC;
+  --font:ui-sans-serif,'Instrument Sans',system-ui,-apple-system,sans-serif;
+  --font-read:var(--font);
+  /* an UNSET custom property invalidates the whole font-family declaration,
+     which silently drops the page to Times New Roman - so this always resolves */
+  --font-user:var(--font);
+  --accent:#7C8AF7; --accent-text:#0A0C1A; --accent-soft:#1A1F3A;
+  --accent-2:#7C8AF7; --danger:#FF6B6B; --success:#3BC77A; --warn:#E3A008; --info:#7C8AF7;
+  --bubble-user:#232842; --bubble-ai:#131518;
+  --radius:8px; --radius-lg:12px; --radius-pill:9999px;
+  --shadow:0 1px 2px rgba(0,0,0,.5); --shadow-lg:0 12px 32px -8px rgba(0,0,0,.7);
+  --shadow-in:none;
+  --ring:0 0 0 3px rgba(124,138,247,.35); --scrim:rgba(0,0,0,.62); --blur:0px;
+}
+
+/* ── 1. GRAPHITE — flat/minimal. DEFAULT. text 15.88 dark / 17.77 light ─ */
+:root[data-skin="graphite"]{
+  --bg:#F7F8F9; --bg-art:none; --surface:#FFFFFF; --surface-2:#F1F2F4;
+  --sidebar-bg:#F7F8F9; --header-bg:#FFFFFF; --composer-bg:#FFFFFF;
+  --border:#E1E4E8; --border-strong:#CBD0D7; --text:#16181C; --text-dim:#5C636E;
+  --font:ui-sans-serif,'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;
+  --font-read:var(--font);
+  --accent:#4A57D6; --accent-text:#FFFFFF; --accent-soft:#EEF0FE; --accent-2:#4A57D6;
+  --danger:#C62828; --success:#12805C; --warn:#8A5A00; --info:#4A57D6;
+  --bubble-user:#EEF0FE; --bubble-ai:#FFFFFF;
+  --radius:8px; --radius-lg:12px;
+  --shadow:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.08);
+  --shadow-lg:0 8px 24px -6px rgba(16,24,40,.14);
+  --ring:0 0 0 3px rgba(74,87,214,.28); --scrim:rgba(16,24,40,.42); --blur:0px;
+}
+.dark:root[data-skin="graphite"]{
+  --bg:#0B0C0E; --surface:#131518; --surface-2:#1B1E22;
+  --sidebar-bg:#0B0C0E; --header-bg:#0B0C0E; --composer-bg:#131518;
+  --border:#24282E; --border-strong:#343A42; --text:#EDEFF2; --text-dim:#9AA1AC;
+  --accent:#7C8AF7; --accent-text:#0A0C1A; --accent-soft:#1A1F3A; --accent-2:#7C8AF7;
+  --danger:#FF6B6B; --success:#3BC77A; --warn:#E3A008; --info:#7C8AF7;
+  --bubble-user:#232842; --bubble-ai:#131518;
+  --shadow:0 1px 2px rgba(0,0,0,.5); --shadow-lg:0 12px 32px -8px rgba(0,0,0,.7);
+  --ring:0 0 0 3px rgba(124,138,247,.35); --scrim:rgba(0,0,0,.62);
+}
+[data-skin=graphite] .app-sidebar{border-right:1px solid var(--border);box-shadow:none}
+[data-skin=graphite] .nav-item{border-radius:6px}
+[data-skin=graphite] .nav-item.is-active{background:var(--accent-soft);box-shadow:inset 2px 0 0 var(--accent)}
+[data-skin=graphite] .composer:focus-within{border-color:var(--accent);box-shadow:var(--ring)}
+[data-skin=graphite] .msg{border:1px solid var(--border)}
+
+/* ── 2. AURORA — glass. Glass is tinted with the DARK base, not white, so
+   the gradient shifts hue not luminance and contrast stays locked.
+   Worst-case over the brightest blob overlap: 15.23 dark / 15.92 light. ── */
+:root[data-skin="aurora"]{
+  --bg:#EEF2FB;
+  --bg-art:radial-gradient(52vw 52vw at 12% -8%,rgba(124,92,255,.14),transparent 62%),
+           radial-gradient(46vw 46vw at 92% 14%,rgba(34,184,207,.12),transparent 60%),
+           radial-gradient(58vw 58vw at 68% 104%,rgba(255,122,182,.10),transparent 62%);
+  --surface:rgba(255,255,255,.72); --surface-2:rgba(255,255,255,.86);
+  --sidebar-bg:rgba(255,255,255,.60); --header-bg:rgba(255,255,255,.62);
+  --composer-bg:rgba(255,255,255,.80);
+  --border:rgba(16,24,40,.10); --border-strong:rgba(16,24,40,.20);
+  --text:#101828; --text-dim:#4B5768;
+  --font:ui-sans-serif,'Inter',system-ui,sans-serif; --font-read:var(--font);
+  --accent:#0F5F94; --accent-text:#FFFFFF; --accent-soft:rgba(15,95,148,.12); --accent-2:#0F5F94;
+  --danger:#B42318; --success:#067647; --warn:#8A5A00; --info:#0F5F94;
+  --bubble-user:rgba(15,95,148,.12); --bubble-ai:rgba(255,255,255,.78);
+  --radius:16px; --radius-lg:22px;
+  --shadow:0 1px 1px rgba(16,24,40,.05),inset 0 1px 0 rgba(255,255,255,.65);
+  --shadow-lg:0 20px 50px -20px rgba(16,24,40,.35),inset 0 1px 0 rgba(255,255,255,.7);
+  --ring:0 0 0 3px rgba(15,95,148,.30); --scrim:rgba(12,20,38,.30); --blur:18px;
+}
+.dark:root[data-skin="aurora"]{
+  --bg:#0A0F1A;
+  --bg-art:radial-gradient(52vw 52vw at 12% -8%,rgba(76,59,207,.26),transparent 62%),
+           radial-gradient(46vw 46vw at 92% 14%,rgba(30,136,168,.20),transparent 60%),
+           radial-gradient(58vw 58vw at 68% 104%,rgba(166,63,160,.15),transparent 62%);
+  --surface:rgba(11,17,32,.66); --surface-2:rgba(20,28,51,.72);
+  --sidebar-bg:rgba(11,17,32,.58); --header-bg:rgba(11,17,32,.60);
+  --composer-bg:rgba(20,28,51,.78);
+  --border:rgba(255,255,255,.10); --border-strong:rgba(255,255,255,.20);
+  --text:#F2F5FA; --text-dim:#A9B4CB;
+  --accent:#8FDCF2; --accent-text:#062431; --accent-soft:rgba(143,220,242,.14); --accent-2:#8FDCF2;
+  --danger:#FF8A8A; --success:#5FE3A1; --warn:#F5C453; --info:#8FDCF2;
+  --bubble-user:rgba(143,220,242,.13); --bubble-ai:rgba(11,17,32,.70);
+  --shadow:0 1px 1px rgba(0,0,0,.4),inset 0 1px 0 rgba(255,255,255,.10);
+  --shadow-lg:0 24px 60px -24px rgba(0,0,0,.8),inset 0 1px 0 rgba(255,255,255,.14);
+  --ring:0 0 0 3px rgba(143,220,242,.32); --scrim:rgba(4,8,18,.55);
+}
+/* blur only on things that overlay SCROLLING content, never the message list */
+[data-skin=aurora] .glass{backdrop-filter:blur(var(--blur)) saturate(160%);
+  -webkit-backdrop-filter:blur(var(--blur)) saturate(160%)}
+/* mobile gets the palette, not the effect: 4-8ms/frame on mid-range Android */
+@media (max-width:860px){
+  [data-skin=aurora] .glass{backdrop-filter:none;-webkit-backdrop-filter:none}
+  .dark:root[data-skin=aurora]{--sidebar-bg:#0A0F1A;--header-bg:#0A0F1A;--composer-bg:#141C33}
+}
+@media (prefers-reduced-transparency:reduce){
+  [data-skin=aurora] .glass{backdrop-filter:none;background:var(--bg)}
+}
+
+/* ── 3. VELLUM — warm paper. Dark variant is candlelight, not grey.
+   Deliberately capped below 21:1; harsh contrast is what it avoids.
+   text 13.72 dark / 14.03 light ───────────────────────────────────────── */
+:root[data-skin="vellum"]{
+  --bg:#F2ECE0; --bg-art:none; --surface:#FBF7EF; --surface-2:#EFE7D8;
+  --sidebar-bg:#EDE5D6; --header-bg:#F2ECE0; --composer-bg:#FBF7EF;
+  --border:#DED2BC; --border-strong:#C7B79B; --text:#2B2620; --text-dim:#6B6153;
+  --font:ui-sans-serif,'Inter',system-ui,sans-serif;
+  --font-read:'Iowan Old Style','Palatino Linotype',Palatino,Georgia,ui-serif,serif;
+  --accent:#9E4A28; --accent-text:#FFF6EE; --accent-soft:#F0DFD2; --accent-2:#9E4A28;
+  --danger:#A32E1F; --success:#3F6B2E; --warn:#8A5A00; --info:#9E4A28;
+  --bubble-user:#EAE0CB; --bubble-ai:transparent;
+  --radius:5px; --radius-lg:8px;
+  --shadow:0 1px 0 rgba(90,70,45,.10); --shadow-lg:0 10px 30px -12px rgba(70,52,30,.32);
+  --ring:0 0 0 3px rgba(158,74,40,.26); --scrim:rgba(56,44,28,.38); --blur:0px;
+}
+.dark:root[data-skin="vellum"]{
+  --bg:#16120E; --surface:#1E1915; --surface-2:#2A231C;
+  --sidebar-bg:#14100C; --header-bg:#16120E; --composer-bg:#1E1915;
+  --border:#372E25; --border-strong:#4C4034; --text:#EDE3D3; --text-dim:#A2947F;
+  --accent:#DB9250; --accent-text:#241708; --accent-soft:#2E2317; --accent-2:#DB9250;
+  --danger:#F0836B; --success:#8FC97A; --warn:#E3B45C; --info:#DB9250;
+  --bubble-user:#33281C; --bubble-ai:transparent;
+  --shadow:0 1px 0 rgba(0,0,0,.4); --shadow-lg:0 14px 36px -14px rgba(0,0,0,.75);
+  --ring:0 0 0 3px rgba(219,146,80,.30); --scrim:rgba(10,7,4,.62);
+}
+/* the AI stops being a bubble and becomes prose on a page — the skin's whole
+   argument, achieved on shared markup */
+[data-skin=vellum] .msg-content{font-family:var(--font-read);font-size:17px;
+  line-height:1.72;max-width:66ch;letter-spacing:.005em}
+[data-skin=vellum] .msg-ai .msg-content{background:none;border:0;border-radius:0;
+  padding-left:0;border-bottom:1px solid var(--border);padding-bottom:1.15rem}
+[data-skin=vellum] .msg-user .msg-content{background:var(--bubble-user);border:0;
+  box-shadow:inset 3px 0 0 var(--accent)}
+
+/* ── 4. CLAY — neumorphic. Depth lives in shadow; text/borders stay full
+   strength. Bubbles are FLAT: 200 messages x 2 blurred shadows would
+   stutter on mid-range Android. text 12.47 dark / 12.66 light ─────────── */
+:root[data-skin="clay"]{
+  --bg:#E4E8EF; --bg-art:none; --surface:#E4E8EF; --surface-2:#EDF0F5;
+  --sidebar-bg:#E4E8EF; --header-bg:#E4E8EF; --composer-bg:#E4E8EF;
+  --border:#CFD5DF; --border-strong:#B4BDCB; --text:#1E2430; --text-dim:#545C6C;
+  --font:ui-rounded,'Nunito',ui-sans-serif,system-ui,sans-serif; --font-read:var(--font);
+  --accent:#4A59C4; --accent-text:#FFFFFF; --accent-soft:#DCE1F5; --accent-2:#4A59C4;
+  --danger:#A82A1C; --success:#2F7D5B; --warn:#8A5A00; --info:#4A59C4;
+  --bubble-user:#DCE1EA; --bubble-ai:#EDF0F5;
+  --radius:16px; --radius-lg:24px;
+  --shadow:6px 6px 12px rgba(163,172,187,.55),-6px -6px 12px rgba(255,255,255,.90);
+  --shadow-in:inset 4px 4px 8px rgba(163,172,187,.55),inset -4px -4px 8px rgba(255,255,255,.90);
+  --shadow-lg:14px 14px 30px rgba(150,160,178,.50),-10px -10px 24px rgba(255,255,255,.85);
+  --ring:0 0 0 3px rgba(74,89,196,.38); --scrim:rgba(30,36,48,.34); --blur:0px;
+}
+.dark:root[data-skin="clay"]{
+  --bg:#23262C; --surface:#23262C; --surface-2:#2B2F36;
+  --sidebar-bg:#23262C; --header-bg:#23262C; --composer-bg:#23262C;
+  --border:#33373F; --border-strong:#454A55; --text:#E6E9EF; --text-dim:#98A0AE;
+  --accent:#8493FF; --accent-text:#10142B; --accent-soft:#2C3150; --accent-2:#8493FF;
+  --danger:#FF7A70; --success:#6FD79E; --warn:#E9BC63; --info:#8493FF;
+  --bubble-user:#2A2E36; --bubble-ai:#2B2F36;
+  --shadow:6px 6px 12px rgba(13,15,18,.62),-6px -6px 12px rgba(52,57,66,.55);
+  --shadow-in:inset 4px 4px 8px rgba(13,15,18,.62),inset -4px -4px 8px rgba(52,57,66,.50);
+  --shadow-lg:14px 14px 30px rgba(10,12,15,.70),-10px -10px 24px rgba(52,57,66,.45);
+  --ring:0 0 0 3px rgba(132,147,255,.40); --scrim:rgba(10,12,15,.60);
+}
+[data-skin=clay] .card,[data-skin=clay] .modal-panel,[data-skin=clay] .btn,
+[data-skin=clay] .toast{box-shadow:var(--shadow);border:0}
+[data-skin=clay] .btn:active,[data-skin=clay] .nav-item.is-active{box-shadow:var(--shadow-in)}
+[data-skin=clay] .composer,[data-skin=clay] input,[data-skin=clay] textarea{
+  box-shadow:var(--shadow-in);border:0;background:var(--surface)}
+[data-skin=clay] .msg-content{box-shadow:none;border:1px solid var(--border)}
+/* focus ring stacks ON TOP of the neumorphic shadow — the usual a11y bug, fixed */
+[data-skin=clay] :focus-visible{box-shadow:var(--shadow),var(--ring);outline:0}
+
+/* ── 5. VOID — OLED. Every boundary is a line; speaker identity is a
+   coloured left rule, which keeps black pixels black (and the panel off).
+   text 21.00 both. Offered, not defaulted: white-on-black haloes for some
+   readers over long sessions. ─────────────────────────────────────────── */
+:root[data-skin="void"]{
+  --bg:#FFFFFF; --bg-art:none; --surface:#FFFFFF; --surface-2:#F2F2F2;
+  --sidebar-bg:#FFFFFF; --header-bg:#FFFFFF; --composer-bg:#FFFFFF;
+  --border:#D6D6D6; --border-strong:#8A8A8A; --text:#000000; --text-dim:#565656;
+  --font:ui-sans-serif,'Inter',system-ui,sans-serif; --font-read:var(--font);
+  --accent:#00695A; --accent-text:#FFFFFF; --accent-soft:#E2F1EE; --accent-2:#00695A;
+  --danger:#C10000; --success:#00695A; --warn:#7A5200; --info:#00695A;
+  --bubble-user:#EFEFEF; --bubble-ai:#FFFFFF;
+  --radius:4px; --radius-lg:6px; --shadow:none; --shadow-lg:none;
+  --ring:0 0 0 2px #FFFFFF,0 0 0 4px #00695A; --scrim:rgba(0,0,0,.55); --blur:0px;
+}
+.dark:root[data-skin="void"]{
+  --bg:#000000; --surface:#000000; --surface-2:#0D0D0D;
+  --sidebar-bg:#000000; --header-bg:#000000; --composer-bg:#0D0D0D;
+  --border:#2A2A2A; --border-strong:#5A5A5A; --text:#FFFFFF; --text-dim:#A0A0A0;
+  --accent:#00E5A0; --accent-text:#00140D; --accent-soft:#04231A; --accent-2:#00E5A0;
+  --danger:#FF4D4D; --success:#00E5A0; --warn:#FFC400; --info:#00E5A0;
+  --bubble-user:#101010; --bubble-ai:#000000;
+  --ring:0 0 0 2px #000000,0 0 0 4px #00E5A0; --scrim:rgba(0,0,0,.80);
+}
+[data-skin=void] .card,[data-skin=void] .modal-panel,[data-skin=void] .toast,
+[data-skin=void] .msg-content,[data-skin=void] .btn{box-shadow:none}
+[data-skin=void] .modal-panel,[data-skin=void] .dropdown,[data-skin=void] .toast{
+  border:1px solid var(--border-strong)}
+[data-skin=void] .msg-content{border:0;border-left:2px solid var(--border);
+  border-radius:0;padding-left:.9rem}
+[data-skin=void] .msg-user .msg-content{border-left-color:var(--accent)}
+[data-skin=void] :focus-visible{box-shadow:var(--ring)!important;outline:0}
+
+/* ── 6. SHERBET — vivid. Gradient confined to the send button + one 2px
+   header rule; glow to one element. text 15.94 dark / 16.22 light.
+   NOTE: light --accent is 4.69:1 — AA, not AAA. Never set 12px timestamps
+   in --accent on this skin; that is what --text-dim is for. ───────────── */
+:root[data-skin="sherbet"]{
+  --bg:#FFF4F9;
+  --bg-art:radial-gradient(60vw 40vw at 100% 0,rgba(214,36,138,.06),transparent 60%),
+           radial-gradient(50vw 40vw at 0 100%,rgba(14,116,144,.06),transparent 60%);
+  --surface:#FFFFFF; --surface-2:#FFE9F3;
+  --sidebar-bg:#FFEAF4; --header-bg:#FFFFFF; --composer-bg:#FFFFFF;
+  --border:#F6CFE3; --border-strong:#E9A7C9; --text:#2A1B2E; --text-dim:#6D5473;
+  --font:ui-rounded,'Nunito','Baloo 2',ui-sans-serif,system-ui,sans-serif; --font-read:var(--font);
+  --accent:#D6248A; --accent-2:#0E7490; --accent-text:#FFFFFF; --accent-soft:#FFE0F0;
+  --danger:#D62246; --success:#0E7490; --warn:#8A5A00; --info:#0E7490;
+  --bubble-user:#FFE0F0; --bubble-ai:#FFFFFF;
+  --radius:14px; --radius-lg:20px;
+  --shadow:0 2px 0 rgba(214,36,138,.14); --shadow-lg:0 16px 40px -14px rgba(214,36,138,.35);
+  --ring:0 0 0 3px rgba(214,36,138,.32); --scrim:rgba(42,27,46,.38); --blur:0px;
+}
+.dark:root[data-skin="sherbet"]{
+  --bg:#0D0A1A;
+  --bg-art:radial-gradient(60vw 45vw at 100% -5%,rgba(255,87,180,.14),transparent 62%),
+           radial-gradient(55vw 45vw at -5% 105%,rgba(53,227,255,.12),transparent 62%);
+  --surface:#171130; --surface-2:#221A42;
+  --sidebar-bg:#120D25; --header-bg:#0D0A1A; --composer-bg:#221A42;
+  --border:#33265C; --border-strong:#4B3A82; --text:#F3EEFF; --text-dim:#AB9DD6;
+  --accent:#FF57B4; --accent-2:#35E3FF; --accent-text:#22001A; --accent-soft:#2E1140;
+  --danger:#FF6B8A; --success:#35E3FF; --warn:#FFC46B; --info:#35E3FF;
+  --bubble-user:#3A1140; --bubble-ai:#171130;
+  --shadow:0 0 0 1px rgba(255,87,180,.20); --shadow-lg:0 18px 46px -16px rgba(255,87,180,.45);
+  --ring:0 0 0 3px rgba(255,87,180,.40); --scrim:rgba(6,4,14,.62);
+}
+[data-skin=sherbet] .btn-primary,[data-skin=sherbet] .send-btn{
+  background:linear-gradient(135deg,var(--accent),var(--accent-2));color:var(--accent-text)}
+.dark [data-skin=sherbet] .send-btn{box-shadow:0 0 18px -4px var(--accent)}
+[data-skin=sherbet] .app-header{border-bottom:2px solid transparent;
+  border-image:linear-gradient(90deg,var(--accent),var(--accent-2)) 1}
+[data-skin=sherbet] .msg-user .msg-content{border-bottom-right-radius:4px}
+[data-skin=sherbet] .msg-ai .msg-content{border-bottom-left-radius:4px}
+
+
+/* ── ISLAND DOCK (Deck theme, desktop only) ─────────────────────────────
+   Pills that widen on hover to reveal their label, an filled active pill and
+   a dot under it. The whole nav is one row, so it is desktop-only by
+   construction - 11 items never fit a phone, and below 1024px the Deck rules
+   never fire at all, leaving the normal drawer. */
+@media (min-width:1024px){
+  :root[data-layout="deck"] #left-sidebar{
+    /* a ceiling, not a width: the pill takes whatever its label needs up to
+       this, so the longest one still fits */
+    --dock-item:50px; --dock-open:260px; --dock-gap:6px; --dock-pad:8px;
+    position:fixed; left:50%; bottom:20px; top:auto; transform:translateX(-50%);
+    flex-direction:row; align-items:center; gap:var(--dock-gap);
+    width:auto; height:auto; padding:var(--dock-pad);
+    border:1px solid color-mix(in oklab,var(--text) 10%,transparent);
+    border-radius:9999px; background:var(--surface);
+    box-shadow:0 10px 15px -3px rgb(0 0 0/.10),0 4px 6px -2px rgb(0 0 0/.05),0 20px 25px -5px rgb(0 0 0/.18);
+    z-index:50; overflow:visible;
+  }
+  /* dissolve the two wrappers so nav + footer buttons become one flex row */
+  :root[data-layout="deck"] #left-sidebar>div:first-child{display:contents}
+  :root[data-layout="deck"] #brand-bar,
+  :root[data-layout="deck"] #nav-footer>a{display:none}
+  :root[data-layout="deck"] #main-nav,
+  :root[data-layout="deck"] #nav-footer{
+    display:flex; flex-direction:row; align-items:center; gap:var(--dock-gap);
+    padding:0; margin:0; border:0; background:none;
+  }
+  :root[data-layout="deck"] #nav-footer{
+    margin-left:var(--dock-gap); padding-left:var(--dock-gap);
+    border-left:1px solid color-mix(in oklab,var(--text) 12%,transparent);
+  }
+
+  /* Sized by its own label rather than to a fixed width: max-width does the
+     opening and closing, and width:auto stops a short label being stretched.
+     The old fixed 150px cut "Manage Sessions" off mid-word, and any single
+     number would be wrong for one label or another. */
+  :root[data-layout="deck"] .dock-btn{
+    position:relative; display:flex; align-items:center; justify-content:flex-start;
+    width:auto; max-width:var(--dock-item); height:var(--dock-item); flex-shrink:0;
+    padding:0; border-radius:9999px; overflow:hidden;
+    background:transparent; color:var(--text-dim);
+    transition:max-width .4s cubic-bezier(.25,.8,.25,1), background-color .3s ease, color .3s ease;
+  }
+  :root[data-layout="deck"] .dock-btn>i,
+  :root[data-layout="deck"] .dock-btn>svg{
+    min-width:var(--dock-item); width:var(--dock-item); height:var(--dock-item);
+    padding:15px; margin:0; flex-shrink:0; z-index:2;
+  }
+  :root[data-layout="deck"] .dock-btn>span{
+    white-space:nowrap; opacity:0; transform:translateX(10px);
+    font-size:13px; font-weight:500; padding-right:18px; pointer-events:none;
+    transition:opacity .2s ease, transform .4s cubic-bezier(.25,.8,.25,1);
+  }
+  /* expand on hover AND on keyboard focus - hover-only would strand Tab users */
+  :root[data-layout="deck"] .dock-btn:hover,
+  :root[data-layout="deck"] .dock-btn:focus-visible{
+    max-width:var(--dock-open); background:color-mix(in oklab,var(--text) 12%,transparent); color:var(--text);
+  }
+  :root[data-layout="deck"] .dock-btn:hover>span,
+  :root[data-layout="deck"] .dock-btn:focus-visible>span{
+    opacity:1; transform:translateX(0); transition-delay:.05s;
+  }
+  /* the current destination stays filled and labelled until you reach for another */
+  /* --glass-accent-ink is only set while glass is on, and falls back to the
+     engine's own fitted ink otherwise - so this is right either way. */
+  :root[data-layout="deck"] .dock-btn.is-active{
+    max-width:var(--dock-open); background:var(--accent);
+    color:var(--glass-accent-ink, var(--accent-text));
+  }
+  :root[data-layout="deck"] .dock-btn.is-active>span{opacity:1;transform:translateX(0)}
+  :root[data-layout="deck"] #left-sidebar:hover .dock-btn.is-active:not(:hover){
+    max-width:var(--dock-item); background:transparent; color:var(--text-dim);
+  }
+  :root[data-layout="deck"] #left-sidebar:hover .dock-btn.is-active:not(:hover)>span{
+    opacity:0; transform:translateX(10px);
+  }
+  :root[data-layout="deck"] .dock-btn.is-active::after{
+    content:""; position:absolute; bottom:5px; left:50%; width:5px; height:5px;
+    border-radius:50%; background:currentColor; opacity:0;
+    transform:translateX(-50%) scale(0);
+    transition:transform .4s cubic-bezier(.25,.8,.25,1), opacity .4s ease-out;
+  }
+  :root[data-layout="deck"] #left-sidebar:hover .dock-btn.is-active:not(:hover)::after{
+    opacity:1; transform:translateX(-50%) scale(1);
+  }
+  /* the dock is the nav, so nothing may sit under it */
+  :root[data-layout="deck"] #app{padding-bottom:96px}
+  :root[data-layout="deck"] #toast{bottom:96px}
+  :root[data-layout="deck"] #sketchboard-sidebar{bottom:96px}
+}
+
+
+/* background art is one fixed layer for every skin — never repaints on scroll */
+body{background-color:var(--bg);background-image:var(--bg-art);background-attachment:fixed}
+
+/* ─────────────────────────────────────────────────────────────────────
+   LAYOUT LAYER — shell structure only. Shared markup; a layout is one
+   attribute on <html>.
+
+   THREE FACTS FROM THE REAL CODE THAT SHAPE ALL OF THIS:
+   1. Tailwind Play CDN injects its stylesheet AFTER the inline <style>,
+      so on equal specificity Tailwind wins. Every rule below is
+      \`:root[data-layout=x] #id\` = (1,1,1), which beats \`.md\\:relative\`.
+      A plain \`.sidebar{}\` rule would silently do nothing.
+   2. \`.hf{display:none!important}\` is the app's universal hide and beats
+      everything here — closed modals/drawers stay closed for free.
+   3. The drawers are JS class toggles (\`-translate-x-full\` on
+      #left-sidebar, \`translate-x-full\` on #sketchboard-sidebar). Never
+      write \`transform:none\` unscoped or the mobile drawer dies.
+
+   THE RULE THAT REMOVES ~90% OF THE MOBILE RISK: every variant lives
+   inside @media (min-width:1024px). Below that, no layout rule fires and
+   the app is exactly what ships today. A broken variant can never strand
+   a phone user.
+
+   DOM TAX (added once, shared by every layout — not per-theme markup):
+     #brand-bar #main-nav #nav-footer #main-col #chat-header
+     #composer-dock #composer-shell   + data-label="..." on nav buttons
+     + <aside id="session-rail"> (display:none except rail/trio)
+   ───────────────────────────────────────────────────────────────────── */
+
+/* ── 1. STUDIO — polished classic. DEFAULT. ───────────────────────────
+   Fixes what makes today's shell feel generic: one reading measure shared
+   by stream AND composer (today the stream is full-bleed but the composer
+   is max-w-3xl, so text and input don't align), a real surface hierarchy,
+   and nav grouped Chat/Workspace/System instead of eight identical rows.
+   Mobile IS today's mobile — zero risk. */
+@media (min-width:768px){
+  :root[data-layout="studio"] #app{
+    display:grid; background:var(--bg);
+    grid-template-columns:272px minmax(0,1fr); grid-template-areas:"nav main";
+  }
+  :root[data-layout="studio"] #left-sidebar{
+    grid-area:nav; position:relative; transform:none; width:auto;
+    background:var(--sidebar-bg); border-right:1px solid var(--border);
+  }
+  :root[data-layout="studio"] #main-col{grid-area:main;background:var(--surface);min-width:0}
+  /* nav groups with no extra markup */
+  :root[data-layout="studio"] #main-nav>button:nth-child(2),
+  :root[data-layout="studio"] #main-nav>button:nth-child(6){
+    margin-top:.75rem;padding-top:.875rem;border-top:1px solid var(--border);
+  }
+  :root[data-layout="studio"] #chat-header{
+    background:color-mix(in oklab,var(--header-bg) 78%,transparent);backdrop-filter:blur(14px);
+  }
+  :root[data-layout="studio"] #chat-container{padding-inline:max(2rem,calc((100% - 46rem)/2))}
+  :root[data-layout="studio"] #composer-shell{max-width:46rem}
+  :root[data-layout="studio"] #composer-dock{
+    background:linear-gradient(to top,var(--surface) 68%,transparent);padding-bottom:1.75rem;
+  }
+  :root[data-layout="studio"] #sketchboard-sidebar{
+    border-radius:var(--radius) 0 0 var(--radius);box-shadow:var(--shadow-lg);
+  }
+}
+
+/* ── 2. RAIL — 64px icon rail + 264px session panel + conversation.
+   Labels come from data-label on :hover AND :focus-visible so keyboard
+   users get them too. Needs #session-rail. Mobile drawer is itself
+   rail+list (64+236=300 of 360) — different feel, still fits. */
+@media (min-width:1024px){
+  :root[data-layout="rail"] #app{
+    display:grid;grid-template-columns:64px var(--rail-w,264px) minmax(0,1fr);
+    grid-template-areas:"rail list main";
+    transition:grid-template-columns .42s cubic-bezier(.2,0,0,1);
+  }
+  :root[data-layout="rail"] #left-sidebar{
+    grid-area:rail;position:relative;transform:none;width:64px;
+    background:var(--bg);border-right:1px solid var(--border);
+  }
+  :root[data-layout="rail"] #main-nav,:root[data-layout="rail"] #nav-footer{
+    display:flex;flex-direction:column;gap:.25rem;padding:.5rem;border-top:0;
+  }
+  :root[data-layout="rail"] #main-nav>button,
+  :root[data-layout="rail"] #nav-footer>button{
+    width:48px;height:44px;padding:0;justify-content:center;position:relative;
+  }
+  /* hide label spans only — NOT the logo glyph */
+  :root[data-layout="rail"] #main-nav>button>span,
+  :root[data-layout="rail"] #nav-footer>button>span,
+  :root[data-layout="rail"] #brand-bar h1,
+  :root[data-layout="rail"] #nav-footer>a{display:none}
+  :root[data-layout="rail"] #brand-bar{justify-content:center;padding:0}
+  :root[data-layout="rail"] [data-label]:hover::after,
+  :root[data-layout="rail"] [data-label]:focus-visible::after{
+    content:attr(data-label);position:absolute;left:calc(100% + 10px);
+    padding:.3rem .55rem;border-radius:6px;font-size:11px;white-space:nowrap;
+    background:var(--text);color:var(--bg);box-shadow:var(--shadow-lg);z-index:60;
+  }
+  :root[data-layout="rail"] #session-rail{
+    grid-area:list;display:flex;flex-direction:column;min-height:0;
+    background:var(--surface-2);border-right:1px solid var(--border);
+  }
+  :root[data-layout="rail"] #main-col{grid-area:main;background:var(--surface);min-width:0}
+  :root[data-layout="rail"] #chat-container{padding-inline:2rem}
+}
+
+/* ── 3. TRIO — desktop-messenger three columns; a 4th appears >=1440px
+   and the sketchboard stops being a drawer. The :has() pair lets the
+   existing toggleSketchboard() keep working while docked. */
+@media (min-width:1024px){
+  :root[data-layout="trio"] #app{
+    display:grid;grid-template-columns:236px var(--rail-w,312px) minmax(0,1fr);
+    grid-template-areas:"nav list main";
+    transition:grid-template-columns .42s cubic-bezier(.2,0,0,1);
+  }
+  :root[data-layout="trio"] #left-sidebar{
+    grid-area:nav;position:relative;transform:none;width:auto;
+    background:var(--sidebar-bg);border-right:1px solid var(--border);
+  }
+  :root[data-layout="trio"] #session-rail{
+    grid-area:list;display:flex;flex-direction:column;min-height:0;
+    background:var(--surface-2);border-right:1px solid var(--border);
+  }
+  :root[data-layout="trio"] #main-col{grid-area:main;background:var(--surface);min-width:0}
+  :root[data-layout="trio"] #brand-bar,
+  :root[data-layout="trio"] #session-rail>header,
+  :root[data-layout="trio"] #chat-header{height:64px;flex:none}
+  :root[data-layout="trio"] #chat-container{padding-inline:1.5rem}
+  :root[data-layout="trio"] #composer-shell{max-width:none}
+}
+@media (min-width:1440px){
+  :root[data-layout="trio"] #app{
+    grid-template-columns:236px var(--rail-w,312px) minmax(0,1fr) 320px;
+    grid-template-areas:"nav list main sketch";
+  }
+  :root[data-layout="trio"] #sketchboard-sidebar{
+    grid-area:sketch;position:relative;transform:none;width:auto;
+    box-shadow:none;border-left:1px solid var(--border);
+  }
+  :root[data-layout="trio"] #sketchboard-sidebar.translate-x-full{display:none}
+  :root[data-layout="trio"] #app:has(#sketchboard-sidebar.translate-x-full){
+    grid-template-columns:236px var(--rail-w,312px) minmax(0,1fr) 0;
+  }
+}
+
+/* ── 4. ZEN — focus mode. Chrome fades; nav parks off-canvas behind a
+   12px edge strip. DISCOVERABILITY IS NOT HOVER-ONLY: the mobile
+   hamburger is un-hidden on desktop (always visible + focusable),
+   :focus-within reveals the nav for Tab users, and the hamburger acts as
+   a pin. Hover is a shortcut, never the mechanism. */
+@media (min-width:1024px){
+  :root[data-layout="zen"] #app{display:block;background:var(--bg)}
+  :root[data-layout="zen"] #main-col{height:100%;background:transparent}
+  :root[data-layout="zen"] #left-sidebar{
+    position:fixed;inset-block:0;left:0;width:272px;z-index:40;
+    transform:translateX(calc(-100% + 12px));
+    transition:transform .22s cubic-bezier(.2,.8,.2,1);
+    background:var(--sidebar-bg);box-shadow:var(--shadow-lg);
+  }
+  :root[data-layout="zen"] #left-sidebar:hover,
+  :root[data-layout="zen"] #left-sidebar:focus-within,
+  :root[data-layout="zen"] #left-sidebar:not(.-translate-x-full){transform:translateX(0)}
+  :root[data-layout="zen"] #chat-header>div>button:first-child{display:flex}
+  :root[data-layout="zen"] #chat-header{
+    height:52px;border-bottom:0;background:transparent;backdrop-filter:none;
+    width:min(42rem,100%);margin-inline:auto;opacity:.55;transition:opacity .2s;
+  }
+  :root[data-layout="zen"] #chat-header:hover,
+  :root[data-layout="zen"] #chat-header:focus-within{opacity:1}
+  :root[data-layout="zen"] #chat-container{
+    padding-inline:max(1.5rem,calc((100% - 42rem)/2));padding-block:2.5rem;line-height:1.75;
+  }
+  :root[data-layout="zen"] #composer-shell{max-width:42rem}
+  :root[data-layout="zen"] #composer-dock{
+    background:linear-gradient(to top,var(--bg) 70%,transparent);padding-bottom:2rem;
+  }
+  :root[data-layout="zen"] #summarize-banner,
+  :root[data-layout="zen"] #load-more-banner{top:52px}
+}
+
+/* ── 5. DECK — floating cards + bottom dock. The trick that needs no
+   markup change: \`#left-sidebar>div{display:contents}\` dissolves the
+   wrapper so #main-nav and #nav-footer become row siblings in the pill.
+   DOCK DOES NOT SHIP ON MOBILE: 11 items x 40px = 440 > 360. Mobile
+   keeps the drawer but retains the card look. */
+@media (min-width:1024px){
+  :root[data-layout="deck"] body{
+    background:radial-gradient(120% 80% at 50% -20%,
+      color-mix(in oklab,var(--accent) 14%,var(--bg)),var(--bg));
+  }
+  :root[data-layout="deck"] #app{display:block;padding:18px 18px 96px}
+  :root[data-layout="deck"] #main-col{
+    height:100%;background:var(--surface);border:1px solid var(--border);
+    border-radius:calc(var(--radius)*2);box-shadow:var(--shadow-lg);overflow:hidden;
+  }
+  /* nav for Deck is the island dock defined below */
+  :root[data-layout="deck"] #sketchboard-sidebar{
+    top:18px;right:18px;bottom:96px;border-radius:calc(var(--radius)*2);
+    border:1px solid var(--border);box-shadow:var(--shadow-lg);
+  }
+  /* #toast is bottom-32 md:bottom-24 and would sit BEHIND the dock */
+  :root[data-layout="deck"] #toast{bottom:92px}
+}
+
+/* ── 6. CONSOLE — dense command centre. \`#main-col{display:contents}\`
+   dissolves <main> so its header/stream/composer join the #app grid —
+   that is how the status band spans full width with zero markup change.
+   Two consequences straight out of the code: the banners are
+   \`absolute top-16\` inside <main>, so once <main> is display:contents
+   they resolve against #app and must be repositioned; and .msg-row has
+   contain-intrinsic-size:auto 90px while dense rows are ~48px, which
+   makes the scrollbar jitter on fast scroll unless overridden. */
+@media (min-width:1024px){
+  :root[data-layout="console"]{--radius:5px}
+  :root[data-layout="console"] #app{
+    display:grid;font-size:13px;
+    grid-template-columns:208px minmax(0,1fr) 300px;
+    grid-template-rows:44px minmax(0,1fr) auto;
+    grid-template-areas:"nav bar sketch" "nav stream sketch" "nav dock sketch";
+  }
+  :root[data-layout="console"] #main-col{display:contents}
+  :root[data-layout="console"] #left-sidebar{
+    grid-area:nav;position:relative;transform:none;width:auto;
+    background:var(--sidebar-bg);border-right:1px solid var(--border);
+  }
+  :root[data-layout="console"] #brand-bar{height:44px;padding-inline:.75rem}
+  :root[data-layout="console"] #main-nav{padding:.375rem;gap:1px}
+  :root[data-layout="console"] #main-nav>button,
+  :root[data-layout="console"] #nav-footer>button{
+    padding:.3125rem .5rem;font-size:12px;border-radius:4px;
+  }
+  :root[data-layout="console"] #chat-header{
+    grid-area:bar;height:44px;padding-inline:.875rem;position:static;
+    border-bottom:1px solid var(--border);
+  }
+  :root[data-layout="console"] #chat-container{grid-area:stream;padding:.75rem 1rem;min-width:0}
+  :root[data-layout="console"] #chat-container>.msg-row+.msg-row{margin-top:.5rem}
+  :root[data-layout="console"] .msg-row{contain-intrinsic-size:auto 48px}
+  :root[data-layout="console"] #composer-dock{grid-area:dock;padding:.625rem 1rem 1rem}
+  :root[data-layout="console"] #composer-shell{max-width:none}
+  :root[data-layout="console"] #sketchboard-sidebar{
+    grid-area:sketch;position:relative;transform:none;width:auto;
+    box-shadow:none;border-left:1px solid var(--border);
+  }
+  :root[data-layout="console"] #sketchboard-sidebar.translate-x-full{display:none}
+  :root[data-layout="console"] #app:has(#sketchboard-sidebar.translate-x-full){
+    grid-template-columns:208px minmax(0,1fr) 0;
+  }
+  :root[data-layout="console"] #summarize-banner,
+  :root[data-layout="console"] #load-more-banner{top:44px;left:208px;right:300px}
+  :root[data-layout="console"] #modal-backdrop{align-items:flex-start;padding-top:11vh}
+}
+/* Console must NEVER lower #chat-input / #new-pin-input below 16px on
+   mobile: they carry \`text-base md:text-sm\` precisely so iOS does not zoom
+   the page on focus. user-scalable=no in the viewport meta is ignored by
+   modern iOS Safari and will not save you. */
+
+
+/* ── 7. LEDGER — the admin-dashboard shape: one full-width bar across the
+   top, navigation beneath it on the left, content in a framed card.
+   display:contents on the sidebar and its wrapper dissolves both, so the
+   brand bar, the nav and the footer become grid items of #app and the bar
+   can span the whole width without a second DOM. */
+@media (min-width:1024px){
+  :root[data-layout="ledger"] #app{
+    display:grid; background:var(--bg);
+    grid-template-columns:var(--nav-w,17rem) minmax(0,1fr);
+    grid-template-rows:56px minmax(0,1fr) auto;
+    grid-template-areas:"brand brand" "nav main" "foot main";
+  }
+  /* only the first wrapper: #nav-footer is a #left-sidebar>div too, and
+     dissolving it drops the account row, Nuke Server and Log out into
+     implicit rows at the bottom of the page */
+  :root[data-layout="ledger"] #left-sidebar,
+  :root[data-layout="ledger"] #left-sidebar>div:first-child{display:contents}
+  :root[data-layout="ledger"] #brand-bar{
+    grid-area:brand; height:56px; padding-inline:1.25rem;
+    background:var(--surface); border-bottom:1px solid var(--border);
+  }
+  :root[data-layout="ledger"] #main-nav{
+    grid-area:nav; padding:.875rem; background:var(--sidebar-bg);
+    border-right:1px solid var(--border); overflow-y:auto;
+  }
+  :root[data-layout="ledger"] #nav-footer{
+    grid-area:foot; padding:.75rem .875rem; background:var(--sidebar-bg);
+    border-right:1px solid var(--border); border-top:1px solid var(--border);
+  }
+  :root[data-layout="ledger"] #main-col{
+    grid-area:main; min-width:0; background:var(--bg);
+    padding:1rem 1.25rem 0; display:flex; flex-direction:column;
+  }
+  /* the conversation is a card, the way a dashboard puts every panel in one */
+  :root[data-layout="ledger"] #chat-header{
+    border:1px solid var(--border); border-bottom:0;
+    border-radius:var(--radius-lg) var(--radius-lg) 0 0;
+    background:var(--header-bg); flex:none;
+  }
+  :root[data-layout="ledger"] #chat-container{
+    border-inline:1px solid var(--border); background:var(--surface);
+    padding-inline:max(1.5rem,calc((100% - var(--measure,46rem))/2));
+  }
+  :root[data-layout="ledger"] #composer-dock{
+    border:1px solid var(--border); border-top:0;
+    border-radius:0 0 var(--radius-lg) var(--radius-lg);
+    background:var(--composer-bg); padding-bottom:1rem; margin-bottom:1.25rem;
+  }
+  :root[data-layout="ledger"] #composer-shell{max-width:var(--measure,46rem)}
+  :root[data-layout="ledger"] #load-more-banner,
+  :root[data-layout="ledger"] #summarize-banner{top:56px; left:var(--nav-w,17rem)}
+  :root[data-layout="ledger"] #sketchboard-sidebar{top:56px}
+}
+
+/* ── 8. SPLIT — the desktop-messenger shape: a wide conversation list that
+   shows what each chat is, and the chat itself filling the rest. The list is
+   the same #session-rail the Rail and Trio layouts use. */
+@media (min-width:1024px){
+  :root[data-layout="split"] #app{
+    display:grid; background:var(--bg);
+    grid-template-columns:76px var(--rail-w,340px) minmax(0,1fr);
+    grid-template-areas:"rail list main";
+    transition:grid-template-columns .42s cubic-bezier(.2,0,0,1);
+  }
+  :root[data-layout="split"] #left-sidebar{
+    grid-area:rail; position:relative; transform:none; width:76px;
+    background:var(--bg); border-right:1px solid var(--border);
+  }
+  :root[data-layout="split"] #main-nav,
+  :root[data-layout="split"] #nav-footer{
+    display:flex; flex-direction:column; gap:.375rem; padding:.5rem; border-top:0;
+  }
+  :root[data-layout="split"] #main-nav>button,
+  :root[data-layout="split"] #nav-footer>button{
+    width:60px; height:52px; padding:0; position:relative;
+    flex-direction:column; gap:3px; justify-content:center; font-size:9px;
+  }
+  :root[data-layout="split"] #main-nav>button>span,
+  :root[data-layout="split"] #nav-footer>button>span{
+    font-size:9px; line-height:1; max-width:56px; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; margin:0;
+  }
+  :root[data-layout="split"] #brand-bar{justify-content:center;padding:0;height:60px}
+  :root[data-layout="split"] #brand-bar h1,
+  :root[data-layout="split"] #nav-footer>a{display:none}
+  :root[data-layout="split"] #session-rail{
+    grid-area:list; display:flex; flex-direction:column; min-height:0;
+    background:var(--surface-2); border-right:1px solid var(--border);
+  }
+  :root[data-layout="split"] #main-col{grid-area:main;background:var(--surface);min-width:0}
+  :root[data-layout="split"] #chat-container{padding-inline:2.5rem}
+  :root[data-layout="split"] #composer-shell{max-width:none}
+}
+
+/* ── 9. CANVAS — no side navigation at all: the nav becomes a horizontal
+   strip under the header and the conversation gets the full width. For
+   people who keep the sketchboard open and want it beside the text. */
+@media (min-width:1024px){
+  :root[data-layout="canvas"] #app{
+    display:grid; background:var(--bg);
+    grid-template-rows:52px minmax(0,1fr);
+    grid-template-columns:minmax(0,1fr);
+    grid-template-areas:"bar" "main";
+  }
+  /* only the first wrapper: #nav-footer is a #left-sidebar>div too, and
+     dissolving it drops the account row, Nuke Server and Log out into
+     implicit rows at the bottom of the page */
+  :root[data-layout="canvas"] #left-sidebar,
+  :root[data-layout="canvas"] #left-sidebar>div:first-child{display:contents}
+  :root[data-layout="canvas"] #brand-bar{display:none}
+  :root[data-layout="canvas"] #main-nav{
+    grid-area:bar; display:flex; flex-direction:row; align-items:center;
+    gap:.25rem; padding:.375rem .75rem; overflow-x:auto;
+    background:var(--sidebar-bg); border-bottom:1px solid var(--border);
+  }
+  :root[data-layout="canvas"] #main-nav>button{
+    width:auto; flex:none; padding:.4rem .7rem; margin:0; border-top:0;
+  }
+  :root[data-layout="canvas"] #nav-footer{
+    grid-area:bar; justify-self:end; align-self:center;
+    display:flex; flex-direction:row; gap:.25rem; padding:.375rem .75rem;
+    border-top:0; background:transparent;
+  }
+  :root[data-layout="canvas"] #nav-footer>button{width:auto;padding:.4rem .6rem}
+  :root[data-layout="canvas"] #nav-footer>button>span,
+  :root[data-layout="canvas"] #nav-footer>a{display:none}
+  :root[data-layout="canvas"] #main-col{grid-area:main;background:var(--surface);min-width:0}
+  :root[data-layout="canvas"] #chat-container{padding-inline:3rem}
+  :root[data-layout="canvas"] #composer-shell{max-width:none}
+  :root[data-layout="canvas"] #load-more-banner,
+  :root[data-layout="canvas"] #summarize-banner{top:52px;left:0}
+  :root[data-layout="canvas"] #sketchboard-sidebar{top:52px}
+}
+
+/* ── 10. TILES — every region is its own rounded panel on a tinted ground.
+   The most decorated of the ten, and the one that shows a wallpaper best,
+   because the gaps let it through. */
+@media (min-width:1024px){
+  :root[data-layout="tiles"] #app{
+    display:grid; background:var(--bg); gap:12px; padding:12px;
+    grid-template-columns:var(--nav-w,17rem) minmax(0,1fr);
+    grid-template-areas:"nav main";
+  }
+  :root[data-layout="tiles"] #left-sidebar{
+    grid-area:nav; position:relative; transform:none; width:auto;
+    background:var(--surface); border:1px solid var(--border);
+    border-radius:var(--radius-lg); overflow:hidden; box-shadow:var(--shadow);
+  }
+  :root[data-layout="tiles"] #main-col{
+    grid-area:main; min-width:0; background:transparent;
+    display:flex; flex-direction:column; gap:12px;
+  }
+  :root[data-layout="tiles"] #chat-header{
+    flex:none; border:1px solid var(--border); border-radius:var(--radius-lg);
+    background:var(--header-bg); box-shadow:var(--shadow);
+  }
+  :root[data-layout="tiles"] #chat-container{
+    border:1px solid var(--border); border-radius:var(--radius-lg);
+    background:var(--surface); box-shadow:var(--shadow);
+    padding-inline:max(1.5rem,calc((100% - var(--measure,46rem))/2));
+  }
+  :root[data-layout="tiles"] #composer-dock{
+    flex:none; border:1px solid var(--border); border-radius:var(--radius-lg);
+    background:var(--composer-bg); box-shadow:var(--shadow); padding:.75rem;
+  }
+  :root[data-layout="tiles"] #composer-shell{max-width:var(--measure,46rem)}
+  :root[data-layout="tiles"] #sketchboard-sidebar{
+    top:12px; bottom:12px; right:12px; border-radius:var(--radius-lg);
+    border:1px solid var(--border); box-shadow:var(--shadow-lg);
+  }
+  :root[data-layout="tiles"] #load-more-banner,
+  :root[data-layout="tiles"] #summarize-banner{left:calc(var(--nav-w,17rem) + 24px)}
+}
+
+/* ── STYLE OPTIONS ──────────────────────────────────────────────────────
+   Each theme declares which of these it exposes; the values arrive as custom
+   properties or data-attributes on <html>. Defaults are written so a theme
+   that does NOT expose an option still renders correctly. */
+:root{ --measure:46rem; --nav-w:17rem; --deck-gap:18px; }
+
+/* reading width: the message column and the composer must share one measure,
+   otherwise text and the box you type into do not line up */
+@media (min-width:768px){
+  :root[data-layout="studio"] #chat-container,
+  :root[data-layout="zen"] #chat-container{
+    padding-inline:max(1.5rem,calc((100% - var(--measure))/2));
+  }
+  :root[data-layout="studio"] #composer-shell,
+  :root[data-layout="zen"] #composer-shell{ max-width:var(--measure) }
+  /* "Full" removes the cap rather than centring on a huge measure */
+  :root[data-layout="studio"] #chat-container[style],
+  :root[data-layout="zen"] #chat-container[style]{}
+}
+
+/* sidebar width */
+@media (min-width:768px){
+  :root[data-layout="studio"] #app{ grid-template-columns:var(--nav-w) minmax(0,1fr) }
+}
+@media (min-width:1024px){
+  :root[data-layout="console"] #app{ grid-template-columns:var(--nav-w) minmax(0,1fr) 300px }
+  :root[data-layout="console"] #app:has(#sketchboard-sidebar.translate-x-full){
+    grid-template-columns:var(--nav-w) minmax(0,1fr) 0;
+  }
+  :root[data-layout="console"] #summarize-banner,
+  :root[data-layout="console"] #load-more-banner{ left:var(--nav-w) }
+}
+
+/* separation: how surfaces are told apart */
+:root[data-depth="flat"] .msg-content,
+:root[data-depth="flat"] #composer-shell>div,
+:root[data-depth="flat"] .modal-content{ box-shadow:none!important; border-color:transparent!important }
+:root[data-depth="flat"] #left-sidebar,
+:root[data-depth="flat"] #chat-header{ border-color:transparent!important }
+:root[data-depth="shadow"] .msg-content,
+:root[data-depth="shadow"] #composer-shell>div{ box-shadow:var(--shadow); border-color:transparent }
+:root[data-depth="shadow"] .modal-content{ box-shadow:var(--shadow-lg) }
+
+/* density: one scale, applied where it is felt */
+:root[data-density="compact"]{ font-size:13px }
+:root[data-density="compact"] #chat-container{ padding-top:.5rem;padding-bottom:.5rem }
+:root[data-density="compact"] #chat-container>*+*{ margin-top:.75rem }
+:root[data-density="compact"] .msg-content{ padding:.6rem .8rem }
+:root[data-density="compact"] #main-nav>button,
+:root[data-density="compact"] #nav-footer>button{ padding-top:.3rem;padding-bottom:.3rem }
+:root[data-density="compact"] #chat-header,
+:root[data-density="compact"] #brand-bar{ height:52px }
+
+/* motion: a user-facing switch, separate from the OS preference, because the
+   reason to turn it off here is a very long scrollback rather than vestibular
+   sensitivity */
+:root[data-motion="reduced"] *,
+:root[data-motion="reduced"] *::before,
+:root[data-motion="reduced"] *::after{
+  animation-duration:.001ms!important; animation-iteration-count:1!important;
+  transition-duration:.001ms!important; scroll-behavior:auto!important;
+}
+
+/* deck: card inset + which end the dock lives on */
+@media (min-width:1024px){
+  :root[data-layout="deck"] #app{ padding:var(--deck-gap) var(--deck-gap) 96px }
+  :root[data-layout="deck"] #sketchboard-sidebar{ top:var(--deck-gap);right:var(--deck-gap) }
+  :root[data-layout="deck"][data-dockpos="top"] #left-sidebar{ top:20px;bottom:auto }
+  :root[data-layout="deck"][data-dockpos="top"] #app{ padding:96px var(--deck-gap) var(--deck-gap) }
+  :root[data-layout="deck"][data-dockpos="top"] #toast{ bottom:32px }
+  :root[data-layout="deck"][data-dockpos="top"] #sketchboard-sidebar{ top:96px;bottom:var(--deck-gap) }
+}
+
+
+/* ── PRESS FEEDBACK ─────────────────────────────────────────────────────
+   scale(0.96) on press, 150ms ease-out. A CSS transition rather than a
+   keyframe so releasing mid-press returns smoothly instead of snapping.
+   Named properties only - transition:all would also animate layout.
+   Excluded: .dock-btn, which runs its own width transition and would fight
+   this, and any control marked data-static. */
+#app button:not(:disabled):not(.dock-btn):not([data-static]),
+#login-screen button:not(:disabled),
+#modal-backdrop button:not(:disabled):not([data-static]){
+  transition-property:scale,opacity,background-color,border-color,color,box-shadow;
+  transition-duration:150ms;
+  transition-timing-function:ease-out;
+}
+#app button:not(:disabled):not(.dock-btn):not([data-static]):active,
+#login-screen button:not(:disabled):active,
+#modal-backdrop button:not(:disabled):not([data-static]):active{ scale:.96 }
+
+/* the theme swap injects this; see toggleTheme */
+.rp-no-transition,.rp-no-transition *,
+.rp-no-transition *::before,.rp-no-transition *::after{
+  transition:none!important; animation:none!important;
+}
+
+/* Touch targets. Measured on the key form: Save was 36px and Browse 38px,
+   both under the 44px a finger needs. Only applied to coarse pointers, so the
+   desktop density the design was drawn at is untouched. .dock-btn sets its own
+   size and is excluded. */
+@media (pointer:coarse){
+  #app button:not(.dock-btn), #modal-backdrop button, #login-screen button,
+  #app select, #modal-backdrop select{ min-height:44px }
+  #modal-backdrop input:not([type=checkbox]):not([type=range]),
+  #app input:not([type=checkbox]):not([type=range]){ min-height:44px }
+}
+
+/* images carry a 1px outline for consistent depth - pure black/white at low
+   opacity, never a tinted neutral, which would read as dirt on the edge */
+#app img:not([src^="data:image/svg"]){ outline:1px solid oklch(0 0 0/.1); outline-offset:-1px }
+.dark #app img:not([src^="data:image/svg"]){ outline-color:oklch(1 0 0/.1) }
+
+
+/* ── COLOUR ENGINE ──────────────────────────────────────────────────────
+   The Colour tab writes its result as inline custom properties on <html>,
+   so it layers over whichever skin is active rather than replacing it.
+
+   --accent stays a SOLID: Tailwind maps it to background-color AND to color,
+   and color-mix() fails silently to transparent when the referenced var holds
+   a gradient. The gradient rides as a background-image instead, which paints
+   over the solid on exactly the elements that fill with the accent. */
+.bg-accent{ background-image:var(--accent-grad,none) }
+
+/* swatches in Appearance > Colour */
+.sw{ position:relative; width:100%; aspect-ratio:1/1; border-radius:var(--radius);
+     border:1px solid var(--border); overflow:hidden; padding:0;
+     transition-property:box-shadow,border-color,scale; transition-duration:150ms;
+     transition-timing-function:ease-out }
+.sw:active{ scale:.96 }
+.sw.is-on{ border-color:var(--accent); box-shadow:var(--ring) }
+.sw.is-on::after{ content:''; position:absolute; right:5px; bottom:5px; width:10px; height:10px;
+     border-radius:9999px; background:var(--accent); outline:2px solid var(--surface) }
+/* a palette card shows the skin it would switch you to, not a label */
+.skin-card{ display:flex; flex-direction:column; gap:6px; padding:8px; text-align:left;
+     border:1px solid var(--border); border-radius:var(--radius-lg); background:var(--surface-2);
+     transition-property:border-color,box-shadow,scale; transition-duration:150ms;
+     transition-timing-function:ease-out }
+.skin-card:active{ scale:.96 }
+.skin-card.is-on{ border-color:var(--accent); box-shadow:var(--ring) }
+.skin-strip{ display:flex; height:22px; border-radius:6px; overflow:hidden; border:1px solid var(--border) }
+.skin-strip>span{ flex:1 }
+
+
+
+
+/* ── CUSTOM BUBBLE AND EXTENSIONS ───────────────────────────────────────
+   Both are real elements inside .msg-content rather than pseudo-elements:
+   every design already spends ::before and ::after on its own ornament, and
+   a video cannot be a background-image at any rate.
+
+   The media sits at z-index:-1 inside the bubble's own stacking context, so
+   it paints over the fill and under the text. The wash on top of it is what
+   makes light text readable over a bright photo, and dark text over a dark
+   one - which is why its colour and strength are both the reader's to set. */
+.msg-content > .bub-layer{
+  position:absolute; inset:0; z-index:-1; overflow:hidden;
+  border-radius:inherit; pointer-events:none;
+}
+.bub-layer > img, .bub-layer > video{
+  display:block; width:100%; height:100%;
+  object-fit:var(--bub-fit,cover);
+  opacity:var(--bub-media-op,1);
+  filter:blur(var(--bub-media-blur,0px)) saturate(var(--bub-media-sat,1));
+}
+.bub-layer > .bub-tint{
+  position:absolute; inset:0;
+  background:var(--bub-tint,#000000);
+  opacity:var(--bub-tint-op,0);
+}
+/* a glyph pinned outside the corner, so it never lands on the message */
+.msg-content > .bub-ext{
+  position:absolute; z-index:2; pointer-events:none; line-height:1;
+  font-size:var(--bub-ext-size,20px);
+  filter:drop-shadow(0 1px 2px rgba(0,0,0,.28));
+}
+/* Inside the edge, not over it. Most designs clip their own overflow to keep
+   a texture or a radius honest, and a mark hung outside the box was simply
+   sliced in half by whichever design was in use. */
+.bub-ext[data-corner="tl"]{ top:3px; left:5px }
+.bub-ext[data-corner="tr"]{ top:3px; right:5px }
+.bub-ext[data-corner="bl"]{ bottom:3px; left:5px }
+.bub-ext[data-corner="br"]{ bottom:3px; right:5px }
+
+/* ── BUBBLE TEXT LEGIBILITY ─────────────────────────────────────────────
+   A scenery or pattern fill has dark and light passages, so ink of either
+   polarity meets its opposite somewhere behind the text. A hairline halo in
+   the opposite polarity lifts the glyphs off whatever is behind them.
+
+   Applied only where a design paints an image AND declares no text-shadow of
+   its own, decided per design in dressRow() - a design that already handles
+   its own contrast keeps what it chose. The halo colour follows the ink, so
+   dark text gets a light halo and light text a dark one. */
+[data-bubble] .msg-content[data-halo]{
+  text-shadow:
+    0 0 2px var(--bub-halo),
+    0 0 4px var(--bub-halo),
+    0 1px 1px var(--bub-halo);
+}
+
+/* ── BUBBLE PICKER ──────────────────────────────────────────────────────
+   The cards are a mock, not a live render: the bubble rules are scoped to
+   :root, so nothing inside the page can wear a different bubble than the page
+   itself. Hovering a card puts the real bubble on <html> instead, which
+   previews it on the actual conversation behind the modal - a truer preview
+   than any thumbnail, and it costs one attribute write. */
+.bub-card{ display:flex; flex-direction:column; gap:5px; padding:7px; text-align:left;
+  border:1px solid var(--border); border-radius:var(--radius-lg); background:var(--surface-2);
+  transition-property:border-color,box-shadow,scale; transition-duration:150ms;
+  transition-timing-function:ease-out }
+.bub-card:active{ scale:.96 }
+.bub-card.is-on{ border-color:var(--accent); box-shadow:var(--ring) }
+/* 4 across on a desktop, 3 on a phone: the designs are the point, so they get
+   the space rather than the labels */
+#bub-grid{ display:grid; gap:8px; grid-template-columns:repeat(3,minmax(0,1fr)) }
+@media (min-width:640px){ #bub-grid{ grid-template-columns:repeat(4,minmax(0,1fr)) } }
+
+/* The preview holds REAL .msg-content elements so each card shows its own
+   design, animations and all.
+
+   It is SCALED, not shrunk. Overriding font-size alone leaves every ornament at
+   full size - a design's decoration is written in pixels, and Fluffy Cloud's
+   clouds are 40 and 59px across - so the trimming rounds a bubble a third of
+   the size and swamps the card. Laying the bubbles out at their real size and
+   scaling the whole stage keeps the ornament in proportion to what it
+   decorates, which is what makes a thumbnail the thing rather than a version of
+   it with one measurement changed. */
+.bub-demo{ position:relative; border-radius:8px;
+  background:var(--surface); overflow:hidden; height:62px }
+.bub-demo>.bub-stage{
+  position:absolute; inset:0;
+  display:flex; flex-direction:column; gap:7px; justify-content:center;
+  padding:12px 14px;
+  width:calc(100% / var(--bub-zoom,0.42));
+  height:calc(100% / var(--bub-zoom,0.42));
+  transform:scale(var(--bub-zoom,0.42));
+  transform-origin:top left;
+}
+.bub-demo .msg-content{ font-size:13px; line-height:1.45; padding:7px 12px;
+  /* A real message is around 180px wide, and every ornament is positioned for
+     one - Fluffy Cloud's clouds sit at left:24 and left:50. A two-word demo
+     collapses to 55px and the ornament lands beside the bubble instead of on
+     it, which is what made the preview look broken while the design was fine
+     in use. */
+  min-width:150px; max-width:86%; width:max-content; white-space:nowrap;
+  overflow:hidden; text-overflow:ellipsis; margin:0 }
+.bub-demo .msg-content[data-side="ai"]{ align-self:flex-start }
+.bub-demo .msg-content[data-side="user"]{ align-self:flex-end }
+/* A card previews ITS OWN design, so the user's overrides must not leak in.
+   Setting a custom property to \`initial\` makes it guaranteed-invalid, which
+   sends every var() reading it to the authored fallback. */
+.bub-neutral{
+  --bub-ai-bg:initial; --bub-ai-tx:initial;
+  --bub-user-bg:initial; --bub-user-tx:initial;
+  --bub-sp:initial; --bub-font:initial;
+  --b1:initial;--b2:initial;--b3:initial;--b4:initial;
+  --b5:initial;--b6:initial;--b7:initial;--b8:initial;
+}
+.bub-name{ font-size:10px; font-weight:600; line-height:1.2; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap }
+.bub-cat{ font-size:9px; color:var(--text-dim); line-height:1.2 }
+.chip{ padding:4px 9px; border-radius:9999px; border:1px solid var(--border);
+  font-size:11px; color:var(--text-dim); white-space:nowrap; flex-shrink:0;
+  transition-property:border-color,background-color,color,scale; transition-duration:150ms;
+  transition-timing-function:ease-out }
+.chip:active{ scale:.96 }
+.chip.is-on{ border-color:var(--accent); background:var(--accent-soft); color:var(--text); font-weight:600 }
+
+
+/* ── THEME MOCKUPS ──────────────────────────────────────────────────────
+   A miniature of each layout, built from the same tokens the app uses, so it
+   tracks the palette and the accent instead of going stale the moment either
+   changes. Proportions are the real ones: the sidebar column here is the same
+   fraction of the width that --nav-w is at a typical desktop size. */
+/* Its own ladder, not the app's. --step is a mix toward the text colour, which
+   is the one thing guaranteed to be far from the background in either mode, so
+   a single set of rules reads in both. The app's real surfaces sit within
+   1.02:1 of each other by design; at this size that is one flat block. */
+.tm{
+  --tm-1:color-mix(in oklab, var(--text) 18%, var(--bg));
+  --tm-2:color-mix(in oklab, var(--text) 28%, var(--bg));
+  --tm-3:color-mix(in oklab, var(--text) 40%, var(--bg));
+  --tm-4:color-mix(in oklab, var(--text) 58%, var(--bg));
+  --tm-edge:color-mix(in oklab, var(--text) 34%, transparent);
+  position:relative; display:grid; gap:2px; width:100%; aspect-ratio:16/10;
+  padding:2px; border:1px solid var(--tm-edge); border-radius:6px;
+  background:var(--bg); overflow:hidden;
+}
+.tm>span{ border-radius:3px; min-width:0 }
+.tm-nav,.tm-rail,.tm-panel{ background:var(--tm-3) }
+.tm-list{ background:var(--tm-2); border:1px solid var(--tm-edge) }
+.tm-main{
+  display:flex; flex-direction:column; gap:3px; padding:3px;
+  background:var(--tm-1); min-width:0;
+}
+.tm-bar{ height:9px; flex:none; border-radius:2px; background:var(--tm-3) }
+.tm-msg{ height:8px; flex:none; border-radius:3px }
+.tm-msg.a{ width:56%; align-self:flex-start; background:var(--tm-3);
+           border:1px solid var(--tm-edge) }
+.tm-msg.u{ width:44%; align-self:flex-end; background:var(--accent);
+           background-image:var(--accent-grad,none) }
+.tm-inp{ margin-top:auto; height:11px; flex:none; border-radius:3px;
+         background:var(--tm-2); border:1px solid var(--tm-edge) }
+/* the nav rows, so a sidebar reads as a sidebar and not as a grey block */
+.tm-nav{ display:flex; flex-direction:column; gap:2px; padding:3px }
+.tm-nav>i{ display:block; height:5px; border-radius:2px; background:var(--tm-4) }
+.tm-nav>i:first-child{ background:var(--accent) }
+.tm-rail{ display:flex; flex-direction:column; gap:3px; padding:3px; align-items:center }
+.tm-rail>i{ display:block; width:7px; height:7px; border-radius:2px; background:var(--tm-4) }
+.tm-rail>i:first-child{ background:var(--accent) }
+.tm-list{ display:flex; flex-direction:column; gap:2px; padding:3px }
+.tm-list>i{ display:block; height:6px; border-radius:2px; background:var(--tm-4); opacity:.75 }
+/* Deck floats the card and puts navigation in a dock */
+.tm[data-mock="deck"]{ padding:5px 5px 14px }
+.tm-dock{
+  position:absolute; left:50%; bottom:3px; transform:translateX(-50%);
+  display:flex; gap:2px; padding:2px 3px; border-radius:9999px;
+  background:var(--surface-2); border:1px solid var(--border);
+}
+.tm-dock>i{ display:block; width:5px; height:5px; border-radius:9999px; background:var(--border-strong) }
+.tm-dock>i:first-child{ background:var(--accent) }
+/* Zen hides the chrome; the mockup should too */
+.tm[data-mock="zen"] .tm-bar{ opacity:.35 }
+.tm[data-mock="console"] .tm-main{ gap:2px; padding:2px }
+.tm[data-mock="console"] .tm-msg{ height:6px }
+.tm-band{ height:5px; flex:none; border-radius:2px; background:var(--accent); opacity:.5 }
+/* Ledger and Canvas put a bar across the whole width, so it spans the grid */
+.tm-top{ grid-column:1/-1; height:8px; border-radius:2px; background:var(--surface-2);
+         border:1px solid var(--border) }
+.tm-top.strip{ display:flex; align-items:center; gap:2px; height:10px; padding:0 2px }
+.tm-top.strip>i{ display:block; width:9px; height:4px; border-radius:1px; background:var(--border-strong); opacity:.55 }
+.tm-top.strip>i:first-child{ background:var(--accent); opacity:1 }
+.tm[data-mock="ledger"],.tm[data-mock="canvas"]{ grid-template-rows:auto 1fr }
+.tm[data-mock="canvas"] .tm-main{ grid-column:1/-1 }
+.tm-list.wide>i{ height:8px }
+/* Tiles: gaps on the ground, every region its own panel */
+.tm[data-mock="tiles"]{ gap:3px; padding:3px }
+.tm-nav.tile,.tm-main.tiled{ border:1px solid var(--tm-edge); border-radius:4px }
+.tm-main.tiled{ background:transparent; gap:3px; padding:0; border:0 }
+/* Each tile sits straight on the mockup's ground, so it is the ground it has to
+   read against - not a main panel, which this layout does not have. */
+.tm-main.tiled>span{ border:1px solid var(--tm-edge); background:var(--tm-2) }
+.tm-main.tiled>.tm-msg{ border:0 }
+
+
+/* ── FITTING THE WINDOW ─────────────────────────────────────────────────
+   A grid with no declared rows gets one auto-sized row, and an auto row grows
+   to fit its content. With a long conversation inside, that pushed the
+   composer and the sidebar footer off the bottom of the window on five of the
+   ten layouts.
+
+   Bounding the row stops the growth. min-height:0 is the other half: a flex
+   item refuses to shrink below its own content unless it is told it may, so
+   without it the scrolling message list still forces its parent taller. */
+@media (min-width:768px){
+  :root[data-layout="studio"] #app,
+  :root[data-layout="rail"] #app,
+  :root[data-layout="trio"] #app,
+  :root[data-layout="split"] #app,
+  :root[data-layout="tiles"] #app{
+    grid-template-rows:minmax(0,1fr);
+    height:100%;
+    min-height:0;
+  }
+}
+/* the scroller and everything that has to stay put around it */
+#main-col{ min-height:0 }
+#chat-container{ min-height:0 }
+#composer-dock{ flex:0 0 auto }
+/* the sidebar has the same problem: a long nav list pushed the footer, which
+   is where the account and Log out live, past the bottom edge */
+#left-sidebar{ min-height:0 }
+#left-sidebar>div:first-child{ min-height:0; display:flex; flex-direction:column }
+#main-nav{ min-height:0; overflow-y:auto; overscroll-behavior:contain }
+#nav-footer{ flex:0 0 auto }
+
+
+/* ── DOCK: TASKBAR ──────────────────────────────────────────────────────
+   The second shape the dock can take: a bar across the bottom edge rather
+   than an island floating above it. Squared off, full width, resting on a
+   hairline - the shape a desktop taskbar has, and the one that reads as part
+   of the window rather than on top of it.
+
+   Labels stay open here. A taskbar has room for them, and hiding them behind
+   a hover would be the island's behaviour wearing the wrong shape. */
+@media (min-width:1024px){
+  :root[data-layout="deck"][data-dockstyle="taskbar"] #left-sidebar{
+    left:0; right:0; bottom:0; top:auto;
+    transform:none; width:100%; height:46px;
+    padding:0 10px; gap:2px;
+    border:0; border-top:1px solid var(--border); border-radius:0;
+    background:color-mix(in oklab,var(--surface) 94%,transparent);
+    backdrop-filter:blur(14px);
+    box-shadow:0 -1px 0 color-mix(in oklab,var(--text) 4%,transparent);
+    justify-content:flex-start;
+  }
+  :root[data-layout="deck"][data-dockstyle="taskbar"] .dock-btn{
+    width:auto; max-width:none; height:34px;
+    padding:0 10px 0 8px; border-radius:6px; gap:7px;
+  }
+  /* padding:0 is the point here. The island gives its icons 15px of padding
+     inside a 50px box; shrinking the box to 18px without clearing that leaves
+     a border-box element whose drawing area is zero, and the icon disappears
+     while still taking up space. */
+  :root[data-layout="deck"][data-dockstyle="taskbar"] .dock-btn>i,
+  :root[data-layout="deck"][data-dockstyle="taskbar"] .dock-btn>svg{
+    min-width:18px; width:18px; height:18px; margin:0; padding:0;
+  }
+  :root[data-layout="deck"][data-dockstyle="taskbar"] .dock-btn>span{
+    opacity:1; transform:none; padding:0; font-size:12px;
+  }
+  /* the running-app underline, which is what a taskbar uses instead of a fill */
+  :root[data-layout="deck"][data-dockstyle="taskbar"] .dock-btn.is-active{
+    background:color-mix(in oklab,var(--accent) 14%,transparent);
+    color:var(--text); max-width:none;
+  }
+  :root[data-layout="deck"][data-dockstyle="taskbar"] .dock-btn.is-active::after{
+    content:''; position:absolute; left:8px; right:8px; bottom:0; top:auto;
+    height:2px; width:auto; border-radius:2px; background:var(--accent); opacity:1;
+  }
+  :root[data-layout="deck"][data-dockstyle="taskbar"] #left-sidebar:hover .dock-btn.is-active:not(:hover){
+    max-width:none;
+  }
+  :root[data-layout="deck"][data-dockstyle="taskbar"] #left-sidebar:hover .dock-btn.is-active:not(:hover)>span{ opacity:1 }
+  :root[data-layout="deck"][data-dockstyle="taskbar"] #nav-footer{
+    margin-left:auto; padding-left:8px;
+    border-left:1px solid var(--border);
+  }
+  /* the card sits above the bar rather than clearing a floating island */
+  :root[data-layout="deck"][data-dockstyle="taskbar"] #app{ padding-bottom:58px }
+  :root[data-layout="deck"][data-dockstyle="taskbar"] #toast{ bottom:58px }
+  :root[data-layout="deck"][data-dockstyle="taskbar"] #sketchboard-sidebar{ bottom:46px }
+}
+
+/* ── FRAMED CONVERSATION ────────────────────────────────────────────────
+   Ledger and Tiles used to draw a border around the header, the message list
+   and the composer, which walls the conversation off from the column it sits
+   in and costs a few pixels on every side for nothing. It is a choice now,
+   and the default is to let the conversation fill its space. */
+@media (min-width:1024px){
+  :root[data-layout="ledger"]:not([data-frame="on"]) #chat-header,
+  :root[data-layout="ledger"]:not([data-frame="on"]) #chat-container,
+  :root[data-layout="ledger"]:not([data-frame="on"]) #composer-dock{
+    border-inline:0; border-radius:0;
+  }
+  :root[data-layout="ledger"]:not([data-frame="on"]) #chat-header{ border-top:0 }
+  :root[data-layout="ledger"]:not([data-frame="on"]) #composer-dock{ border-bottom:0; margin-bottom:0 }
+  :root[data-layout="ledger"]:not([data-frame="on"]) #main-col{ padding:0 }
+
+  :root[data-layout="tiles"]:not([data-frame="on"]) #chat-header,
+  :root[data-layout="tiles"]:not([data-frame="on"]) #chat-container,
+  :root[data-layout="tiles"]:not([data-frame="on"]) #composer-dock{
+    border:0; border-radius:0; box-shadow:none;
+  }
+  :root[data-layout="tiles"]:not([data-frame="on"]) #main-col{ gap:0 }
+  :root[data-layout="tiles"]:not([data-frame="on"]) #chat-header{ border-bottom:1px solid var(--border) }
+}
+
+
+/* ── ROOM FOR A BREAKOUT ────────────────────────────────────────────────
+   .msg-row carries content-visibility:auto for scrolling performance, and
+   that brings paint containment with it: the moment a row is off screen and
+   comes back, anything painted outside its padding box is clipped. A sun
+   cresting the top of a bubble, an ear, a paw - all of them live exactly
+   there.
+
+   Padding gives the containment box the room to hold them. The matching
+   negative margin takes the space back out of the layout, so nothing moves.
+   Only rows that are actually wearing a design pay for it. */
+.msg-row[data-bubble]{
+  padding-top:34px;
+  margin-top:-34px;
+  padding-inline:14px;
+  margin-inline:-14px;
+  contain-intrinsic-size:auto 124px;
+}
+
+
+/* ── WHEN A WALLPAPER IS SET ────────────────────────────────────────────
+   #app and #main-col each paint an opaque fill across the whole window, so a
+   wallpaper behind them - picture or video - was covered completely. These
+   soften the two large surfaces, and the chrome around them, so it shows.
+
+   Small surfaces are deliberately left alone. A bubble, an input, a menu keeps
+   its solid fill, because that is what the text is read against; only the big
+   empty areas become glass.
+
+   How much is a setting: --wall-veil is the share of the surface that stays.
+   The Dim slider still governs the picture itself; this governs how much of
+   the app is in front of it. */
+:root[data-wallpaper] #app{ background:transparent }
+
+/* ONE pane, not a stack of bands. Veiling the header, the message list and the
+   composer separately meant three layers of the same fill on top of each other,
+   and every boundary between them showed as a step in opacity - the seams above
+   the composer and under the header. #main-col alone carries the veil now and
+   everything inside it is transparent, so the conversation reads as a single
+   sheet over the wallpaper. --wall-veil is how much of the app stays in front;
+   at 0% the picture is simply there. */
+:root[data-wallpaper] #main-col{
+  background:color-mix(in oklab, var(--surface) var(--wall-veil,0%), transparent);
+}
+:root[data-wallpaper] #chat-container,
+:root[data-wallpaper] #load-more-banner{
+  background:transparent; box-shadow:none;
+}
+/* A scrim, not a panel. The title and the composer chrome are dark text and
+   without something behind them they are invisible over a dark picture - the
+   title measured rgb(22,24,28) on the video. A flat fill is what drew the seams
+   in the first place, so this starts at the window edge and dissolves to
+   nothing across the height of the bar: there is no boundary to see because the
+   gradient never arrives at one. */
+:root[data-wallpaper] #chat-header{
+  background:linear-gradient(to bottom,
+    color-mix(in oklab, var(--surface) 34%, transparent),
+    color-mix(in oklab, var(--surface) 12%, transparent) 60%,
+    transparent);
+  box-shadow:none;
+}
+/* Nothing behind the composer. A scrim here is a pale band straight across the
+   picture, and the input card has its own fill, so the chrome it was meant to
+   support was never actually unsupported. */
+:root[data-wallpaper] #composer-dock{
+  background:transparent;
+  box-shadow:none;
+}
+:root[data-wallpaper] #chat-header{
+  border-bottom-color:transparent;
+  backdrop-filter:none; -webkit-backdrop-filter:none;
+}
+/* the composer's fade strip is a solid --surface gradient; over a wallpaper it
+   is just a bar across the picture */
+:root[data-wallpaper] #composer-dock>div[style*="linear-gradient"]{ background-image:none!important }
+
+/* The nav is its own region and has to stay readable, so it keeps a fill - but
+   only one. #nav-footer was in this list too, painting a second copy of the
+   same colour over the sidebar's, which is what made the account row look like
+   a solid white card sitting in the middle of the glass. */
+:root[data-wallpaper] #left-sidebar,
+:root[data-wallpaper] #session-rail{
+  background:color-mix(in oklab, var(--sidebar-bg) var(--wall-veil,0%), transparent);
+  /* No blur here. These are the two tallest elements on screen, and a
+     backdrop-filter on something this size over a playing video is what Chrome
+     splits into tiles - the seam down the sidebar, shimmering as each frame
+     recomposites. Blurring is what liquid glass is for, so it lives in the
+     glass rules and nowhere else; with glass off these keep their fill and stop
+     touching the backdrop at all. */
+}
+:root[data-wallpaper] #nav-footer,
+:root[data-wallpaper] #main-nav,
+:root[data-wallpaper] #left-sidebar>div{ background:transparent }
+:root[data-wallpaper] #nav-footer{ border-top-color:color-mix(in oklab,var(--border) 55%,transparent) }
+
+/* Deck floats its nav already; it only needs to stop being opaque. */
+:root[data-wallpaper][data-layout="deck"] #left-sidebar{
+  background:color-mix(in oklab, var(--surface) var(--wall-veil,0%), transparent);
+}
+
+/* No legibility rule for the messages themselves on purpose: a message always
+   paints its own opaque fill - the surface for theirs, the accent for yours, or
+   whatever a design specifies - so the text never lands on the wallpaper,
+   whatever the veil is set to. */
+
+/* ── LIQUID GLASS ───────────────────────────────────────────────────────
+   The reference builds a signed-distance field per element, derives surface
+   normals, refracts through them by Snell's law and feeds the result to
+   feDisplacementMap as a canvas-generated displacement image. That is the
+   right way to get true refraction, and it re-runs whenever the backdrop
+   repaints - affordable for a page with a dozen panels, not for a
+   conversation with hundreds of bubbles on a playing video.
+
+   What survives that trade is the part the eye actually reads as glass, and
+   it costs one composited layer: a blurred and saturated backdrop, a thin
+   tint over it, a bright rim along the top edge where light would catch, and
+   a darker one along the bottom where it falls away. */
+:root[data-glass="on"]{
+  /* Half a pixel by default. The refraction is the whole point and a real blur
+     erases it, so this is only here to take the hard edge off the bent image -
+     but how much frost you want is a preference, so it is settable. */
+  --glass-blur:0.5px;
+  --glass-sat:1.4;
+  /* thin: chrome, where there is nothing to read but labels */
+  /* of --glass-base, not --surface: see glassBase(). The fallback keeps this
+     sane for the moment before the first measurement lands. */
+  --glass-fill:color-mix(in oklab, var(--glass-base, var(--surface)) 15%, transparent);
+  --glass-nav:color-mix(in oklab, var(--glass-base-nav, var(--sidebar-bg)) 15%, transparent);
+  /* thicker: surfaces carrying words. The bevel is only the outer ~30px, so
+     the refraction still happens at the rim - filling the middle costs it
+     nothing and gives the text a ground. */
+  --glass-read:color-mix(in oklab, var(--glass-base, var(--surface)) 64%, transparent);
+  --glass-rim:rgba(255,255,255,.6);
+  --glass-under:rgba(255,255,255,.14);
+  --glass-hair:rgba(255,255,255,.26);
+  --glass-drop:0 8px 30px rgba(0,0,0,.16), 0 1px 2px rgba(0,0,0,.08);
+}
+:root[data-glass="on"].dark{
+  --glass-fill:color-mix(in oklab, var(--glass-base, var(--surface)) 14%, transparent);
+  --glass-nav:color-mix(in oklab, var(--glass-base-nav, var(--sidebar-bg)) 14%, transparent);
+  --glass-read:color-mix(in oklab, var(--glass-base, var(--surface)) 58%, transparent);
+  --glass-rim:rgba(255,255,255,.28);
+  --glass-under:rgba(255,255,255,.06);
+  --glass-hair:rgba(255,255,255,.13);
+  --glass-drop:0 10px 34px rgba(0,0,0,.5), 0 1px 2px rgba(0,0,0,.34);
+}
+/* A 30% tint is not enough to read small dark labels against a photograph, and
+   thickening it would put the frost back. A shadow costs the glass nothing and
+   is what the reference does with its own text. */
+:root[data-glass="on"] #left-sidebar,
+:root[data-glass="on"] #chat-header,
+:root[data-glass="on"] #session-rail,
+:root[data-glass="on"] #sketchboard-sidebar,
+:root[data-glass="on"] .msg-row:not([data-bubble]) .msg-content{
+  text-shadow:0 0 1px color-mix(in oklab, var(--bg) 96%, transparent),
+              0 0 3px color-mix(in oklab, var(--bg) 92%, transparent),
+              0 0 7px color-mix(in oklab, var(--bg) 78%, transparent),
+              0 1px 2px color-mix(in oklab, var(--bg) 88%, transparent);
+}
+/* your own messages are white on the accent, so their shadow has to be dark
+   whatever the theme is doing */
+:root[data-glass="on"] .msg-row:not([data-bubble]) .msg-content[data-side="user"]{
+  text-shadow:0 1px 10px rgba(0,0,0,.45), 0 0 2px rgba(0,0,0,.35);
+}
+/* the one recipe, shared */
+:root[data-glass="on"] #chat-header,
+:root[data-glass="on"] #composer-shell>div,
+:root[data-glass="on"] #sketchboard-sidebar,
+:root[data-glass="on"] #left-sidebar,
+:root[data-glass="on"] #session-rail,
+:root[data-glass="on"] #send-btn,
+:root[data-glass="on"] #scroll-btn{
+  backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));
+  -webkit-backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));
+  background:var(--glass-fill);
+  box-shadow:inset 0 1px 0 var(--glass-rim),
+             inset 0 -1px 0 var(--glass-under),
+             inset 0 0 0 1px var(--glass-hair),
+             var(--glass-drop);
+  border-color:transparent;
+}
+:root[data-glass="on"] #left-sidebar,
+:root[data-glass="on"] #session-rail,
+:root[data-glass="on"] #sketchboard-sidebar{ background:var(--glass-nav) }
+/* the two you read from */
+:root[data-glass="on"] .msg-row:not([data-bubble]) .msg-content,
+:root[data-glass="on"] #composer-shell>div{ background:var(--glass-read) }
+/* The message bubble has the recipe but not the drop shadow. --glass-drop is
+   34px at half opacity: behind a panel that is what lifts it off the page,
+   behind a bubble sitting on a photograph it is a dark smear across whatever
+   the picture was doing there, and the backdrop blur underneath compounds it.
+   A bubble was never floating above anything - it reads as its own object from
+   its shape. The rim stays, because that is the part that says glass. */
+:root[data-glass="on"] .msg-row:not([data-bubble]) .msg-content{
+  backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));
+  -webkit-backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));
+  box-shadow:inset 0 1px 0 var(--glass-rim),
+             inset 0 0 0 1px var(--glass-hair);
+  border-color:transparent;
+}
+/* and a bubble wearing a design keeps the design's own depth, minus nothing */
+/* Your own messages keep their accent. The neutral fill above outranks the
+   bg-accent class they carry, and with text-onaccent still white that left
+   white text on white glass - the two sides became one. */
+:root[data-glass="on"] .msg-row:not([data-bubble]) .msg-content[data-side="user"]{
+  background:color-mix(in oklab, var(--accent) 76%, transparent);
+}
+/* a button keeps its accent; glass only softens and lights the edge */
+:root[data-glass="on"] #send-btn,
+:root[data-glass="on"] #scroll-btn{
+  background:color-mix(in oklab, var(--accent) 78%, transparent);
+}
+:root[data-glass="on"] .dock-btn:hover,
+:root[data-glass="on"] .dock-btn.is-active{
+  background:color-mix(in oklab, var(--accent) 26%, transparent);
+}
+/* A bubble wearing a design gets the blur and nothing else. Its surface and
+   its depth are the design's to decide, and glass has no business repainting
+   them - the fill above is for a bubble that has no design of its own. */
+:root[data-glass="on"] .msg-row[data-bubble] .msg-content{
+  backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));
+  -webkit-backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));
+}
+:root[data-glass="on"] #chat-header{ border-bottom-color:transparent }
+
+/* ── GLASS: BUTTONS AND THE SKETCHBOARD ─────────────────────────────────
+   A flat accent pill sitting next to a bubble that refracts its backdrop is
+   what gives the whole material away, so the buttons are glass as well: the
+   accent thinned enough to see through, the same rim, and - because they are
+   in the engine's selector list - the same refracted edge rather than a
+   translucent fill doing an impression of one. */
+
+/* ── THE PILLS INSIDE THE DOCK ──────────────────────────────────────────
+   No backdrop-filter of their own. The bar they sit in already has one, and
+   nesting them means the inner filter blurs an already-blurred backdrop -
+   which Chrome bands along the layer boundaries, and that banding is the
+   striping across the dock. A pill on frosted glass wants a tint on top of
+   the frost, not a second helping of it. */
+:root[data-glass="on"] .dock-btn:hover,
+:root[data-glass="on"] .dock-btn.is-active{
+  background:color-mix(in oklab, var(--text) 12%, transparent);
+  box-shadow:inset 0 1px 0 var(--glass-rim), inset 0 0 0 1px var(--glass-hair);
+  border-color:transparent;
+}
+/* Whatever is currently open. Same reasoning as the accent pill: the ink the
+   colour engine fitted to a solid accent is not the ink for a thinned one, and
+   this is the rule that dresses the button you just touched. */
+:root[data-glass="on"] .dock-btn.is-active{
+  background:color-mix(in oklab, var(--accent) 72%, transparent);
+  color:var(--glass-accent-ink, var(--accent-text));
+}
+
+/* The pill clips its own label while the width animates. Without this the
+   label is painted by a layer that has not been re-clipped yet, and it shows
+   outside the pill for a frame or two - the ghosting in the dock. */
+:root[data-layout="deck"] .dock-btn{ contain:paint }
+
+:root[data-glass="on"] #think-btn{
+  backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));
+  -webkit-backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));
+  background:color-mix(in oklab, var(--surface) 22%, transparent);
+  box-shadow:inset 0 1px 0 var(--glass-rim), inset 0 0 0 1px var(--glass-hair);
+  border-color:transparent;
+}
+/* Whatever is currently open, and anything that carries the accent.
+
+   88%, not 58%. The label on these is text-onaccent - the ink the colour engine
+   fitted against the accent at full strength - and thinning the accent moves
+   the surface out from under that decision. In dark mode the fitted ink is
+   near-black, because this accent is light; composite it at 58% over a dark bar
+   and the ink is left on something far too dark for it. Measured: rgb(10,10,10)
+   on the Current Chat pill while every other label was rgb(242,245,250).
+
+   The right ink cannot be worked out here - part of what it sits on is a
+   wallpaper no computed style can report - so the fill stays close enough to
+   the accent for the ink already fitted to it to remain true. The blur, the rim
+   and the refracted edge are all still there. */
+:root[data-glass="on"] #main-nav .dock-btn.bg-accent,
+:root[data-glass="on"] #nav-footer .dock-btn.bg-accent,
+:root[data-glass="on"] #sketchboard-sidebar button.bg-accent,
+:root[data-glass="on"] #send-btn,
+:root[data-glass="on"] #scroll-btn{
+  background:color-mix(in oklab, var(--accent) 72%, transparent);
+  /* not text-onaccent: that ink was fitted to the accent at full strength, and
+     this is not that surface. See glassAccentInk(). */
+  color:var(--glass-accent-ink, var(--accent-text));
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.45),
+             inset 0 0 0 1px rgba(255,255,255,.28),
+             var(--glass-drop);
+}
+
+/* The sketchboard's title bar and its fields had no fill of their own, so the
+   wallpaper came through them unbroken - a header you cannot read. They are the
+   thicker glass, like the message bubbles, for the same reason. */
+:root[data-glass="on"] #sketchboard-sidebar>div:first-child{
+  background:color-mix(in oklab, var(--sidebar-bg) 82%, transparent);
+  backdrop-filter:blur(10px) saturate(var(--glass-sat));
+  -webkit-backdrop-filter:blur(10px) saturate(var(--glass-sat));
+  border-bottom-color:var(--border);
+  box-shadow:inset 0 -1px 0 var(--glass-under);
+}
+:root[data-glass="on"] #new-pin-input,
+:root[data-glass="on"] #sketchboard-sidebar .rs-search,
+:root[data-glass="on"] #sketchboard-sidebar input[type="text"]{
+  background:color-mix(in oklab, var(--surface) 84%, transparent);
+  border-color:var(--border);
+  color:var(--text);
+}
+
+/* The bar itself is a scrim that fades to nothing, which is right for a bar and
+   useless for the words on it - the persona name, the session line and the
+   Sketchboard pill were left sitting on the wallpaper. The text gets a chip;
+   the bar stays open. */
+:root[data-wallpaper] #header-persona-btn,
+:root[data-wallpaper] #chat-header>button:last-of-type{
+  /* No backdrop-filter on a chip this size. It samples a strip a few pixels
+     wide, which is not glass by any useful definition, and each one is another
+     composited layer whose edges can show. A slightly heavier fill says the
+     same thing for nothing. */
+  background:color-mix(in oklab, var(--surface) 76%, transparent);
+  box-shadow:inset 0 0 0 1px color-mix(in oklab, var(--border) 70%, transparent);
+}
+:root[data-wallpaper] #header-persona-btn{ border-radius:12px }
+
+/* The nav has no fill of its own to speak of now, so its labels are read
+   against the wallpaper. This is the same shadow the header gets under glass,
+   applied whenever there is a picture back there at all. */
+:root[data-wallpaper] #left-sidebar,
+:root[data-wallpaper] #session-rail{
+  text-shadow:0 0 1px color-mix(in oklab, var(--bg) 96%, transparent),
+              0 0 3px color-mix(in oklab, var(--bg) 92%, transparent),
+              0 0 7px color-mix(in oklab, var(--bg) 78%, transparent),
+              0 1px 2px color-mix(in oklab, var(--bg) 88%, transparent);
+}
+
+/* The composer's placeholder is Tailwind's gray-400, picked against an opaque
+   white card. Over glass it is barely there, and neither is what you type. */
+:root[data-glass="on"] #chat-input,
+:root[data-wallpaper] #chat-input{ color:var(--text) }
+:root[data-glass="on"] #chat-input::placeholder,
+:root[data-wallpaper] #chat-input::placeholder{
+  color:color-mix(in oklab, var(--text) 62%, transparent);
+  opacity:1;
+}
+:root[data-glass="on"] #composer-shell>div{ color:var(--text) }
+
+/* ── GLASS: THE FLOATING SURFACES ───────────────────────────────────────
+   A menu, a modal, a popover and the toast sit on top of everything, so they
+   are where glass reads strongest - and they were the ones still painting
+   flat. */
+:root[data-glass="on"] #global-dropdown,
+:root[data-glass="on"] #think-picker,
+:root[data-glass="on"] .modal-content,
+:root[data-glass="on"] #toast{
+  backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));
+  -webkit-backdrop-filter:blur(var(--glass-blur)) saturate(var(--glass-sat));
+  background:var(--glass-fill);
+  box-shadow:inset 0 1px 0 var(--glass-rim),
+             inset 0 0 0 1px var(--glass-hair),
+             var(--glass-drop);
+  border-color:transparent;
+}
+/* A menu is a panel, not chrome. Thinned to the header's fill it does show the
+   refraction beautifully and its coloured rows - the destructive ones, which
+   are the ones you least want to misread - stop being legible against a
+   photograph. A bar carrying two short labels can afford that; a list of
+   commands cannot. So this keeps the fill the bubbles use, and the header and
+   the sidebar stay thin. */
+:root[data-glass="on"] #global-dropdown,
+:root[data-glass="on"] #think-picker{
+  background:var(--glass-read);
+}
+/* a row you are pointing at should still separate from the rest */
+:root[data-glass="on"] #global-dropdown button:hover,
+:root[data-glass="on"] #think-picker button:hover{
+  background:color-mix(in oklab, var(--text) 14%, transparent);
+}
+/* the toast is an accent chip, not a panel */
+:root[data-glass="on"] #toast{
+  background:color-mix(in oklab, var(--accent) 74%, transparent);
+}
+/* A field is where you read back what you typed, so it cannot be a window.
+   Every input in a modal is bg-transparent, which is right on an opaque card
+   and wrong the moment the card is glass: the conversation behind it shows
+   straight through the box, and the two-factor form ended up with message
+   bubbles legible inside the username field. */
+:root[data-glass="on"] .modal-content input:not([type="range"]):not([type="checkbox"]):not([type="radio"]),
+:root[data-glass="on"] .modal-content textarea,
+:root[data-glass="on"] .modal-content select,
+:root[data-wallpaper] .modal-content input:not([type="range"]):not([type="checkbox"]):not([type="radio"]),
+:root[data-wallpaper] .modal-content textarea,
+:root[data-wallpaper] .modal-content select{
+  background:var(--surface-2);
+  border-color:var(--border);
+}
+
+/* The modals stay thicker, and it is not an oversight. A menu is six words per
+   row; a settings panel is forms, labels, inputs and paragraphs, and one you
+   have to squint through is not a better settings panel. */
+:root[data-glass="on"] .modal-content{
+  background:color-mix(in oklab, var(--glass-base, var(--surface)) 78%, transparent);
+}
+
+/* ── THE MESSAGE MENU BUTTON ────────────────────────────────────────────
+   Three dark dots and nothing behind them. On an opaque page that reads fine;
+   over a wallpaper they land on whatever the picture happens to be doing there
+   and disappear. A round chip is enough - and being in the engine's selector
+   list, its edge refracts like everything else. */
+:root[data-wallpaper] .msg-more,
+:root[data-glass="on"] .msg-more{
+  /* one of these per message, at 24px each - a fill, not a filter */
+  background:color-mix(in oklab, var(--surface) 82%, transparent);
+  box-shadow:inset 0 0 0 1px color-mix(in oklab, var(--border) 60%, transparent),
+             0 2px 8px rgba(0,0,0,.14);
+  color:var(--text);
+}
+/* it only appears on hover, so it may as well answer when pointed at */
+:root[data-wallpaper] .msg-more:hover,
+:root[data-glass="on"] .msg-more:hover{
+  background:color-mix(in oklab, var(--surface) 88%, transparent);
+}
+
+/* ── THE MESSAGES PASS UNDER THE HEADER ─────────────────────────────────
+   #chat-container is the scroller, and it began below the header, so its own
+   overflow clipped every message dead level with the header's bottom edge -
+   a straight cut, with nothing ever reaching the glass to be refracted by it.
+
+   Pulling the scroller up behind the header and padding its content back down
+   by the same amount leaves the layout exactly where it was and lets a message
+   scroll underneath, where the header's backdrop-filter bends it like it bends
+   everything else.
+
+   Not for the layouts that place the header with grid-area: there the header is
+   not a flex sibling of the scroller and a negative margin means something else
+   entirely. */
+:root[data-wallpaper]:not([data-layout="console"]):not([data-layout="ledger"]):not([data-layout="canvas"]) #chat-container{
+  margin-top:calc(0px - var(--hdr-h));
+  padding-top:var(--hdr-h);
+  scroll-padding-top:var(--hdr-h);
+}
+/* Measured, not assumed - see watchHeaderHeight(). 4rem is only what it is
+   before the first measurement lands. */
+:root{ --hdr-h:4rem }
+
+/* ── CONSOLE: THE PERSONA CHIP IN A 44px BAR ────────────────────────────
+   Console draws a 44px bar and the chip is a 32px avatar stacked over two
+   lines of text, which wants about 48. Something has to give, and in a bar
+   this dense it is the session line - the name is what you actually read. */
+:root[data-layout="console"] #header-persona-btn{ padding-block:2px }
+:root[data-layout="console"] #header-persona-btn>div:last-child>div{ display:none }
+:root[data-layout="console"] #header-avatar{ width:24px; height:24px }
+:root[data-layout="console"] #chat-header{ overflow:hidden }
+
+/* ── ZEN: A HEADER YOU CAN SEE ──────────────────────────────────────────
+   Zen fades its bar to .55 and brings it back on hover. Against a plain
+   background that is a nice piece of restraint. Over a wallpaper it is dark
+   text at half strength on a photograph, which is not restraint, it is
+   invisible - and you cannot hover something you cannot find. */
+:root[data-layout="zen"] #chat-header{ opacity:1 }
+
+/* ── THE CORNERS THE THEME ASKED FOR ────────────────────────────────────
+   Corners is a theme option, and two things were ignoring it: the header,
+   which had no radius at all, and the persona list, which is a fixed 8px. At
+   Round or Pill everything else curves and those two stay square. */
+:root[data-wallpaper] #chat-header,
+:root[data-glass="on"] #chat-header{
+  border-radius:calc(var(--radius) * 1.2);
+}
+#global-dropdown{ border-radius:calc(var(--radius) * 1.2) }
+#global-dropdown button:first-child{ border-top-left-radius:var(--radius); border-top-right-radius:var(--radius) }
+#global-dropdown button:last-child{ border-bottom-left-radius:var(--radius); border-bottom-right-radius:var(--radius) }
+
+/* ── NO SHADOW BEHIND THE COMPOSER ──────────────────────────────────────
+   It reads as a card lifted off the page, which is the one thing the composer
+   is not: it is part of the frame. */
+#composer-shell>div{ box-shadow:none }
+:root[data-glass="on"] #composer-shell>div{
+  box-shadow:inset 0 1px 0 var(--glass-rim), inset 0 0 0 1px var(--glass-hair);
+}
+
+/* ── THE CONVERSATION LIST ──────────────────────────────────────────────
+   Hidden by default and revealed only by the two layouts that reserve a
+   column for it. Everywhere else the same conversations are one click away in
+   Manage Sessions, and a third column on a layout that did not plan for one
+   would be worse than no column at all. */
+#session-rail{ display:none }
+@media (min-width:1024px){
+  :root[data-layout="rail"] #session-rail,
+  :root[data-layout="trio"] #session-rail,
+  :root[data-layout="split"] #session-rail{ display:flex }
+}
+/* Trio hides the rail's own header because its nav column already carries the
+   brand bar; Rail keeps it, because at 64px its nav has room for nothing. */
+:root[data-layout="rail"] #session-rail>header{ background:var(--surface-2) }
+
+/* ── THE COLUMN, AND WHAT IT DOES ───────────────────────────────────────
+   One width for the chat list, a wider one for a docked panel, and zero when
+   the conversation is asked for on its own. grid-template-columns animates, so
+   a single transition on #app moves the whole layout and nothing has to be
+   choreographed element by element. */
+@media (min-width:1024px){
+  :root[data-layout="rail"]{ --rail-w:264px }
+  :root[data-layout="trio"]{ --rail-w:312px }
+  :root[data-layout="split"]{ --rail-w:340px }
+  :root[data-layout="rail"][data-rail="panel"],
+  :root[data-layout="trio"][data-rail="panel"],
+  :root[data-layout="split"][data-rail="panel"]{ --rail-w:min(460px, 40vw) }
+  :root[data-layout="rail"][data-rail="off"],
+  :root[data-layout="trio"][data-rail="off"],
+  :root[data-layout="split"][data-rail="off"]{ --rail-w:0px }
+
+  :root[data-layout="split"] #session-rail{ overflow:hidden }
+  :root[data-layout="split"] #chat-container{
+    transition:padding .42s cubic-bezier(.2,0,0,1);
+  }
+  :root[data-layout="split"][data-rail="off"] #chat-container{
+    padding-inline:max(2rem, calc((100% - 50rem) / 2));
+  }
+
+  /* The grids themselves are declared once, with the layouts - see
+     --rail-w there. Only the widths it takes live here.
+     So the contents clip rather than squeeze while the column closes: */
+  :root[data-layout="rail"] #session-rail,
+  :root[data-layout="trio"] #session-rail{ overflow:hidden }
+  :root[data-rail="off"] #session-rail{ border-right-width:0 }
+
+  /* With the column gone the conversation has the whole width, which is more
+     than a line of text should ever be. It settles in the middle instead. */
+  :root[data-layout="rail"] #chat-container,
+  :root[data-layout="trio"] #chat-container{
+    transition:padding .42s cubic-bezier(.2,0,0,1);
+  }
+  :root[data-layout="rail"][data-rail="off"] #chat-container,
+  :root[data-layout="trio"][data-rail="off"] #chat-container{
+    padding-inline:max(2rem, calc((100% - 50rem) / 2));
+  }
+}
+@media (prefers-reduced-motion: reduce){
+  :root[data-layout="rail"] #app, :root[data-layout="trio"] #app,
+  :root[data-layout="split"] #app,
+  :root[data-layout="rail"] #chat-container, :root[data-layout="trio"] #chat-container,
+  :root[data-layout="split"] #chat-container{
+    transition:none;
+  }
+}
+
+/* A panel that has been moved into the column is not a floating card any more:
+   no width of its own, no radius, no shadow, no height cap. Addressed through
+   #rail-panel so it outranks the utility classes still on the element without
+   a pile of !important. */
+#rail-panel{ overflow:hidden }
+#rail-panel > .modal-content{
+  position:static; width:100%; max-width:none; height:100%; max-height:none;
+  margin:0; border:0; border-radius:0; box-shadow:none; background:transparent;
+  /* Not a flex column: several of these panels have their own scroll container
+     inside and several do not, and flex sizing them uniformly gets one group or
+     the other wrong. Scrolling the panel itself is right for all of them, and
+     it is what puts a save button that sits at the very bottom back within
+     reach. */
+  display:block; overflow-y:auto; overscroll-behavior:contain;
+}
+#rail-panel > .modal-content > div:first-child{
+  /* the panel's own title row lines up with the chat header beside it, and
+     stays there while the rest scrolls - in a column this narrow it is the only
+     thing saying which panel you are in */
+  position:sticky; top:0; z-index:2;
+  min-height:4rem;
+  background:color-mix(in oklab, var(--sidebar-bg) 92%, transparent);
+  backdrop-filter:blur(10px);
+  -webkit-backdrop-filter:blur(10px);
+}
+/* Any scroll container the panel brought with it stops being one: with the
+   panel itself scrolling, a nested scroller just traps the wheel halfway down. */
+#rail-panel > .modal-content .overflow-y-auto{
+  overflow:visible; max-height:none;
+}
+/* The footer bar. In a modal it marks where the panel ends and the page
+   resumes; in a column nothing resumes, so it is a tinted strip under something
+   that already finished. The buttons keep their spacing, the bar does not. */
+#rail-panel > .modal-content > div:last-child{
+  background:transparent; border-top:0;
+}
+
+/* ── HOW SOLID THE DEFAULT BUBBLE IS ────────────────────────────────────
+   A bubble with no design takes its fill from a utility class, so there is no
+   colour token to put an alpha on the way a design's fill has. The fill is
+   restated here instead, at whatever the slider asked for.
+
+   Written to outrank the glass recipe, which also sets a background on this
+   element - and deliberately not touching backdrop-filter, so a translucent
+   bubble is still glass, just more of it. */
+:root[data-plainalpha] .msg-row:not([data-bubble]) .msg-content{
+  background:color-mix(in oklab, var(--glass-base, var(--surface)) var(--bub-plain,100%), transparent);
+}
+:root[data-plainalpha] .msg-row:not([data-bubble]) .msg-content[data-side="user"]{
+  background:color-mix(in oklab, var(--accent) var(--bub-plain,100%), transparent);
+}
+
+/* ── NO SHADOW ON A MESSAGE ─────────────────────────────────────────────
+   126 of the 240 designs declare their own outer box-shadow. Removing it from
+   the plain bubble and leaving the designs to theirs is why it kept coming
+   back: for most of the catalogue nothing had changed.
+
+   !important because a design's own rules can outrank anything written here,
+   and this has to hold for all of them rather than for whichever ones lose a
+   specificity contest.
+
+   filter is left alone on purpose: several designs build their shape out of
+   drop-shadow() - the paw's rim, the cloud's edge - and stripping that would
+   take the drawing with it. */
+#chat-container .msg-content{ box-shadow:none !important }
+/* glass keeps its rim, which is an inset and not a shadow cast on anything */
+:root[data-glass="on"] #chat-container .msg-content{
+  box-shadow:inset 0 1px 0 var(--glass-rim, transparent),
+             inset 0 0 0 1px var(--glass-hair, transparent) !important;
+}
+
+/* ── WITHOUT LIQUID GLASS ───────────────────────────────────────────────
+   Glass earns its transparency with a blur: there is something happening
+   between you and the wallpaper, so a thin surface still reads as a surface.
+   Turn it off and a thin surface is just a hole. Measured with the wallpaper
+   on and glass off, the header and the sidebar were both at alpha 0 while the
+   menus were at 0.72 - the quiet backdrops invisible and the readable panels
+   nearly solid, which is backwards.
+
+   So the chrome gets a floor it cannot go below, and the menus get a fill that
+   still lets the picture show. The header and the sidebar share one number
+   because they were deliberately put in step with each other.
+
+   And no backdrop-filter in here. Blurring is the thing that was switched off,
+   and on areas this size over a playing video it is what Chrome splits into
+   tiles - which is the vertical seam, and the shimmer along it as every frame
+   recomposites. A surface reads as a surface here because it is opaque enough
+   to, not because something is happening behind it. */
+:root[data-wallpaper]:not([data-glass="on"]) #chat-header{
+  background:color-mix(in oklab, var(--glass-base, var(--surface)) var(--chrome-veil,62%), transparent);
+}
+:root[data-wallpaper]:not([data-glass="on"]) #left-sidebar,
+:root[data-wallpaper]:not([data-glass="on"]) #session-rail{
+  background:color-mix(in oklab, var(--glass-base-nav, var(--sidebar-bg)) var(--chrome-veil,62%), transparent);
+}
+/* A menu is a list you read off, so it keeps more than the chrome does - but
+   not so much that the wallpaper stops existing behind it. */
+:root[data-wallpaper]:not([data-glass="on"]) #global-dropdown,
+:root[data-wallpaper]:not([data-glass="on"]) #think-picker{
+  background:color-mix(in oklab, var(--glass-base, var(--surface)) 94%, transparent);
+}
+@media (prefers-reduced-transparency: reduce){
+  :root[data-glass="on"]{ --glass-blur:0px; --glass-sat:1;
+    --glass-fill:var(--surface); --glass-nav:var(--sidebar-bg); }
+}
+
+/* ── UI ZOOM ────────────────────────────────────────────────────────────
+   Tailwind's spacing and type scales are rem-based, so moving the root font
+   size scales padding, gaps, type and radii together. Widths declared in px
+   are converted to rem below so they come along too.
+   The floor exists because #chat-input carries text-base md:text-sm
+   specifically to stay >=16px on phones - below that iOS Safari zooms the
+   page on focus - so the scale is never allowed to shrink it under 16px. */
+:root{ --ui-scale:1; }
+/* The sketchboard drawer parks itself one width off the right edge, and it is
+   position:absolute, so it extends the document box and the whole page can be
+   dragged 320px sideways into nothing. body already hides its own overflow;
+   the root did not. Using clip rather than hidden keeps the root from becoming a
+   scroll container, which would break position:fixed children. */
+html{ overflow-x:clip }
+html{ font-size:calc(16px * var(--ui-scale)) }
+@media (max-width:767px){
+  /* keep the composer at a real 16px no matter how far the user zooms out */
+  #chat-input,#new-pin-input{ font-size:max(16px, 1rem) }
+}
+`;
+}
+
+// ── HTML PAGES ──────────────────────────────────────────────────────────────────────
 
 // Full application injected safely to prevent templating string collisions.
 function getAppHTML() {
   return `<!DOCTYPE html>
 <html lang="en" class="light">
 <head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
+<script>
+/* Runs before <body> exists, so the chosen theme is on <html> before the
+   first paint and there is no flash of the default one. The shell itself is
+   byte-identical for everyone (it is ETag-cached), which is exactly why this
+   has to happen on the client. */
+window.APP_V='${APP_BUILD}';
+(function(){
+  try{
+    var d=document.documentElement, g=function(k,f){
+      var m=document.cookie.match(new RegExp('(?:^|; )'+k+'=([^;]*)'));
+      return m?decodeURIComponent(m[1]):(localStorage.getItem(k)||f);
+    };
+    d.dataset.skin    = g('rp_skin','graphite');
+    d.dataset.layout  = g('rp_layout','studio');
+    d.dataset.density = g('rp_density','comfortable');
+    if(g('aiphp_theme','light')==='dark') d.classList.add('dark');
+    var u=localStorage.getItem('rp_ui');
+    if(u){ u=JSON.parse(u); var s=d.style;
+      /* what was in effect last time, flattened by the app on every change */
+      if(u.boot) u=Object.assign({}, u, u.boot);
+      if(u.font)      s.setProperty('--font-user', u.font);
+      if(u.cursor)    s.setProperty('--cursor', 'url('+u.cursor+') '+(u.cursorHot||'0 0')+', auto');
+      if(u.cursorPtr) s.setProperty('--cursor-pointer', 'url('+u.cursorPtr+') '+(u.cursorPtrHot||'0 0')+', pointer');
+      if(u.glass) d.dataset.glass='on';
+      if(u.glassBlur!=null) s.setProperty('--glass-blur', u.glassBlur+'px');
+      if(u.bg){
+        d.dataset.wallpaper='1';
+        var _ve = (u.bgVeil==null?100:u.bgVeil);
+        s.setProperty('--wall-veil', (100-_ve)+'%');
+        s.setProperty('--chrome-veil', Math.max(62,100-_ve)+'%');
+        /* a video is an element, not a background-image; setting one here just
+           issues a request that can never decode */
+        if(u.bgKind!=='video') s.setProperty('--bg-user', 'url("'+u.bg+'")');
+      }
+      if(u.bgOpacity!=null) s.setProperty('--bg-user-opacity', u.bgOpacity);
+      if(u.bgBlur!=null)    s.setProperty('--bg-user-blur', u.bgBlur+'px');
+      if(u.bgBlur > 0)      s.setProperty('--bg-user-filter', 'blur('+u.bgBlur+'px)');
+      /* The colour engine's own output, cached per skin+mode when it last ran.
+         Replaying it here means a custom palette is on screen at first paint
+         instead of appearing a frame after the script loads. A miss is safe:
+         the engine re-derives and refills the cache once the app boots. */
+      var ck=u.colourCache && u.colourCache[d.dataset.skin+'|'+(d.classList.contains('dark')?'dark':'light')];
+      if(ck) for(var k in ck){ if(ck[k] && ck[k]!=='none') s.setProperty(k, ck[k]); }
+      /* The bubble stylesheet is a separate asset, so it has to be requested
+         here rather than after the app script runs - a <link> added in <head>
+         blocks rendering until it arrives, which is exactly what stops a flash
+         of the default bubble. */
+      /* The id lives on each message row now, and rows do not exist yet.
+         Only the stylesheet is worth requesting this early: a <link> in <head>
+         blocks rendering until it lands, which is what stops the first painted
+         message wearing the default bubble. */
+      var anyBub=u.bubble && (u.bubble.id || (u.bubble.ai&&u.bubble.ai.id) || (u.bubble.user&&u.bubble.user.id));
+      if(anyBub){
+        var lk=document.createElement('link');
+        lk.id='bubble-sheet'; lk.rel='stylesheet';
+        lk.href='?action=asset&f=bubbles.css&v='+window.APP_V;
+        document.head.appendChild(lk);
+        var bf=(u.bubble.ai&&u.bubble.ai.fontName)||u.bubble.fontName;
+        if(bf){
+          var fl=document.createElement('link'); fl.rel='stylesheet'; fl.dataset.bubfont='1';
+          fl.href='https://fonts.googleapis.com/css2?family='+encodeURIComponent(bf).replace(/%20/g,'+')+':wght@400;500;600;700&display=swap';
+          document.head.appendChild(fl);
+        }
+      }
+    }
+  }catch(e){}
+})();
+</script>
+<link rel="stylesheet" href="?action=asset&f=theme.css&v=${APP_BUILD}">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
 <title>RSROLEPLAY Engine</title>
-<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="?action=asset&f=tailwind.css&v=${APP_BUILD}">
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-<script src="https://unpkg.com/lucide@latest"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
-<script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/marked-katex-extension@5.0.0/lib/index.umd.js"></script>
+<!-- Icons are an inline sprite at the top of <body>; see createIcons(). -->
+<link rel="preconnect" href="https://cdn.jsdelivr.net">
+<!-- KaTeX is 74KB and most messages contain no maths, so it is fetched the
+     first time one does. See ensureKatex(). -->
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
-<script>tailwind.config={darkMode:'class',theme:{extend:{fontFamily:{sans:['Instrument Sans','-apple-system','sans-serif']},animation:{'pulse-slow':'pulse 3s cubic-bezier(0.4,0,0.6,1) infinite','slide-up':'slideUp .25s ease-out forwards'},keyframes:{slideUp:{'0%':{transform:'translateY(6px)',opacity:'0'},'100%':{transform:'translateY(0)',opacity:'1'}}}}}}</script>
+<!-- The Tailwind config that produced the stylesheet above lives in
+     scratchpad/tw_config.js; it is build input now, not runtime code. -->
 <style>
 ::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#e5e5e5;border-radius:10px}.dark ::-webkit-scrollbar-thumb{background:#404040}
 .hf{display:none!important}
+/* user personalisation, all optional and all inert until set by the bootstrap
+   script above: an unset var falls back through to the skin's own value */
+html{cursor:var(--cursor,auto)}
+a,button,[role=button],summary,label[for],select,.cursor-pointer{cursor:var(--cursor-pointer,pointer)}
+/* the user's wallpaper sits under everything as one fixed layer, so it never
+   repaints while the message list scrolls */
+body::before{content:'';position:fixed;inset:0;z-index:-1;pointer-events:none;
+  background-image:var(--bg-user,none);background-size:cover;background-position:center;
+  opacity:var(--bg-user-opacity,1);filter:var(--bg-user-filter,none)}
+/* A video wallpaper cannot be a background-image, so it is a real element
+   parked behind everything. Same dimming and blur controls as the picture. */
+#bg-video{position:fixed;inset:0;z-index:-1;width:100%;height:100%;object-fit:cover;
+  pointer-events:none;opacity:var(--bg-user-opacity,1);filter:var(--bg-user-filter,none)}
 .swipeable{transition:transform .18s ease-out;touch-action:pan-y}.swiping{transition:none}
 /* PERF FIX 4: let the browser skip layout/paint for off-screen messages */
 .msg-row{content-visibility:auto;contain-intrinsic-size:auto 90px}
@@ -2087,116 +7480,150 @@ function getAppHTML() {
 .msg-content img{max-width:100%;height:auto}
 </style>
 </head>
-<body class="bg-white dark:bg-black text-black dark:text-white font-sans h-[100dvh] flex overflow-hidden transition-colors duration-300" onclick="closeAllDropdowns()">
+<body class="bg-surface text-main font-sans h-[100dvh] flex overflow-hidden transition-colors duration-300" onclick="closeAllDropdowns()">
 
-<div id="global-dropdown" class="fixed w-52 bg-white dark:bg-[#111] border border-gray-200 dark:border-gray-800 rounded-lg shadow-xl hf py-1 z-[9999]"></div>
-<div id="toast" class="fixed bottom-32 md:bottom-24 left-1/2 -translate-x-1/2 bg-black dark:bg-white text-white dark:text-black px-4 py-2 rounded-full text-xs shadow-lg z-[9999] hf pointer-events-none animate-slide-up whitespace-nowrap"></div>
+<div id="global-dropdown" class="fixed w-52 bg-surface border border-line rounded-lg shadow-xl hf py-1 z-[9999]"></div>
+<div id="toast" class="fixed bottom-32 md:bottom-24 left-1/2 -translate-x-1/2 bg-accent text-onaccent px-4 py-2 rounded-full text-xs shadow-lg z-[9999] hf pointer-events-none animate-slide-up whitespace-nowrap"></div>
 
 <!-- LOGIN -->
-<div id="login-screen" class="fixed inset-0 bg-gray-50 dark:bg-[#0a0a0a] flex items-center justify-center z-50">
-  <div class="w-[calc(100%-2rem)] max-w-sm bg-white dark:bg-[#111] border border-gray-200 dark:border-gray-800 rounded-2xl shadow-2xl p-6 md:p-8 mx-auto">
-    <div class="flex items-center space-x-3 mb-8"><div class="w-8 h-8 bg-black dark:bg-white rounded-md flex items-center justify-center"><span class="text-white dark:text-black text-xs font-bold">AI</span></div><h1 class="text-xl font-bold tracking-tight">RSROLEPLAY Engine</h1></div>
-    <div id="login-error" class="hf mb-4 text-sm text-red-500 bg-red-50 dark:bg-red-900/20 px-3 py-2 rounded-lg"></div>
+<div id="login-screen" class="fixed inset-0 bg-surface-2 flex items-center justify-center z-50">
+  <div class="w-[calc(100%-2rem)] max-w-sm bg-surface border border-line rounded-2xl shadow-2xl p-6 md:p-8 mx-auto">
+    <div class="flex items-center space-x-3 mb-8"><div class="w-8 h-8 bg-accent rounded-md flex items-center justify-center"><span class="text-onaccent text-xs font-bold">AI</span></div><h1 class="text-xl font-bold tracking-tight">RSROLEPLAY Engine</h1></div>
+    <div id="login-error" class="hf mb-4 text-sm text-danger bg-danger-soft px-3 py-2 rounded-lg"></div>
     <div class="space-y-4">
-      <div><label class="block text-xs font-medium text-gray-500 mb-1">Username</label><input id="login-user" type="text" placeholder="admin" class="w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-lg p-3 text-sm outline-none focus:border-black dark:focus:border-white transition-colors"></div>
-      <div><label class="block text-xs font-medium text-gray-500 mb-1">Password</label><input id="login-pass" type="password" placeholder="••••••" class="w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-lg p-3 text-sm outline-none focus:border-black dark:focus:border-white transition-colors"></div>
-      <button id="login-btn" onclick="doLogin()" class="w-full bg-black dark:bg-white text-white dark:text-black py-3 rounded-lg text-sm font-medium hover:opacity-80 transition-opacity flex items-center justify-center space-x-2"><span>Sign In</span></button>
+      <div><label class="block text-xs font-medium text-dim mb-1">Username</label><input id="login-user" type="text" placeholder="admin" class="w-full border border-line bg-transparent rounded-lg p-3 text-sm outline-none focus:border-accent transition-colors"></div>
+      <div><label class="block text-xs font-medium text-dim mb-1">Password</label><input id="login-pass" type="password" placeholder="••••••" class="w-full border border-line bg-transparent rounded-lg p-3 text-sm outline-none focus:border-accent transition-colors"></div>
+      <div id="login-mfa" class="hf"><label class="block text-xs font-medium text-dim mb-1">Authentication code</label>
+        <input id="login-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="14" placeholder="123456"
+          onkeydown="if(event.key==='Enter')doLogin()"
+          class="w-full border border-line bg-transparent rounded-lg px-3 py-2.5 text-base tracking-[0.3em] font-mono outline-none focus:border-accent">
+        <p class="text-[11px] text-dim mt-1">From your authenticator app, or one of your recovery codes.</p></div>
+      <button id="login-btn" onclick="doLogin()" class="w-full bg-accent text-onaccent py-3 rounded-lg text-sm font-medium hover:opacity-80 transition-opacity flex items-center justify-center space-x-2"><span>Sign In</span></button>
     </div>
   </div>
 </div>
 
 <!-- APP -->
+<!-- ── ICON SPRITE ────────────────────────────────────────────────────────
+     The 37 icons this app draws, inlined. Chrome does not resolve <use> across
+     files, so an external sprite would need a fetch-and-inject dance; at 8KB
+     inlining is both smaller and simpler than the 81KB library it replaces. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" aria-hidden="true" style="position:absolute"><symbol id="i-alert-triangle" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></symbol><symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/><path d="M17.599 6.5a3 3 0 0 0 .399-1.375"/><path d="M6.003 5.125A3 3 0 0 0 6.401 6.5"/><path d="M3.477 10.896a4 4 0 0 1 .585-.396"/><path d="M19.938 10.5a4 4 0 0 1 .585.396"/><path d="M6 18a4 4 0 0 1-1.967-.516"/><path d="M19.967 17.484A4 4 0 0 1 18 18"/></symbol><symbol id="i-brain-circuit" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M9 13a4.5 4.5 0 0 0 3-4"/><path d="M6.003 5.125A3 3 0 0 0 6.401 6.5"/><path d="M3.477 10.896a4 4 0 0 1 .585-.396"/><path d="M6 18a4 4 0 0 1-1.967-.516"/><path d="M12 13h4"/><path d="M12 18h6a2 2 0 0 1 2 2v1"/><path d="M12 8h8"/><path d="M16 8V5a2 2 0 0 1 2-2"/><circle cx="16" cy="13" r=".5"/><circle cx="18" cy="3" r=".5"/><circle cx="20" cy="21" r=".5"/><circle cx="20" cy="8" r=".5"/></symbol><symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol><symbol id="i-check-circle" viewBox="0 0 24 24"><path d="M21.801 10A10 10 0 1 1 17 3.335"/><path d="m9 11 3 3L22 4"/></symbol><symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol><symbol id="i-chevron-left" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol><symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol><symbol id="i-copy" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></symbol><symbol id="i-corner-down-left" viewBox="0 0 24 24"><polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></symbol><symbol id="i-dices" viewBox="0 0 24 24"><rect width="12" height="12" x="2" y="10" rx="2" ry="2"/><path d="m17.92 14 3.5-3.5a2.24 2.24 0 0 0 0-3l-5-4.92a2.24 2.24 0 0 0-3 0L10 6"/><path d="M6 18h.01"/><path d="M10 14h.01"/><path d="M15 6h.01"/><path d="M18 9h.01"/></symbol><symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></symbol><symbol id="i-edit-2" viewBox="0 0 24 24"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/></symbol><symbol id="i-folder-open" viewBox="0 0 24 24"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></symbol><symbol id="i-git-branch" viewBox="0 0 24 24"><line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol><symbol id="i-key" viewBox="0 0 24 24"><path d="m15.5 7.5 2.3 2.3a1 1 0 0 0 1.4 0l2.1-2.1a1 1 0 0 0 0-1.4L19 4"/><path d="m21 2-9.6 9.6"/><circle cx="7.5" cy="15.5" r="5.5"/></symbol><symbol id="i-loader" viewBox="0 0 24 24"><path d="M12 2v4"/><path d="m16.2 7.8 2.9-2.9"/><path d="M18 12h4"/><path d="m16.2 16.2 2.9 2.9"/><path d="M12 18v4"/><path d="m4.9 19.1 2.9-2.9"/><path d="M2 12h4"/><path d="m4.9 4.9 2.9 2.9"/></symbol><symbol id="i-log-out" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/></symbol><symbol id="i-menu" viewBox="0 0 24 24"><line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="18" y2="18"/></symbol><symbol id="i-message-square" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol><symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol><symbol id="i-more-vertical" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/></symbol><symbol id="i-palette" viewBox="0 0 24 24"><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/></symbol><symbol id="i-pin" viewBox="0 0 24 24"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></symbol><symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M12 5v14"/></symbol><symbol id="i-refresh-cw" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></symbol><symbol id="i-rotate-ccw" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></symbol><symbol id="i-settings" viewBox="0 0 24 24"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></symbol><symbol id="i-slash" viewBox="0 0 24 24"><path d="M22 2 2 22"/></symbol><symbol id="i-sliders-horizontal" viewBox="0 0 24 24"><line x1="21" x2="14" y1="4" y2="4"/><line x1="10" x2="3" y1="4" y2="4"/><line x1="21" x2="12" y1="12" y2="12"/><line x1="8" x2="3" y1="12" y2="12"/><line x1="21" x2="16" y1="20" y2="20"/><line x1="12" x2="3" y1="20" y2="20"/><line x1="14" x2="14" y1="2" y2="6"/><line x1="8" x2="8" y1="10" y2="14"/><line x1="16" x2="16" y1="18" y2="22"/></symbol><symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></symbol><symbol id="i-toggle-right" viewBox="0 0 24 24"><rect width="20" height="12" x="2" y="6" rx="6" ry="6"/><circle cx="16" cy="12" r="2"/></symbol><symbol id="i-trash-2" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></symbol><symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></symbol><symbol id="i-user-cog" viewBox="0 0 24 24"><circle cx="18" cy="15" r="3"/><circle cx="9" cy="7" r="4"/><path d="M10 15H6a4 4 0 0 0-4 4v2"/><path d="m21.7 16.4-.9-.3"/><path d="m15.2 13.9-.9-.3"/><path d="m16.6 18.7.3-.9"/><path d="m19.1 12.2.3-.9"/><path d="m19.6 18.7-.4-1"/><path d="m16.8 12.3-.4-1"/><path d="m14.3 16.6 1-.4"/><path d="m20.7 13.8 1-.4"/></symbol><symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol><symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol></svg>
 <div id="app" class="hf flex w-full h-full relative">
 
 <!-- Sidebar Overlay (Mobile) -->
-<div id="sidebar-overlay" onclick="toggleSidebar()" class="fixed inset-0 bg-black/50 z-30 md:hidden hf backdrop-blur-sm opacity-0 transition-opacity duration-300"></div>
+<div id="sidebar-overlay" onclick="toggleSidebar()" class="fixed inset-0 bg-accent/50 z-30 md:hidden hf backdrop-blur-sm opacity-0 transition-opacity duration-300"></div>
 
 <!-- Left Sidebar -->
-<aside id="left-sidebar" class="fixed inset-y-0 left-0 w-64 transform -translate-x-full md:relative md:translate-x-0 border-r border-gray-200 dark:border-gray-800 flex flex-col justify-between bg-gray-50 dark:bg-[#111] flex-shrink-0 z-40 transition-transform duration-300">
+<aside id="left-sidebar" class="fixed inset-y-0 left-0 w-64 transform -translate-x-full md:relative md:translate-x-0 border-r border-line flex flex-col justify-between bg-surface-2 flex-shrink-0 z-40 transition-transform duration-300">
   <div>
-    <div class="h-16 flex items-center px-6 border-b border-gray-200 dark:border-gray-800 justify-between">
+    <div id="brand-bar" class="h-16 flex items-center px-6 border-b border-line justify-between">
       <div class="flex items-center">
-        <div class="w-6 h-6 bg-black dark:bg-white rounded-sm flex items-center justify-center mr-3"><span class="text-white dark:text-black text-[10px] font-bold">AI</span></div>
+        <div class="w-6 h-6 bg-accent rounded-sm flex items-center justify-center mr-3"><span class="text-onaccent text-[10px] font-bold">AI</span></div>
         <h1 class="font-semibold tracking-tight text-sm">RSROLEPLAY Engine</h1>
       </div>
-      <button onclick="toggleSidebar()" class="md:hidden text-gray-500"><i data-lucide="x" class="w-4 h-4"></i></button>
+      <button onclick="toggleSidebar()" class="md:hidden text-dim"><i data-lucide="x" class="w-4 h-4"></i></button>
     </div>
-    <nav class="p-4 space-y-1">
-      <button onclick="closeSidebarOnMobile();closeModals()" class="w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md bg-black dark:bg-white text-white dark:text-black"><i data-lucide="message-square" class="w-4 h-4"></i><span>Current Chat</span></button>
-      <button onclick="openModal('sessions-modal');closeSidebarOnMobile()" class="w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"><i data-lucide="folder-open" class="w-4 h-4"></i><span>Manage Sessions</span></button>
-      <button onclick="openModal('persona-modal');closeSidebarOnMobile()" class="w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"><i data-lucide="users" class="w-4 h-4"></i><span>Personas & Prompts</span></button>
-      <button onclick="openModal('memory-modal');closeSidebarOnMobile()" class="w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"><i data-lucide="brain" class="w-4 h-4"></i><span>Memory Rules</span></button>
-      <button onclick="openModal('keys-modal');closeSidebarOnMobile()" class="w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"><i data-lucide="key" class="w-4 h-4"></i><span>API Endpoints</span></button>
-      <button onclick="openModal('advanced-modal');closeSidebarOnMobile()" class="w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"><i data-lucide="sliders-horizontal" class="w-4 h-4"></i><span>Advanced AI</span></button>
-      <button onclick="openModal('sync-modal');closeSidebarOnMobile()" class="w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"><i data-lucide="refresh-cw" class="w-4 h-4"></i><span>Data Sync</span></button>
-      <button onclick="toggleTheme()" class="w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"><i data-lucide="moon" id="theme-icon" class="w-4 h-4"></i><span>Toggle Theme</span></button>
+    <nav id="main-nav" class="p-4 space-y-1">
+      <button data-label="Current Chat" onclick="closeSidebarOnMobile();closeModals();railShowChat()" class="dock-btn w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md bg-accent text-onaccent"><i data-lucide="message-square" class="w-4 h-4"></i><span>Current Chat</span></button>
+      <button data-label="Manage Sessions" onclick="railAvailable()?railShowChats():openModal('sessions-modal');closeSidebarOnMobile()" class="dock-btn w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-body hover:bg-surface-3 transition-colors"><i data-lucide="folder-open" class="w-4 h-4"></i><span>Manage Sessions</span></button>
+      <button data-label="Personas & Prompts" onclick="openModal('persona-modal');closeSidebarOnMobile()" class="dock-btn w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-body hover:bg-surface-3 transition-colors"><i data-lucide="users" class="w-4 h-4"></i><span>Personas & Prompts</span></button>
+      <button data-label="Memory Rules" onclick="openModal('memory-modal');closeSidebarOnMobile()" class="dock-btn w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-body hover:bg-surface-3 transition-colors"><i data-lucide="brain" class="w-4 h-4"></i><span>Memory Rules</span></button>
+      <button data-label="API Endpoints" onclick="openModal('keys-modal');closeSidebarOnMobile()" class="dock-btn w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-body hover:bg-surface-3 transition-colors"><i data-lucide="key" class="w-4 h-4"></i><span>API Endpoints</span></button>
+      <button data-label="Advanced AI" onclick="openModal('advanced-modal');closeSidebarOnMobile()" class="dock-btn w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-body hover:bg-surface-3 transition-colors"><i data-lucide="sliders-horizontal" class="w-4 h-4"></i><span>Advanced AI</span></button>
+      <button data-label="Data Sync" onclick="openModal('sync-modal');closeSidebarOnMobile()" class="dock-btn w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-body hover:bg-surface-3 transition-colors"><i data-lucide="refresh-cw" class="w-4 h-4"></i><span>Data Sync</span></button>
+      <button data-label="Appearance" onclick="openModal('appearance-modal');closeSidebarOnMobile()" class="dock-btn w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-body hover:bg-surface-3 transition-colors"><i data-lucide="palette" class="w-4 h-4"></i><span>Appearance</span></button>
+      <button data-label="Toggle Theme" onclick="toggleTheme()" class="dock-btn w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-body hover:bg-surface-3 transition-colors"><i data-lucide="moon" id="theme-icon" class="w-4 h-4"></i><span>Toggle Theme</span></button>
     </nav>
   </div>
-  <div class="p-4 border-t border-gray-200 dark:border-gray-800 space-y-1">
-    <button onclick="openModal('account-modal');closeSidebarOnMobile()" class="w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"><i data-lucide="user-cog" class="w-4 h-4"></i><span id="sidebar-uname">Account</span></button>
-    <button onclick="openModal('nuke-modal');closeSidebarOnMobile()" class="w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"><i data-lucide="settings" class="w-4 h-4"></i><span>Nuke Server!</span></button>
-    <button onclick="doLogout()" class="w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"><i data-lucide="log-out" class="w-4 h-4"></i><span>Logout</span></button>
-    <a href="https://miku.us.kg" target="_blank" class="block pt-4 pb-2 text-center text-[10px] text-gray-400 hover:text-black dark:hover:text-white transition-colors">RSROLEPLAY 2026 - Made by @redsus.vn</a>
+  <div id="nav-footer" class="p-4 border-t border-line space-y-1">
+    <button data-label="Account" onclick="openModal('account-modal');closeSidebarOnMobile()" class="dock-btn w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-body hover:bg-surface-3 transition-colors"><i data-lucide="user-cog" class="w-4 h-4"></i><span id="sidebar-uname">Account</span></button>
+    <button data-label="Nuke Server" onclick="openModal('nuke-modal');closeSidebarOnMobile()" class="dock-btn w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-body hover:bg-surface-3 transition-colors"><i data-lucide="settings" class="w-4 h-4"></i><span>Nuke Server!</span></button>
+    <button data-label="Logout" onclick="doLogout()" class="dock-btn w-full flex items-center space-x-3 px-3 py-2 text-sm font-medium rounded-md text-danger hover:bg-danger-soft transition-colors"><i data-lucide="log-out" class="w-4 h-4"></i><span>Logout</span></button>
+    <a href="https://miku.us.kg" target="_blank" class="block pt-4 pb-2 text-center text-[10px] text-dim hover:text-main transition-colors">RSROLEPLAY 2026 - Made by @redsus.vn</a>
   </div>
 </aside>
 
+<!-- The conversation list. Rail and Trio give it a column of its own; every
+     other layout hides it, and the same conversations stay reachable through
+     Manage Sessions. -->
+<aside id="session-rail" class="hidden flex-col min-h-0">
+  <div id="rail-chats" class="flex-1 min-h-0 flex flex-col">
+  <header class="h-16 flex items-center justify-between px-3 flex-shrink-0 border-b border-line">
+    <span class="text-[11px] font-bold uppercase tracking-wider text-dim">Chats</span>
+    <button onclick="newSession()" title="New chat"
+      class="w-7 h-7 rounded-lg flex items-center justify-center text-dim hover:text-main hover:bg-surface-3 transition-colors">
+      <i data-lucide="plus" class="w-4 h-4"></i>
+    </button>
+  </header>
+  <div class="px-2.5 pt-2.5 flex-shrink-0">
+    <input id="rail-filter" type="text" placeholder="Filter&hellip;" oninput="renderSessionRail()"
+      class="w-full bg-surface border border-line rounded-lg px-2.5 py-1.5 text-xs outline-none focus:border-accent">
+  </div>
+  <div id="rail-list" class="flex-1 min-h-0 overflow-y-auto p-2.5 space-y-1"></div>
+  </div>
+  <!-- Where a panel goes when it is docked here instead of opening over the
+       conversation. The panel itself is moved in, not copied. -->
+  <div id="rail-panel" class="hf flex-1 min-h-0 flex flex-col"></div>
+</aside>
+
 <!-- Main Chat Area -->
-<main class="flex-1 flex flex-col h-full relative min-w-0 bg-white dark:bg-black">
-  <header class="h-16 border-b border-gray-200 dark:border-gray-800 flex items-center justify-between px-4 sm:px-6 bg-white/80 dark:bg-black/80 backdrop-blur-md sticky top-0 z-10">
+<main id="main-col" class="flex-1 flex flex-col h-full relative min-w-0 bg-surface">
+  <header id="chat-header" class="h-16 border-b border-line flex items-center justify-between px-4 sm:px-6 bg-surface/80 backdrop-blur-md sticky top-0 z-10">
     <div class="flex items-center space-x-2 sm:space-x-3">
-      <button onclick="toggleSidebar()" class="md:hidden p-1.5 -ml-1 text-gray-500 hover:text-black dark:hover:text-white"><i data-lucide="menu" class="w-5 h-5"></i></button>
+      <button onclick="toggleSidebar()" class="md:hidden p-1.5 -ml-1 text-dim hover:text-main"><i data-lucide="menu" class="w-5 h-5"></i></button>
       
-      <button id="header-persona-btn" onclick="togglePersonaDropdown(event)" class="flex items-center space-x-2 sm:space-x-3 text-left hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg p-1.5 -ml-1.5 transition-colors focus:outline-none" title="Change Persona for this session">
-        <div class="w-8 h-8 rounded-full bg-gray-200 dark:bg-gray-800 flex items-center justify-center border border-gray-300 dark:border-gray-700 overflow-hidden flex-shrink-0" id="header-avatar"><span class="text-xs font-bold text-gray-600 dark:text-gray-300">AI</span></div>
+      <button id="header-persona-btn" onclick="togglePersonaDropdown(event)" class="flex items-center space-x-2 sm:space-x-3 text-left hover:bg-surface-2 rounded-lg p-1.5 -ml-1.5 transition-colors focus:outline-none" title="Change Persona for this session">
+        <div class="w-8 h-8 rounded-full bg-surface-3 flex items-center justify-center border border-line-2 overflow-hidden flex-shrink-0" id="header-avatar"><span class="text-xs font-bold text-body">AI</span></div>
         <div>
-            <h2 class="text-[13px] sm:text-sm font-semibold flex items-center space-x-1"><span id="header-name">System Assistant</span><i data-lucide="chevron-down" class="w-3.5 h-3.5 text-gray-400"></i></h2>
-            <div class="flex items-center text-[10px] sm:text-xs text-gray-500 dark:text-gray-400"><span class="w-2 h-2 rounded-full bg-green-500 animate-pulse-slow mr-1.5"></span><span id="header-sess" class="truncate max-w-[120px] sm:max-w-[200px]">default</span></div>
+            <h2 class="text-[13px] sm:text-sm font-semibold flex items-center space-x-1"><span id="header-name">System Assistant</span><i data-lucide="chevron-down" class="w-3.5 h-3.5 text-dim"></i></h2>
+            <div class="flex items-center text-[10px] sm:text-xs text-dim"><span class="w-2 h-2 rounded-full bg-success animate-pulse-slow mr-1.5"></span><span id="header-sess" class="truncate max-w-[120px] sm:max-w-[200px]">default</span></div>
         </div>
       </button>
 
     </div>
-    <button onclick="toggleSketchboard();event.stopPropagation();" class="flex items-center space-x-1.5 sm:space-x-2 px-2.5 sm:px-3 py-1.5 border border-gray-200 dark:border-gray-800 rounded-full hover:bg-gray-50 dark:hover:bg-gray-900 transition-colors text-xs font-medium">
+    <button onclick="toggleSketchboard();event.stopPropagation();" class="flex items-center space-x-1.5 sm:space-x-2 px-2.5 sm:px-3 py-1.5 border border-line rounded-full hover:bg-surface-2 transition-colors text-xs font-medium">
       <span id="sketch-led" class="w-2 h-2 rounded-full bg-gray-400 flex-shrink-0 transition-colors"></span><i data-lucide="pin" class="w-3.5 h-3.5 sm:hidden"></i><span class="hidden sm:inline">Sketchboard</span>
-      <span id="sketch-count" class="bg-gray-100 dark:bg-gray-800 px-1.5 py-0.5 rounded text-gray-600 dark:text-gray-300">0</span>
+      <span id="sketch-count" class="bg-surface-2 px-1.5 py-0.5 rounded text-body">0</span>
     </button>
   </header>
-  <div id="summarize-banner" class="absolute top-16 left-0 right-0 bg-blue-600 text-white text-xs py-2 flex items-center justify-center space-x-2 hf z-20">
+  <div id="summarize-banner" class="absolute top-16 left-0 right-0 bg-blue-600 text-onaccent text-xs py-2 flex items-center justify-center space-x-2 hf z-20">
     <i data-lucide="loader" class="w-3 h-3 animate-spin"></i><span>Summarizing Memory...</span>
   </div>
-  <div id="load-more-banner" class="absolute top-16 left-0 right-0 bg-gray-100 dark:bg-gray-900 text-gray-500 text-xs py-2 flex items-center justify-center space-x-2 hf z-20">
+  <div id="load-more-banner" class="absolute top-16 left-0 right-0 bg-surface-2 text-dim text-xs py-2 flex items-center justify-center space-x-2 hf z-20">
     <i data-lucide="loader" class="w-3 h-3 animate-spin"></i><span>Loading older messages...</span>
   </div>
   <div id="chat-container" class="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6"></div>
   
-  <div class="w-full flex-shrink-0 bg-white dark:bg-black pt-2 pb-6 px-4 sm:pt-4 sm:pb-6 sm:px-6 z-10 relative">
-    <div class="absolute bottom-full left-0 right-0 h-8 bg-gradient-to-t from-white dark:from-black to-transparent pointer-events-none"></div>
-    <button id="scroll-btn" onclick="scrollToBottom()" class="hf absolute bottom-full mb-4 right-4 md:right-6 z-20 w-9 h-9 rounded-full bg-black dark:bg-white text-white dark:text-black shadow-lg flex items-center justify-center hover:opacity-80 transition-opacity">
+  <div id="composer-dock" class="w-full flex-shrink-0 bg-surface pt-2 pb-6 px-4 sm:pt-4 sm:pb-6 sm:px-6 z-10 relative">
+    <div class="absolute bottom-full left-0 right-0 h-8 pointer-events-none" style="background-image:linear-gradient(to top,var(--surface),transparent)"></div>
+    <button id="scroll-btn" onclick="scrollToBottom()" class="hf absolute bottom-full mb-4 right-4 md:right-6 z-20 w-9 h-9 rounded-full bg-accent text-onaccent shadow-lg flex items-center justify-center hover:opacity-80 transition-opacity">
       <i data-lucide="chevron-down" class="w-5 h-5"></i>
     </button>
-    <div class="max-w-3xl mx-auto relative">
-      <div class="border border-gray-200 dark:border-gray-800 rounded-xl bg-white dark:bg-[#111] shadow focus-within:border-black dark:focus-within:border-white focus-within:ring-1 focus-within:ring-black dark:focus-within:ring-white transition-all">
+    <div id="composer-shell" class="max-w-3xl mx-auto relative">
+      <div class="border border-line rounded-xl bg-surface shadow focus-within:border-black focus-within:ring-1 focus-within:ring-black dark:focus-within:ring-white transition-[background-color,border-color,color,box-shadow,scale]">
         <textarea id="chat-input" rows="1" class="w-full bg-transparent p-3 sm:p-4 pr-12 resize-none outline-none text-base md:text-sm max-h-40 placeholder-gray-400 dark:placeholder-gray-600" placeholder="Type here to chat. Ctrl + Enter to add a new line."></textarea>
         <!-- Toolbar row -->
         <div class="flex items-center justify-between px-2 pb-2">
           <!-- Thinking toggle -->
           <div class="flex items-center space-x-2">
             <button id="think-btn" onclick="toggleThinkingPicker(event)" title="Enable thinking / reasoning"
-              class="flex items-center space-x-1.5 px-2 py-1 rounded-full text-xs font-medium border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 hover:border-purple-400 hover:text-purple-600 dark:hover:text-purple-400 transition-colors">
+              class="flex items-center space-x-1.5 px-2 py-1 rounded-full text-xs font-medium border border-line text-dim hover:border-purple-400 hover:text-accent-2 transition-colors">
               <i data-lucide="brain-circuit" class="w-3.5 h-3.5"></i>
               <span id="think-label">Think: Off</span>
             </button>
-            <div id="think-picker" class="hf absolute bottom-14 left-2 sm:left-6 bg-white dark:bg-[#111] border border-gray-200 dark:border-gray-700 rounded-xl shadow-xl p-3 z-30 w-48 sm:w-52" onclick="event.stopPropagation()">
-              <p class="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-2">Thinking Effort</p>
+            <div id="think-picker" class="hf bg-surface border border-line rounded-xl shadow-xl p-3 w-48 sm:w-52" style="position:fixed;z-index:9998" onclick="event.stopPropagation()">
+              <p class="text-[10px] font-bold text-dim uppercase tracking-wider mb-2">Thinking Effort</p>
               <div class="space-y-1" id="think-options">
-                <button onclick="setThinkingEffort('none')"    class="think-opt w-full text-left px-3 py-2 rounded-lg text-sm hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors flex items-center justify-between"><span>Off</span></button>
-                <button onclick="setThinkingEffort('low')"     class="think-opt w-full text-left px-3 py-2 rounded-lg text-sm hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors flex items-center justify-between"><span>Low</span><span class="text-[10px] text-gray-400">faster</span></button>
-                <button onclick="setThinkingEffort('medium')"  class="think-opt w-full text-left px-3 py-2 rounded-lg text-sm hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors flex items-center justify-between"><span>Medium</span><span class="text-[10px] text-gray-400">balanced</span></button>
-                <button onclick="setThinkingEffort('high')"    class="think-opt w-full text-left px-3 py-2 rounded-lg text-sm hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors flex items-center justify-between"><span>High</span><span class="text-[10px] text-gray-400">thorough</span></button>
+                <button onclick="setThinkingEffort('none')"    class="think-opt w-full text-left px-3 py-2 rounded-lg text-sm hover:bg-surface-2 transition-colors flex items-center justify-between"><span>Off</span></button>
+                <button onclick="setThinkingEffort('low')"     class="think-opt w-full text-left px-3 py-2 rounded-lg text-sm hover:bg-surface-2 transition-colors flex items-center justify-between"><span>Low</span><span class="text-[10px] text-dim">faster</span></button>
+                <button onclick="setThinkingEffort('medium')"  class="think-opt w-full text-left px-3 py-2 rounded-lg text-sm hover:bg-surface-2 transition-colors flex items-center justify-between"><span>Medium</span><span class="text-[10px] text-dim">balanced</span></button>
+                <button onclick="setThinkingEffort('high')"    class="think-opt w-full text-left px-3 py-2 rounded-lg text-sm hover:bg-surface-2 transition-colors flex items-center justify-between"><span>High</span><span class="text-[10px] text-dim">thorough</span></button>
               </div>
-              <p class="text-[10px] text-gray-400 mt-2 leading-relaxed">Works well with reasoning models (DeepSeek, Qwen3).</p>
+              <p class="text-[10px] text-dim mt-2 leading-relaxed">Works well with reasoning models (DeepSeek, Qwen3).</p>
             </div>
           </div>
-          <button id="send-btn" onclick="handleSend()" class="p-1.5 sm:p-2 bg-black dark:bg-white text-white dark:text-black rounded-md hover:opacity-80 disabled:opacity-30 transition-opacity">
+          <button id="send-btn" onclick="handleSend()" class="p-1.5 sm:p-2 bg-accent text-onaccent rounded-md hover:opacity-80 disabled:opacity-30 transition-opacity">
             <i data-lucide="corner-down-left" class="w-4 h-4"></i>
           </button>
         </div>
@@ -2206,23 +7633,23 @@ function getAppHTML() {
 </main>
 
 <!-- Sketchboard Overlay on mobile -->
-<div id="sketchboard-overlay" onclick="toggleSketchboard()" class="fixed inset-0 bg-black/50 z-40 md:hidden hf backdrop-blur-sm opacity-0 transition-opacity duration-300"></div>
+<div id="sketchboard-overlay" onclick="toggleSketchboard()" class="fixed inset-0 bg-accent/50 z-40 md:hidden hf backdrop-blur-sm opacity-0 transition-opacity duration-300"></div>
 
 <!-- Sketchboard -->
-<aside id="sketchboard-sidebar" class="w-full sm:w-80 max-w-full border-l border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-[#111] absolute right-0 top-0 bottom-0 transform translate-x-full transition-transform duration-300 z-50 flex flex-col shadow-2xl sm:shadow-none" onclick="event.stopPropagation()">
-  <div class="h-16 flex items-center justify-between px-4 border-b border-gray-200 dark:border-gray-800">
+<aside id="sketchboard-sidebar" class="w-full sm:w-80 max-w-full border-l border-line bg-surface-2 absolute right-0 top-0 bottom-0 transform translate-x-full transition-transform duration-300 z-50 flex flex-col shadow-2xl sm:shadow-none" onclick="event.stopPropagation()">
+  <div class="h-16 flex items-center justify-between px-4 border-b border-line">
     <div class="flex items-center space-x-3">
       <h2 class="font-semibold flex items-center space-x-2"><i data-lucide="pin" class="w-4 h-4"></i><span>Sketchboard</span></h2>
-      <button id="global-sketch-toggle" onclick="toggleGlobalSketchboard()" class="text-green-500 hover:text-gray-500 transition-colors" title="Toggle Sketchboard Context">
+      <button id="global-sketch-toggle" onclick="toggleGlobalSketchboard()" class="text-success hover:text-dim transition-colors" title="Toggle Sketchboard Context">
         <i data-lucide="toggle-right" class="w-5 h-5"></i>
       </button>
     </div>
-    <button onclick="toggleSketchboard()" class="text-gray-500 hover:text-black dark:hover:text-white"><i data-lucide="x" class="w-5 h-5"></i></button>
+    <button onclick="toggleSketchboard()" class="text-dim hover:text-main"><i data-lucide="x" class="w-5 h-5"></i></button>
   </div>
   <div class="p-4 flex-1 overflow-y-auto">
     <div class="flex space-x-2 mb-4">
-      <input type="text" id="new-pin-input" placeholder="Add custom pin..." class="flex-1 border border-gray-200 dark:border-gray-700 bg-white dark:bg-black rounded-md px-3 py-2 text-sm outline-none focus:border-black dark:focus:border-white text-base md:text-sm" onkeydown="if(event.key==='Enter')addPin()">
-      <button onclick="addPin()" class="bg-black dark:bg-white text-white dark:text-black px-3 rounded-md text-sm hover:opacity-80"><i data-lucide="plus" class="w-4 h-4"></i></button>
+      <input type="text" id="new-pin-input" placeholder="Add custom pin..." class="flex-1 border border-line bg-surface rounded-md px-3 py-2 text-sm outline-none focus:border-accent text-base md:text-sm" onkeydown="if(event.key==='Enter')addPin()">
+      <button onclick="addPin()" class="bg-accent text-onaccent px-3 rounded-md text-sm hover:opacity-80"><i data-lucide="plus" class="w-4 h-4"></i></button>
     </div>
     <ul id="pins-list" class="space-y-2"></ul>
   </div>
@@ -2230,34 +7657,34 @@ function getAppHTML() {
 </div><!-- end #app -->
 
 <!-- MODALS -->
-<div id="modal-backdrop" class="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 hf flex items-center justify-center p-2 sm:p-4 opacity-0 transition-opacity duration-200" onclick="closeModalsOnBackdrop(event)">
+<div id="modal-backdrop" class="fixed inset-0 bg-accent/40 backdrop-blur-sm z-50 hf flex items-center justify-center p-2 sm:p-4 opacity-0 transition-opacity duration-200" onclick="closeModalsOnBackdrop(event)">
 
   <!-- Sessions -->
-  <div id="sessions-modal" class="modal-content bg-white dark:bg-[#0a0a0a] w-[calc(100%-1rem)] max-w-3xl rounded-xl shadow-2xl border border-gray-200 dark:border-gray-800 hf flex flex-col max-h-[95vh] overflow-hidden" onclick="event.stopPropagation()">
-    <div class="px-4 sm:px-6 py-4 border-b border-gray-200 dark:border-gray-800 flex justify-between items-center bg-gray-50 dark:bg-[#111]">
-      <div><h3 class="font-bold text-lg">Manage Sessions</h3><p class="text-xs text-gray-500 mt-0.5">Your conversation history</p></div>
-      <button onclick="closeModals()" class="text-gray-500 hover:text-black dark:hover:text-white"><i data-lucide="x" class="w-5 h-5"></i></button>
+  <div id="sessions-modal" class="modal-content bg-surface w-[calc(100%-1rem)] max-w-3xl rounded-xl shadow-2xl border border-line hf flex flex-col max-h-[95vh] overflow-hidden" onclick="event.stopPropagation()">
+    <div class="px-4 sm:px-6 py-4 border-b border-line flex justify-between items-center bg-surface-2">
+      <div><h3 class="font-bold text-lg">Manage Sessions</h3><p class="text-xs text-dim mt-0.5">Your conversation history</p></div>
+      <button onclick="closeModals()" class="text-dim hover:text-main"><i data-lucide="x" class="w-5 h-5"></i></button>
     </div>
     <div class="p-4 sm:p-6 flex-1 overflow-y-auto">
         <div class="flex justify-between items-center mb-4">
             <h4 class="font-semibold text-sm">All Sessions</h4>
-            <button onclick="newSession()" class="text-xs bg-black dark:bg-white text-white dark:text-black px-3 py-1.5 rounded-md hover:opacity-80 flex items-center"><i data-lucide="plus" class="w-3.5 h-3.5 mr-1"></i>New Session</button>
+            <button onclick="newSession()" class="text-xs bg-accent text-onaccent px-3 py-1.5 rounded-md hover:opacity-80 flex items-center"><i data-lucide="plus" class="w-3.5 h-3.5 mr-1"></i>New Session</button>
         </div>
         <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3" id="sessions-list"></div>
     </div>
   </div>
 
   <!-- Personas -->
-  <div id="persona-modal" class="modal-content bg-white dark:bg-[#0a0a0a] w-[calc(100%-1rem)] max-w-4xl rounded-xl shadow-2xl border border-gray-200 dark:border-gray-800 hf flex flex-col max-h-[95vh] overflow-hidden" onclick="event.stopPropagation()">
-    <div class="px-4 sm:px-6 py-4 border-b border-gray-200 dark:border-gray-800 flex justify-between items-center bg-gray-50 dark:bg-[#111]">
-      <div><h3 class="font-bold text-lg" id="personas-title">Personas & Prompts</h3><p class="text-xs text-gray-500 mt-0.5">Define custom AI behaviors</p></div>
-      <button onclick="closeModals()" class="text-gray-500 hover:text-black dark:hover:text-white"><i data-lucide="x" class="w-5 h-5"></i></button>
+  <div id="persona-modal" class="modal-content bg-surface w-[calc(100%-1rem)] max-w-4xl rounded-xl shadow-2xl border border-line hf flex flex-col max-h-[95vh] overflow-hidden" onclick="event.stopPropagation()">
+    <div class="px-4 sm:px-6 py-4 border-b border-line flex justify-between items-center bg-surface-2">
+      <div><h3 class="font-bold text-lg" id="personas-title">Personas & Prompts</h3><p class="text-xs text-dim mt-0.5">Define custom AI behaviors</p></div>
+      <button onclick="closeModals()" class="text-dim hover:text-main"><i data-lucide="x" class="w-5 h-5"></i></button>
     </div>
     
     <div id="personas-list-view" class="p-4 sm:p-6 overflow-y-auto flex-1">
       <div id="personas-list-container" class="space-y-3"></div>
-      <div class="mt-4 pt-4 border-t border-gray-200 dark:border-gray-800 flex justify-end">
-        <button onclick="showPersonaForm(null)" class="w-full sm:w-auto bg-black dark:bg-white text-white dark:text-black px-4 py-2 rounded-md text-sm font-medium hover:opacity-80 flex justify-center items-center"><i data-lucide="plus" class="w-4 h-4 mr-1"></i>Create New Persona</button>
+      <div class="mt-4 pt-4 border-t border-line flex justify-end">
+        <button onclick="showPersonaForm(null)" class="w-full sm:w-auto bg-accent text-onaccent px-4 py-2 rounded-md text-sm font-medium hover:opacity-80 flex justify-center items-center"><i data-lucide="plus" class="w-4 h-4 mr-1"></i>Create New Persona</button>
       </div>
     </div>
 
@@ -2265,159 +7692,168 @@ function getAppHTML() {
       <div class="flex flex-col md:flex-row gap-4 md:gap-8">
         <div class="w-full md:w-1/2 space-y-4">
           <div>
-            <label class="block text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">Avatar</label>
+            <label class="block text-[10px] font-bold text-dim uppercase tracking-wider mb-2">Avatar</label>
             <div class="flex space-x-3 items-center">
-              <div class="w-14 h-14 rounded-xl bg-gray-100 dark:bg-[#111] border border-gray-200 dark:border-gray-700 flex items-center justify-center overflow-hidden flex-shrink-0"><span id="persona-avatar-preview" class="text-xl font-bold text-gray-400">AI</span></div>
-              <input type="text" id="persona-avatar" placeholder="URL or 2-letter initials" class="w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-lg p-3 text-base md:text-sm outline-none focus:border-blue-500 transition-colors">
+              <div class="w-14 h-14 rounded-xl bg-surface-2 border border-line flex items-center justify-center overflow-hidden flex-shrink-0"><span id="persona-avatar-preview" class="text-xl font-bold text-dim">AI</span></div>
+              <input type="text" id="persona-avatar" placeholder="URL or 2-letter initials" class="w-full border border-line bg-transparent rounded-lg p-3 text-base md:text-sm outline-none focus:border-info transition-colors">
             </div>
           </div>
-          <div><label class="block text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-1">Bot Name</label><input type="text" id="persona-name" class="w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-lg p-3 text-base md:text-sm outline-none focus:border-blue-500"></div>
-          <div><label class="block text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-1">Description</label><textarea id="persona-desc" rows="2" class="w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-lg p-3 text-base md:text-sm outline-none focus:border-blue-500 resize-none"></textarea></div>
-          <div><label class="block text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-1">Greeting Message</label><textarea id="persona-first-msg" rows="2" class="w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-lg p-3 text-base md:text-sm outline-none focus:border-blue-500 resize-none"></textarea></div>
+          <div><label class="block text-[10px] font-bold text-dim uppercase tracking-wider mb-1">Bot Name</label><input type="text" id="persona-name" class="w-full border border-line bg-transparent rounded-lg p-3 text-base md:text-sm outline-none focus:border-info"></div>
+          <div><label class="block text-[10px] font-bold text-dim uppercase tracking-wider mb-1">Description</label><textarea id="persona-desc" rows="2" class="w-full border border-line bg-transparent rounded-lg p-3 text-base md:text-sm outline-none focus:border-info resize-none"></textarea></div>
+          <div><label class="block text-[10px] font-bold text-dim uppercase tracking-wider mb-1">Greeting Message</label><textarea id="persona-first-msg" rows="2" class="w-full border border-line bg-transparent rounded-lg p-3 text-base md:text-sm outline-none focus:border-info resize-none"></textarea></div>
         </div>
         <div class="w-full md:w-1/2 flex flex-col gap-4">
-          <div class="flex-1 flex flex-col"><label class="block text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-1">System Prompt</label><textarea id="persona-prompt" class="flex-1 w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-lg p-3 sm:p-4 text-base md:text-sm outline-none focus:border-blue-500 resize-none min-h-[140px]"></textarea></div>
-          <div class="flex-1 flex flex-col"><label class="block text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-1">User Persona</label><textarea id="persona-user" class="flex-1 w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-lg p-3 sm:p-4 text-base md:text-sm outline-none focus:border-blue-500 resize-none min-h-[80px]"></textarea></div>
+          <div class="flex-1 flex flex-col"><label class="block text-[10px] font-bold text-dim uppercase tracking-wider mb-1">System Prompt</label><textarea id="persona-prompt" class="flex-1 w-full border border-line bg-transparent rounded-lg p-3 sm:p-4 text-base md:text-sm outline-none focus:border-info resize-none min-h-[140px]"></textarea></div>
+          <div class="flex-1 flex flex-col"><label class="block text-[10px] font-bold text-dim uppercase tracking-wider mb-1">User Persona</label><textarea id="persona-user" class="flex-1 w-full border border-line bg-transparent rounded-lg p-3 sm:p-4 text-base md:text-sm outline-none focus:border-info resize-none min-h-[80px]"></textarea></div>
         </div>
       </div>
       <input type="hidden" id="persona-edit-id">
-      <div class="mt-6 pt-4 border-t border-gray-200 dark:border-gray-800 flex justify-end space-x-3">
-        <button onclick="hidePersonaForm()" class="px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-md">Cancel</button>
-        <button onclick="savePersona()" class="w-full sm:w-auto bg-black dark:bg-white text-white dark:text-black px-6 py-2 rounded-lg text-sm font-medium hover:opacity-80">Save Persona</button>
+      <div id="persona-look" class="hf mt-4 flex items-center justify-between gap-3 p-3 rounded-lg border border-line bg-surface-2">
+        <span class="text-xs text-dim">This persona can have its own bubble, colours, font and wallpaper.</span>
+        <button onclick="stylePersona()" class="px-3 py-1.5 rounded-lg border border-line text-xs flex-shrink-0 flex items-center gap-1.5"><i data-lucide="palette" class="w-3.5 h-3.5"></i>Appearance</button>
+      </div>
+      <div class="mt-6 pt-4 border-t border-line flex justify-end space-x-3">
+        <button onclick="hidePersonaForm()" class="px-4 py-2 text-sm text-dim hover:bg-surface-2 rounded-md">Cancel</button>
+        <button onclick="savePersona()" class="w-full sm:w-auto bg-accent text-onaccent px-6 py-2 rounded-lg text-sm font-medium hover:opacity-80">Save Persona</button>
       </div>
     </div>
   </div>
 
   <!-- Memory -->
-  <div id="memory-modal" class="modal-content bg-white dark:bg-[#0a0a0a] w-[calc(100%-1rem)] max-w-2xl rounded-xl shadow-2xl border border-gray-200 dark:border-gray-800 hf flex flex-col max-h-[95vh]" onclick="event.stopPropagation()">
-    <div class="px-4 sm:px-6 py-4 border-b border-gray-200 dark:border-gray-800 flex justify-between items-center bg-gray-50 dark:bg-[#111]">
-      <div><h3 class="font-semibold text-base sm:text-lg">Memory & Summarization</h3><p id="mem-session-label" class="text-xs text-gray-500 mt-0.5">Session: —</p></div>
-      <button onclick="closeModals()" class="text-gray-500 hover:text-black dark:hover:text-white"><i data-lucide="x" class="w-5 h-5"></i></button>
+  <div id="memory-modal" class="modal-content bg-surface w-[calc(100%-1rem)] max-w-2xl rounded-xl shadow-2xl border border-line hf flex flex-col max-h-[95vh]" onclick="event.stopPropagation()">
+    <div class="px-4 sm:px-6 py-4 border-b border-line flex justify-between items-center bg-surface-2">
+      <div><h3 class="font-semibold text-base sm:text-lg">Memory & Summarization</h3><p id="mem-session-label" class="text-xs text-dim mt-0.5">Session: —</p></div>
+      <button onclick="closeModals()" class="text-dim hover:text-main"><i data-lucide="x" class="w-5 h-5"></i></button>
     </div>
     <div class="p-4 sm:p-6 space-y-5 overflow-y-auto">
       <div>
         <div class="flex justify-between items-center mb-2">
-          <label class="text-xs font-medium text-gray-500">Summary <span class="text-gray-400 font-normal">(editable)</span></label>
+          <label class="text-xs font-medium text-dim">Summary <span class="text-dim font-normal">(editable)</span></label>
           <div class="flex items-center space-x-2 sm:space-x-3">
-            <span id="sum-save-hint" class="hf text-xs text-green-600">Saved ✓</span>
-            <button onclick="saveSummaryEdit()" class="text-xs bg-black dark:bg-white text-white dark:text-black px-2 py-1 sm:px-3 rounded-md hover:opacity-80">Save Edit</button>
-            <button onclick="triggerSummarize()" class="text-xs text-blue-600 dark:text-blue-400 hover:underline">Regenerate</button>
+            <span id="sum-save-hint" class="hf text-xs text-success">Saved ✓</span>
+            <button onclick="saveSummaryEdit()" class="text-xs bg-accent text-onaccent px-2 py-1 sm:px-3 rounded-md hover:opacity-80">Save Edit</button>
+            <button onclick="triggerSummarize()" class="text-xs text-info hover:underline">Regenerate</button>
           </div>
         </div>
-        <textarea id="memory-summary-ta" rows="6" class="w-full border border-gray-200 dark:border-gray-700 rounded-md p-3 text-xs bg-gray-50 dark:bg-[#111] font-mono text-gray-700 dark:text-gray-300 outline-none focus:border-black dark:focus:border-white resize-y" placeholder="No summary yet. Regenerate to create one."></textarea>
+        <textarea id="memory-summary-ta" rows="6" class="w-full border border-line rounded-md p-3 text-xs bg-surface-2 font-mono text-body outline-none focus:border-accent resize-y" placeholder="No summary yet. Regenerate to create one."></textarea>
       </div>
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-        <div><label class="block text-xs font-medium text-gray-500 mb-1">Summarize Threshold <span class="text-gray-400">(msgs)</span></label><input type="number" id="mem-threshold" min="5" class="w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-md p-2 text-base md:text-sm outline-none focus:border-black dark:focus:border-white"></div>
-        <div><label class="block text-xs font-medium text-gray-500 mb-1">Messages to Summarize</label><input type="number" id="mem-count" min="5" class="w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-md p-2 text-base md:text-sm outline-none focus:border-black dark:focus:border-white"></div>
-        <div><label class="block text-xs font-medium text-gray-500 mb-1">Context Window <span class="text-gray-400">(last N for AI)</span></label><input type="number" id="mem-context" min="5" class="w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-md p-2 text-base md:text-sm outline-none focus:border-black dark:focus:border-white"></div>
-        <div><label class="block text-xs font-medium text-gray-500 mb-1">History Display Fetch</label><input type="number" id="mem-fetch" min="10" class="w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-md p-2 text-base md:text-sm outline-none focus:border-black dark:focus:border-white"></div>
+        <div><label class="block text-xs font-medium text-dim mb-1">Summarize Threshold <span class="text-dim">(msgs)</span></label><input type="number" id="mem-threshold" min="5" class="w-full border border-line bg-transparent rounded-md p-2 text-base md:text-sm outline-none focus:border-accent"></div>
+        <div><label class="block text-xs font-medium text-dim mb-1">Messages to Summarize</label><input type="number" id="mem-count" min="5" class="w-full border border-line bg-transparent rounded-md p-2 text-base md:text-sm outline-none focus:border-accent"></div>
+        <div><label class="block text-xs font-medium text-dim mb-1">Context Window <span class="text-dim">(last N for AI)</span></label><input type="number" id="mem-context" min="5" class="w-full border border-line bg-transparent rounded-md p-2 text-base md:text-sm outline-none focus:border-accent"></div>
+        <div><label class="block text-xs font-medium text-dim mb-1">History Display Fetch</label><input type="number" id="mem-fetch" min="10" class="w-full border border-line bg-transparent rounded-md p-2 text-base md:text-sm outline-none focus:border-accent"></div>
       </div>
-      <label class="flex items-center space-x-3 cursor-pointer"><input type="checkbox" id="mem-include-old" class="rounded border-gray-300"><span class="text-sm text-gray-700 dark:text-gray-300">Include Previous Summary when re-summarizing</span></label>
+      <label class="flex items-center space-x-3 cursor-pointer"><input type="checkbox" id="mem-include-old" class="rounded border-line-2"><span class="text-sm text-body">Include Previous Summary when re-summarizing</span></label>
     </div>
-    <div class="px-4 sm:px-6 py-4 border-t border-gray-200 dark:border-gray-800 flex justify-end bg-gray-50 dark:bg-[#111]">
-      <button onclick="saveMemorySettings()" class="w-full sm:w-auto bg-black dark:bg-white text-white dark:text-black px-4 py-2 rounded-md text-sm font-medium hover:opacity-80">Apply Rules</button>
+    <div class="px-4 sm:px-6 py-4 border-t border-line flex justify-end bg-surface-2">
+      <button onclick="saveMemorySettings()" class="w-full sm:w-auto bg-accent text-onaccent px-4 py-2 rounded-md text-sm font-medium hover:opacity-80">Apply Rules</button>
     </div>
   </div>
   <!-- Advanced AI Settings -->
-  <div id="advanced-modal" class="modal-content bg-white dark:bg-[#0a0a0a] w-[calc(100%-1rem)] max-w-2xl rounded-xl shadow-2xl border border-gray-200 dark:border-gray-800 hf flex flex-col max-h-[95vh]" onclick="event.stopPropagation()">
-    <div class="px-4 sm:px-6 py-4 border-b border-gray-200 dark:border-gray-800 flex justify-between items-center bg-gray-50 dark:bg-[#111]">
+  <div id="advanced-modal" class="modal-content bg-surface w-[calc(100%-1rem)] max-w-2xl rounded-xl shadow-2xl border border-line hf flex flex-col max-h-[95vh]" onclick="event.stopPropagation()">
+    <div class="px-4 sm:px-6 py-4 border-b border-line flex justify-between items-center bg-surface-2">
       <div>
         <h3 class="font-semibold text-base sm:text-lg">Advanced AI Settings</h3>
-        <p class="text-xs text-gray-500 mt-0.5">Global &mdash; applies to every API endpoint</p>
+        <p class="text-xs text-dim mt-0.5">Global &mdash; applies to every API endpoint</p>
       </div>
-      <button onclick="closeModals()" class="text-gray-500 hover:text-black dark:hover:text-white"><i data-lucide="x" class="w-5 h-5"></i></button>
+      <button onclick="closeModals()" class="text-dim hover:text-main"><i data-lucide="x" class="w-5 h-5"></i></button>
     </div>
     <div class="p-4 sm:p-6 space-y-6 overflow-y-auto">
       <div>
-        <label class="block text-xs font-medium text-gray-500 mb-2">Preset</label>
+        <label class="block text-xs font-medium text-dim mb-2">Preset</label>
         <div id="gen-presets" class="grid grid-cols-1 sm:grid-cols-2 gap-2"></div>
       </div>
-      <div class="space-y-4 pt-1 border-t border-gray-200 dark:border-gray-800">
+      <div class="space-y-4 pt-1 border-t border-line">
         <div class="flex justify-between items-center pt-4">
-          <label class="text-xs font-medium text-gray-500">Parameters</label>
-          <span id="gen-custom-hint" class="text-[10px] text-amber-600 dark:text-amber-400">Choose Custom to edit these</span>
+          <label class="text-xs font-medium text-dim">Parameters</label>
+          <span id="gen-custom-hint" class="text-[10px] text-warn">Choose Custom to edit these</span>
         </div>
       <div>
         <div class="flex justify-between items-center mb-1">
-          <label class="text-xs font-medium text-gray-700 dark:text-gray-300">Temperature</label>
-          <span id="genv-temperature" class="text-xs font-mono text-gray-500">-</span>
+          <label class="text-xs font-medium text-body">Temperature</label>
+          <span id="genv-temperature" class="text-xs font-mono text-dim">-</span>
         </div>
-        <input type="range" id="gen-temperature" min="0" max="2" step="0.05" oninput="onGenInput('temperature')" class="w-full accent-black dark:accent-white cursor-pointer">
-        <p class="text-[10px] text-gray-400 mt-1">Randomness. Low sticks to the prompt, high is more inventive.</p>
+        <input type="range" id="gen-temperature" min="0" max="2" step="0.05" oninput="onGenInput('temperature')" class="w-full accent-accent cursor-pointer">
+        <p class="text-[10px] text-dim mt-1">Randomness. Low sticks to the prompt, high is more inventive.</p>
       </div>
       <div>
         <div class="flex justify-between items-center mb-1">
-          <label class="text-xs font-medium text-gray-700 dark:text-gray-300">Top P</label>
-          <span id="genv-top_p" class="text-xs font-mono text-gray-500">-</span>
+          <label class="text-xs font-medium text-body">Top P</label>
+          <span id="genv-top_p" class="text-xs font-mono text-dim">-</span>
         </div>
-        <input type="range" id="gen-top_p" min="0" max="1" step="0.05" oninput="onGenInput('top_p')" class="w-full accent-black dark:accent-white cursor-pointer">
-        <p class="text-[10px] text-gray-400 mt-1">Nucleus sampling. Lower narrows the pool of candidate words.</p>
+        <input type="range" id="gen-top_p" min="0" max="1" step="0.05" oninput="onGenInput('top_p')" class="w-full accent-accent cursor-pointer">
+        <p class="text-[10px] text-dim mt-1">Nucleus sampling. Lower narrows the pool of candidate words.</p>
       </div>
       <div>
         <div class="flex justify-between items-center mb-1">
-          <label class="text-xs font-medium text-gray-700 dark:text-gray-300">Presence Penalty</label>
-          <span id="genv-presence_penalty" class="text-xs font-mono text-gray-500">-</span>
+          <label class="text-xs font-medium text-body">Presence Penalty</label>
+          <span id="genv-presence_penalty" class="text-xs font-mono text-dim">-</span>
         </div>
-        <input type="range" id="gen-presence_penalty" min="-2" max="2" step="0.05" oninput="onGenInput('presence_penalty')" class="w-full accent-black dark:accent-white cursor-pointer">
-        <p class="text-[10px] text-gray-400 mt-1">Positive values push the model toward new topics.</p>
+        <input type="range" id="gen-presence_penalty" min="-2" max="2" step="0.05" oninput="onGenInput('presence_penalty')" class="w-full accent-accent cursor-pointer">
+        <p class="text-[10px] text-dim mt-1">Positive values push the model toward new topics.</p>
       </div>
       <div>
         <div class="flex justify-between items-center mb-1">
-          <label class="text-xs font-medium text-gray-700 dark:text-gray-300">Frequency Penalty</label>
-          <span id="genv-frequency_penalty" class="text-xs font-mono text-gray-500">-</span>
+          <label class="text-xs font-medium text-body">Frequency Penalty</label>
+          <span id="genv-frequency_penalty" class="text-xs font-mono text-dim">-</span>
         </div>
-        <input type="range" id="gen-frequency_penalty" min="-2" max="2" step="0.05" oninput="onGenInput('frequency_penalty')" class="w-full accent-black dark:accent-white cursor-pointer">
-        <p class="text-[10px] text-gray-400 mt-1">Positive values discourage reusing the same words.</p>
+        <input type="range" id="gen-frequency_penalty" min="-2" max="2" step="0.05" oninput="onGenInput('frequency_penalty')" class="w-full accent-accent cursor-pointer">
+        <p class="text-[10px] text-dim mt-1">Positive values discourage reusing the same words.</p>
       </div>
       <div>
         <div class="flex justify-between items-center mb-1">
-          <label class="text-xs font-medium text-gray-700 dark:text-gray-300">Repetition Penalty</label>
-          <span id="genv-repetition_penalty" class="text-xs font-mono text-gray-500">-</span>
+          <label class="text-xs font-medium text-body">Repetition Penalty</label>
+          <span id="genv-repetition_penalty" class="text-xs font-mono text-dim">-</span>
         </div>
-        <input type="range" id="gen-repetition_penalty" min="0" max="2" step="0.05" oninput="onGenInput('repetition_penalty')" class="w-full accent-black dark:accent-white cursor-pointer">
-        <p class="text-[10px] text-gray-400 mt-1">OpenRouter and custom endpoints only. 0 = off (not sent).</p>
+        <input type="range" id="gen-repetition_penalty" min="0" max="2" step="0.05" oninput="onGenInput('repetition_penalty')" class="w-full accent-accent cursor-pointer">
+        <p class="text-[10px] text-dim mt-1">OpenRouter and custom endpoints only. 0 = off (not sent).</p>
       </div>
       <div>
         <div class="flex justify-between items-center mb-1">
-          <label class="text-xs font-medium text-gray-700 dark:text-gray-300">Top K</label>
-          <span id="genv-top_k" class="text-xs font-mono text-gray-500">-</span>
+          <label class="text-xs font-medium text-body">Top K</label>
+          <span id="genv-top_k" class="text-xs font-mono text-dim">-</span>
         </div>
-        <input type="range" id="gen-top_k" min="0" max="200" step="1" oninput="onGenInput('top_k')" class="w-full accent-black dark:accent-white cursor-pointer">
-        <p class="text-[10px] text-gray-400 mt-1">OpenRouter and custom endpoints only. 0 = off (not sent).</p>
+        <input type="range" id="gen-top_k" min="0" max="200" step="1" oninput="onGenInput('top_k')" class="w-full accent-accent cursor-pointer">
+        <p class="text-[10px] text-dim mt-1">OpenRouter and custom endpoints only. 0 = off (not sent).</p>
       </div>
       <div>
         <div class="flex justify-between items-center mb-1">
-          <label class="text-xs font-medium text-gray-700 dark:text-gray-300">Max Tokens</label>
-          <span id="genv-max_tokens" class="text-xs font-mono text-gray-500">-</span>
+          <label class="text-xs font-medium text-body">Max Tokens</label>
+          <span id="genv-max_tokens" class="text-xs font-mono text-dim">-</span>
         </div>
-        <input type="range" id="gen-max_tokens" min="256" max="32768" step="256" oninput="onGenInput('max_tokens')" class="w-full accent-black dark:accent-white cursor-pointer">
-        <p class="text-[10px] text-gray-400 mt-1">Longest reply the model may produce in one turn.</p>
+        <input type="range" id="gen-max_tokens" min="256" max="32768" step="256" oninput="onGenInput('max_tokens')" class="w-full accent-accent cursor-pointer">
+        <p class="text-[10px] text-dim mt-1">Longest reply the model may produce in one turn.</p>
       </div>
       </div>
     </div>
-    <div class="px-4 sm:px-6 py-4 border-t border-gray-200 dark:border-gray-800 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2 bg-gray-50 dark:bg-[#111]">
-      <span class="text-[10px] text-gray-400">Summarization keeps its own fixed settings.</span>
-      <button onclick="saveGenSettings()" class="w-full sm:w-auto bg-black dark:bg-white text-white dark:text-black px-4 py-2 rounded-md text-sm font-medium hover:opacity-80">Apply Globally</button>
+    <div class="px-4 sm:px-6 py-4 border-t border-line flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2 bg-surface-2">
+      <span class="text-[10px] text-dim">Summarization keeps its own fixed settings.</span>
+      <button onclick="saveGenSettings()" class="w-full sm:w-auto bg-accent text-onaccent px-4 py-2 rounded-md text-sm font-medium hover:opacity-80">Apply Globally</button>
     </div>
   </div>
 
   <!-- API Keys -->
-  <div id="keys-modal" class="modal-content bg-white dark:bg-[#0a0a0a] w-[calc(100%-1rem)] max-w-2xl rounded-xl shadow-2xl border border-gray-200 dark:border-gray-800 hf flex flex-col max-h-[95vh]" onclick="event.stopPropagation()">
-    <div class="px-4 sm:px-6 py-4 border-b border-gray-200 dark:border-gray-800 flex justify-between items-center bg-gray-50 dark:bg-[#111]">
+  <div id="keys-modal" class="modal-content bg-surface w-[calc(100%-1rem)] max-w-2xl rounded-xl shadow-2xl border border-line hf flex flex-col max-h-[95vh]" onclick="event.stopPropagation()">
+    <div class="px-4 sm:px-6 py-4 border-b border-line flex justify-between items-center bg-surface-2">
       <h3 class="font-semibold text-base sm:text-lg" id="keys-title">API Endpoints</h3>
-      <button onclick="closeModals()" class="text-gray-500 hover:text-black dark:hover:text-white"><i data-lucide="x" class="w-5 h-5"></i></button>
+      <button onclick="closeModals()" class="text-dim hover:text-main"><i data-lucide="x" class="w-5 h-5"></i></button>
     </div>
     <div id="keys-list-view" class="p-4 sm:p-6 overflow-y-auto">
       <div id="keys-list-container" class="space-y-3"></div>
-      <div class="mt-4 pt-4 border-t border-gray-200 dark:border-gray-800 flex justify-end">
-        <button onclick="showKeyForm(null)" class="w-full sm:w-auto bg-black dark:bg-white text-white dark:text-black px-4 py-2 rounded-md text-sm font-medium hover:opacity-80 flex justify-center items-center"><i data-lucide="plus" class="w-4 h-4 mr-1"></i>Add Endpoint</button>
+      <div class="mt-4 pt-4 border-t border-line flex justify-end">
+        <button onclick="showKeyForm(null)" class="w-full sm:w-auto bg-accent text-onaccent px-4 py-2 rounded-md text-sm font-medium hover:opacity-80 flex justify-center items-center"><i data-lucide="plus" class="w-4 h-4 mr-1"></i>Add Endpoint</button>
       </div>
     </div>
     <div id="keys-form-view" class="p-4 sm:p-6 hf overflow-y-auto">
-      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
-        <div>
-            <label class="block text-xs font-medium text-gray-500 mb-1">Provider Format</label>
-            <select id="key-provider" class="w-full border border-gray-200 dark:border-gray-700 bg-white dark:bg-[#0a0a0a] rounded-md p-2 text-base md:text-sm outline-none">
+      <div class="space-y-4 mb-4">
+        <!-- 1. name -->
+        <div><label class="block text-xs font-medium text-dim mb-1">Name</label>
+          <input type="text" id="key-name" placeholder="What you want to call this endpoint" class="w-full border border-line bg-transparent rounded-md p-2 text-base md:text-sm outline-none focus:border-accent"></div>
+
+        <!-- 2. type -->
+        <div><label class="block text-xs font-medium text-dim mb-1">Type</label>
+            <select id="key-provider" class="w-full border border-line bg-surface rounded-md p-2 text-base md:text-sm outline-none">
+                <option value="imgxh">Imgxh (Free API)</option>
                 <option value="groq">Groq</option>
                 <option value="mistral">Mistral</option>
                 <option value="openrouter">OpenRouter</option>
@@ -2426,98 +7862,338 @@ function getAppHTML() {
                 <option value="custom">Custom (OpenAI Compatible)</option>
             </select>
         </div>
-        <div><label class="block text-xs font-medium text-gray-500 mb-1">Model ID</label><input type="text" id="key-model" placeholder="e.g. mistral-large-latest" class="w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-md p-2 text-base md:text-sm outline-none focus:border-black dark:focus:border-white"></div>
-        <div id="custom-url-container" class="hf sm:col-span-2">
-            <label class="block text-xs font-medium text-gray-500 mb-1" id="custom-url-label">Custom API URL</label>
-            <input type="text" id="key-custom-url" placeholder="http://localhost:11434/v1/chat/completions" class="w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-md p-2 text-base md:text-sm outline-none focus:border-black dark:focus:border-white">
+
+        <!-- 3. endpoint / account id, only when the type needs one -->
+        <div id="custom-url-container" class="hf">
+            <label class="block text-xs font-medium text-dim mb-1" id="custom-url-label">API endpoint</label>
+            <input type="text" id="key-custom-url" placeholder="https://your-host/v1/chat/completions" class="w-full border border-line bg-transparent rounded-md p-2 text-base md:text-sm outline-none focus:border-accent">
+            <p class="text-[11px] text-dim mt-1" id="custom-url-hint"></p>
         </div>
-        <div><label class="block text-xs font-medium text-gray-500 mb-1">Mode</label><select id="key-mode" class="w-full border border-gray-200 dark:border-gray-700 bg-white dark:bg-[#0a0a0a] rounded-md p-2 text-base md:text-sm outline-none"><option value="chat">Chat (Main Bot)</option><option value="summarize">Summarize (Background)</option></select></div>
-        <div><label class="block text-xs font-medium text-gray-500 mb-1">API Key / CF Token</label><input type="password" id="key-value" placeholder="sk-... (optional for local)" class="w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-md p-2 text-base md:text-sm outline-none focus:border-black dark:focus:border-white"></div>
-        <div><label class="block text-xs font-medium text-gray-500 mb-1">Label (optional)</label><input type="text" id="key-name" class="w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-md p-2 text-base md:text-sm outline-none focus:border-black dark:focus:border-white"></div>
-        <div class="flex items-end mt-2 sm:mt-0"><label class="flex items-center space-x-2 cursor-pointer text-sm"><input type="checkbox" id="key-primary" class="rounded border-gray-300"><span>Set as Primary</span></label></div>
+
+        <!-- 4. key -->
+        <div><label class="block text-xs font-medium text-dim mb-1">API key</label>
+          <input type="password" id="key-value" placeholder="sk-..." autocomplete="off" class="w-full border border-line bg-transparent rounded-md p-2 text-base md:text-sm outline-none focus:border-accent">
+          <p class="text-[11px] text-dim mt-1" id="key-value-hint">Paste the key, then pick a model below.</p></div>
+
+        <!-- 5. model, chosen from what this key can actually run -->
+        <div><label class="block text-xs font-medium text-dim mb-1">Model</label>
+          <div class="flex gap-2">
+            <input type="text" id="key-model" placeholder="Pick or type a model id" class="flex-1 min-w-0 border border-line bg-transparent rounded-md p-2 text-base md:text-sm outline-none focus:border-accent">
+            <button type="button" onclick="openModelPicker()" id="key-model-btn" class="px-3 py-2 rounded-md border border-line text-xs font-semibold whitespace-nowrap hover:border-line-2">Browse</button>
+          </div>
+          <div id="model-picker" class="hf mt-2 border border-line rounded-lg overflow-hidden shadow-sm">
+            <input type="text" id="model-search" placeholder="Search models..." class="w-full bg-surface-2 px-3 py-2 text-sm outline-none border-b border-line" oninput="filterModels()">
+            <div id="model-list" class="max-h-56 overflow-y-auto"></div>
+          </div>
+        </div>
+
+        <!-- 6. the rest -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div><label class="block text-xs font-medium text-dim mb-1">Mode</label><select id="key-mode" class="w-full border border-line bg-surface rounded-md p-2 text-base md:text-sm outline-none"><option value="chat">Chat (Main Bot)</option><option value="summarize">Summarize (Background)</option></select></div>
+          <div class="flex items-end"><label class="flex items-center space-x-2 cursor-pointer text-sm"><input type="checkbox" id="key-primary" class="rounded border-line-2"><span>Set as Primary</span></label></div>
+        </div>
       </div>
       <input type="hidden" id="key-edit-id">
-      <div id="key-form-error" class="hf mb-3 text-sm text-red-500 bg-red-50 dark:bg-red-900/20 px-3 py-2 rounded-lg"></div>
+      <div id="key-form-error" class="hf mb-3 text-sm text-danger bg-danger-soft px-3 py-2 rounded-lg"></div>
       <div class="flex justify-end space-x-3">
-        <button onclick="hideKeyForm()" class="px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-md">Cancel</button>
-        <button onclick="saveKey()" class="bg-black dark:bg-white text-white dark:text-black px-4 py-2 rounded-md text-sm hover:opacity-80">Save Key</button>
+        <button onclick="hideKeyForm()" class="px-4 py-2 text-sm text-dim hover:bg-surface-2 rounded-md">Cancel</button>
+        <button onclick="saveKey()" class="bg-accent text-onaccent px-4 py-2 rounded-md text-sm hover:opacity-80">Save Key</button>
       </div>
     </div>
   </div>
 
   <!-- Sync -->
-  <div id="sync-modal" class="modal-content bg-white dark:bg-[#0a0a0a] w-[calc(100%-1rem)] max-w-md rounded-xl shadow-2xl border border-gray-200 dark:border-gray-800 hf flex flex-col" onclick="event.stopPropagation()">
-    <div class="px-4 sm:px-6 py-4 border-b border-gray-200 dark:border-gray-800 flex justify-between items-center bg-gray-50 dark:bg-[#111]"><h3 class="font-semibold text-lg">Data Sync</h3><button onclick="closeModals()" class="text-gray-500 hover:text-black dark:hover:text-white"><i data-lucide="x" class="w-5 h-5"></i></button></div>
+  <div id="sync-modal" class="modal-content bg-surface w-[calc(100%-1rem)] max-w-md rounded-xl shadow-2xl border border-line hf flex flex-col" onclick="event.stopPropagation()">
+    <div class="px-4 sm:px-6 py-4 border-b border-line flex justify-between items-center bg-surface-2"><h3 class="font-semibold text-lg">Data Sync</h3><button onclick="closeModals()" class="text-dim hover:text-main"><i data-lucide="x" class="w-5 h-5"></i></button></div>
     <div class="p-4 sm:p-6 space-y-4">
-      <div onclick="exportData()" class="border border-gray-200 dark:border-gray-700 rounded-lg p-4 text-center hover:border-black dark:hover:border-white transition-colors cursor-pointer">
-        <i data-lucide="download" class="w-6 h-6 mx-auto mb-2 text-gray-700 dark:text-gray-300"></i><h4 class="font-medium text-sm">Download TXT</h4><p class="text-xs text-gray-500 mt-1">Exports as {user}/{bot} tags.</p>
+      <div onclick="exportData()" class="border border-line rounded-lg p-4 text-center hover:border-accent transition-colors cursor-pointer">
+        <i data-lucide="download" class="w-6 h-6 mx-auto mb-2 text-body"></i><h4 class="font-medium text-sm">Download TXT</h4><p class="text-xs text-dim mt-1">Exports as {user}/{bot} tags.</p>
       </div>
-      <div class="border border-dashed border-gray-200 dark:border-gray-700 rounded-lg p-4 text-center hover:border-black dark:hover:border-white transition-colors cursor-pointer relative bg-gray-50 dark:bg-[#111]">
+      <div class="border border-dashed border-line rounded-lg p-4 text-center hover:border-accent transition-colors cursor-pointer relative bg-surface-2">
         <input type="file" accept=".txt" class="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onchange="importData(event)">
-        <i data-lucide="upload" class="w-6 h-6 mx-auto mb-2 text-gray-700 dark:text-gray-300"></i><h4 class="font-medium text-sm">Import Session</h4><p class="text-xs text-gray-500 mt-1">Upload a .txt exported file.</p>
+        <i data-lucide="upload" class="w-6 h-6 mx-auto mb-2 text-body"></i><h4 class="font-medium text-sm">Import Session</h4><p class="text-xs text-dim mt-1">Upload a .txt exported file.</p>
       </div>
     </div>
   </div>
 
   <!-- Account -->
-  <div id="account-modal" class="modal-content bg-white dark:bg-[#0a0a0a] w-[calc(100%-1rem)] max-w-md rounded-xl shadow-2xl border border-gray-200 dark:border-gray-800 hf flex flex-col" onclick="event.stopPropagation()">
-    <div class="px-4 sm:px-6 py-4 border-b border-gray-200 dark:border-gray-800 flex justify-between items-center bg-gray-50 dark:bg-[#111]"><h3 class="font-semibold text-lg">Account Settings</h3><button onclick="closeModals()" class="text-gray-500 hover:text-black dark:hover:text-white"><i data-lucide="x" class="w-5 h-5"></i></button></div>
+  <div id="account-modal" class="modal-content bg-surface w-[calc(100%-1rem)] max-w-md rounded-xl shadow-2xl border border-line hf flex flex-col" onclick="event.stopPropagation()">
+    <div class="px-4 sm:px-6 py-4 border-b border-line flex justify-between items-center bg-surface-2"><h3 class="font-semibold text-lg">Account Settings</h3><button onclick="closeModals()" class="text-dim hover:text-main"><i data-lucide="x" class="w-5 h-5"></i></button></div>
     <div class="p-4 sm:p-6 space-y-4">
-      <div id="acct-error" class="hf text-sm text-red-500 bg-red-50 dark:bg-red-900/20 px-3 py-2 rounded-lg"></div>
-      <div id="acct-success" class="hf text-sm text-green-600 bg-green-50 dark:bg-green-900/20 px-3 py-2 rounded-lg"></div>
-      <div><label class="block text-xs font-medium text-gray-500 mb-1">New Username</label><input type="text" id="acct-username" class="w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-lg p-3 text-base md:text-sm outline-none focus:border-black dark:focus:border-white"></div>
-      <div><label class="block text-xs font-medium text-gray-500 mb-1">New Password <span class="text-gray-400">(blank = keep current)</span></label><input type="password" id="acct-newpass" placeholder="••••••" class="w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-lg p-3 text-base md:text-sm outline-none focus:border-black dark:focus:border-white"></div>
-      <div><label class="block text-xs font-medium text-gray-500 mb-1">Current Password <span class="text-red-500">*</span></label><input type="password" id="acct-curpass" class="w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-lg p-3 text-base md:text-sm outline-none focus:border-black dark:focus:border-white"></div>
+      <div id="acct-error" class="hf text-sm text-danger bg-danger-soft px-3 py-2 rounded-lg"></div>
+      <div id="acct-success" class="hf text-sm text-success bg-success-soft px-3 py-2 rounded-lg"></div>
+      <div><label class="block text-xs font-medium text-dim mb-1">New Username</label><input type="text" id="acct-username" class="w-full border border-line bg-transparent rounded-lg p-3 text-base md:text-sm outline-none focus:border-accent"></div>
+      <div><label class="block text-xs font-medium text-dim mb-1">New Password <span class="text-dim">(blank = keep current)</span></label><input type="password" id="acct-newpass" placeholder="••••••" class="w-full border border-line bg-transparent rounded-lg p-3 text-base md:text-sm outline-none focus:border-accent"></div>
+      <div><label class="block text-xs font-medium text-dim mb-1">Current Password <span class="text-danger">*</span></label><input type="password" id="acct-curpass" class="w-full border border-line bg-transparent rounded-lg p-3 text-base md:text-sm outline-none focus:border-accent"></div>
     </div>
-    <div class="px-4 sm:px-6 py-4 border-t border-gray-200 dark:border-gray-800 flex justify-end bg-gray-50 dark:bg-[#111]"><button onclick="saveAccount()" class="w-full sm:w-auto bg-black dark:bg-white text-white dark:text-black px-6 py-2.5 rounded-lg text-sm font-medium hover:opacity-80">Save Changes</button></div>
+    <div class="px-4 sm:px-6 pb-5">
+      <div class="pt-5 border-t border-line">
+        <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Two-factor authentication</p>
+        <div id="mfa-panel" class="text-sm"></div>
+      </div>
+    </div>
+    <div class="px-4 sm:px-6 py-4 border-t border-line flex justify-end bg-surface-2"><button onclick="saveAccount()" class="w-full sm:w-auto bg-accent text-onaccent px-6 py-2.5 rounded-lg text-sm font-medium hover:opacity-80">Save Changes</button></div>
   </div>
 
   <!-- Nuke -->
-  <div id="nuke-modal" class="modal-content bg-white dark:bg-[#0a0a0a] w-[calc(100%-1rem)] max-w-md rounded-xl shadow-2xl border border-gray-200 dark:border-gray-800 hf flex flex-col" onclick="event.stopPropagation()">
-    <div class="px-4 sm:px-6 py-4 border-b border-gray-200 dark:border-gray-800 flex justify-between items-center bg-gray-50 dark:bg-[#111]"><h3 class="font-semibold text-lg text-red-600">Danger Zone</h3><button onclick="closeModals()" class="text-gray-500 hover:text-black dark:hover:text-white"><i data-lucide="x" class="w-5 h-5"></i></button></div>
+  <div id="nuke-modal" class="modal-content bg-surface w-[calc(100%-1rem)] max-w-md rounded-xl shadow-2xl border border-line hf flex flex-col" onclick="event.stopPropagation()">
+    <div class="px-4 sm:px-6 py-4 border-b border-line flex justify-between items-center bg-surface-2"><h3 class="font-semibold text-lg text-danger">Danger Zone</h3><button onclick="closeModals()" class="text-dim hover:text-main"><i data-lucide="x" class="w-5 h-5"></i></button></div>
     <div class="p-4 sm:p-6 space-y-4">
-      <p class="text-sm text-gray-600 dark:text-gray-400">Drops all data, scrambles your account, and logs you out. Irreversible.</p>
-      <input type="password" id="nuke-pass" placeholder="Enter current password" class="w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-md p-2 text-base md:text-sm outline-none focus:border-red-500">
-      <div id="nuke-error" class="hf text-sm text-red-500 bg-red-50 dark:bg-red-900/20 px-3 py-2 rounded-lg"></div>
-      <button onclick="nukeServer()" class="w-full bg-red-600 text-white px-4 py-2 rounded-md text-sm font-medium hover:bg-red-700 flex items-center justify-center space-x-2"><i data-lucide="alert-triangle" class="w-4 h-4"></i><span>Nuke Server (Wipe DB)</span></button>
+      <p class="text-sm text-body">Drops all data, scrambles your account, and logs you out. Irreversible.</p>
+      <input type="password" id="nuke-pass" placeholder="Enter current password" class="w-full border border-line bg-transparent rounded-md p-2 text-base md:text-sm outline-none focus:border-danger">
+      <div id="nuke-error" class="hf text-sm text-danger bg-danger-soft px-3 py-2 rounded-lg"></div>
+      <button onclick="nukeServer()" class="w-full bg-danger text-onaccent px-4 py-2 rounded-md text-sm font-medium hover:bg-red-700 flex items-center justify-center space-x-2"><i data-lucide="alert-triangle" class="w-4 h-4"></i><span>Nuke Server (Wipe DB)</span></button>
     </div>
   </div>
 
+
+<!-- Appearance -->
+<div id="appearance-modal" class="modal-content bg-surface w-[calc(100%-1rem)] max-w-2xl max-h-[88vh] rounded-xl shadow-2xl border border-line hf flex flex-col overflow-hidden" onclick="event.stopPropagation()">
+  <div class="flex items-center justify-between px-5 py-4 border-b border-line flex-shrink-0">
+    <h2 class="font-semibold text-sm">Appearance</h2>
+    <button onclick="closeModals()" class="text-dim hover:text-main"><i data-lucide="x" class="w-4 h-4"></i></button>
+  </div>
+  <div class="flex gap-1 px-5 pt-3 border-b border-line flex-shrink-0 overflow-x-auto" id="ap-tabs">
+    <button data-tab="theme" onclick="apTab('theme')" class="ap-tab px-3 py-2 text-xs font-semibold border-b-2 border-transparent text-dim">Theme</button>
+    <button data-tab="style" onclick="apTab('style')" class="ap-tab px-3 py-2 text-xs font-semibold border-b-2 border-transparent text-dim">Style</button>
+    <button data-tab="colour" onclick="apTab('colour')" class="ap-tab px-3 py-2 text-xs font-semibold border-b-2 border-transparent text-dim flex-shrink-0">Colour</button>
+    <button data-tab="bubble" onclick="apTab('bubble')" class="ap-tab px-3 py-2 text-xs font-semibold border-b-2 border-transparent text-dim flex-shrink-0">Bubble</button>
+    <button data-tab="bubbleset" onclick="apTab('bubbleset')" class="ap-tab px-3 py-2 text-xs font-semibold border-b-2 border-transparent text-dim flex-shrink-0">Bubble setup</button>
+    <button data-tab="more" onclick="apTab('more')" class="ap-tab px-3 py-2 text-xs font-semibold border-b-2 border-transparent text-dim">More</button>
+  </div>
+  <div id="ap-scope" class="hf px-5 pt-3"></div>
+  <div class="overflow-y-auto p-5 space-y-6">
+
+    <div data-panel="theme" class="ap-panel space-y-2">
+      <p class="text-xs text-dim">A theme is a different interface, not a different colour. Pick the shape first.</p>
+      <div id="theme-grid" class="grid grid-cols-1 sm:grid-cols-2 gap-2"></div>
+    </div>
+
+    <div data-panel="style" class="ap-panel hf space-y-5">
+      <p class="text-xs text-dim">Options belonging to <span id="style-theme-name" class="font-semibold text-main">this theme</span>.</p>
+      <div id="style-options" class="space-y-5"></div>
+    </div>
+
+    <div data-panel="colour" class="ap-panel hf space-y-5">
+      <div id="colour-panel" class="space-y-5"></div>
+    </div>
+
+    <div data-panel="bubble" class="ap-panel hf space-y-5">
+      <div id="bubble-panel" class="space-y-5"></div>
+    </div>
+
+    <div data-panel="bubbleset" class="ap-panel hf space-y-5">
+      <div id="bubbleset-panel" class="space-y-5"></div>
+    </div>
+
+    <div data-panel="more" class="ap-panel hf space-y-6">
+      <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Font</p>
+      <div class="flex gap-2">
+        <input id="font-input" type="text" placeholder="Any Google Font, e.g. Nunito" class="flex-1 min-w-0 bg-transparent border border-line rounded-lg px-3 py-2 text-sm outline-none focus:border-accent">
+        <button onclick="applyUserFont()" class="px-3 py-2 rounded-lg bg-accent text-onaccent text-xs font-semibold flex-shrink-0">Apply</button>
+        <button onclick="applyUserFont('')" class="px-3 py-2 rounded-lg border border-line text-xs flex-shrink-0">Reset</button>
+      </div>
+    </div>
+
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Mouse cursor</p>
+      <p class="text-xs text-dim mb-2">Pick one below, or bring your own: paste a cursor page, paste a direct image link, or upload a file.</p>
+      <div id="cursor-kit" class="flex flex-wrap gap-2 mb-3">
+        <button onclick="useCursorKit()" class="px-3 py-2 rounded-lg border border-line text-xs font-semibold">Built-in cursors</button>
+      </div>
+      <p class="text-[11px] text-dim mb-2">Pages that work: <span class="text-main">rw-designer.com</span> has its own rule, and any page whose cursors are plain images is read directly &mdash; <span class="text-main">cursors-4u.com</span>, <span class="text-main">custom-cursor.com</span> and most galleries qualify. A direct <span class="font-mono">.png</span>, <span class="font-mono">.gif</span> or <span class="font-mono">.cur</span> link always works. Max 256&nbsp;KB, 128&times;128.</p>
+      <div class="flex gap-2">
+        <input id="cursor-url" type="text" placeholder="https://&hellip;" class="flex-1 min-w-0 bg-transparent border border-line rounded-lg px-3 py-2 text-sm outline-none focus:border-accent">
+        <button id="cursor-find" onclick="findCursors()" class="px-3 py-2 rounded-lg bg-accent text-onaccent text-xs font-semibold flex-shrink-0">Find</button>
+        <label class="px-3 py-2 rounded-lg border border-line text-xs cursor-pointer flex-shrink-0">Upload<input type="file" accept="image/*" class="hf" onchange="uploadCursor(event)"></label>
+      </div>
+      <div id="cursor-results" class="grid grid-cols-4 sm:grid-cols-6 gap-2 mt-3"></div>
+      <div id="cursor-tuner" class="hf mt-3 flex flex-col sm:flex-row gap-4 items-start">
+        <div>
+          <p class="text-xs text-dim mb-1">Click the tip you point with</p>
+          <canvas id="cursor-canvas" width="160" height="160" onclick="pickHotspot(event)" class="border border-line rounded-lg" style="image-rendering:pixelated;cursor:crosshair"></canvas>
+        </div>
+        <div class="flex-1 space-y-2 text-xs">
+          <p class="text-dim">Hotspot: <span id="hotspot-label" class="font-mono">0, 0</span></p>
+          <label class="block text-dim">Size <span id="cursor-size-val" class="font-mono text-main">32px</span>
+            <input id="cursor-size" type="range" min="12" max="128" step="2" value="32"
+              oninput="$('cursor-size-val').textContent=this.value+'px'" onchange="setCursorSize(this.value)"
+              class="w-full accent-accent">
+          </label>
+          <p class="text-dim">Hover here to try it &mdash; it is already live.</p>
+          <div class="flex gap-2 flex-wrap">
+            <button onclick="saveCursor()" class="px-3 py-2 rounded-lg bg-accent text-onaccent text-xs font-semibold">Save cursor</button>
+            <button onclick="clearCursor()" class="px-3 py-2 rounded-lg border border-line text-xs">Remove</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Liquid glass</p>
+      <div class="flex items-center justify-between gap-3 mb-1">
+        <p class="text-xs text-dim flex-1">Frosts the bubbles, the sidebar, the header bar, the buttons and the sketchboard so what is behind them shows through.</p>
+        <button id="glass-toggle" onclick="toggleGlass()" class="w-11 h-6 rounded-full relative flex-shrink-0 bg-surface-3">
+          <span class="absolute top-0.5 w-5 h-5 rounded-full bg-surface shadow transition-[left]" style="left:2px"></span>
+        </button>
+      </div>
+      <label class="block text-xs text-dim mt-3">Frost <span id="glass-blur-val" class="font-mono">0.5px</span>
+        <input id="glass-blur" type="range" min="0" max="14" step="0.5" value="0.5" oninput="tuneGlass()" class="w-full accent-accent">
+      </label>
+      <p class="text-[11px] text-dim mb-5">How much the glass blurs what is behind it. The refraction that bends the edges stays whatever you set &mdash; but past two or three pixels there is little left behind the element to bend. Turns itself off where the system asks for reduced transparency.</p>
+
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Wallpaper</p>
+      <p class="text-xs text-dim mb-2">A picture or a video. A link ending .mp4, .webm or .mov plays as video, muted and looping.</p>
+      <div class="flex gap-2">
+        <input id="bg-url" type="text" placeholder="Image or video link&hellip;" class="flex-1 min-w-0 bg-transparent border border-line rounded-lg px-3 py-2 text-sm outline-none focus:border-accent">
+        <button onclick="applyWallpaper()" class="px-3 py-2 rounded-lg bg-accent text-onaccent text-xs font-semibold flex-shrink-0">Apply</button>
+        <button onclick="applyWallpaper('')" class="px-3 py-2 rounded-lg border border-line text-xs flex-shrink-0">Clear</button>
+      </div>
+      <label class="inline-flex items-center gap-2 mt-2 px-3 py-2 rounded-lg border border-line text-xs cursor-pointer">
+        <i data-lucide="upload" class="w-3.5 h-3.5"></i>Use a file from this device
+        <input type="file" accept="image/*,video/*" class="hf" onchange="uploadWallpaper(event)">
+      </label>
+      <p class="text-[11px] text-dim mt-1">Stays on this device &mdash; too big for the settings that follow your account, so each machine keeps its own. Up to 120MB.</p>
+      <div class="grid grid-cols-2 gap-4 mt-3">
+        <label class="text-xs text-dim">Dim <span id="bg-op-val" class="font-mono">100%</span><input id="bg-op" type="range" min="5" max="100" value="100" oninput="tuneWallpaper()" class="w-full accent-accent"></label>
+        <label class="text-xs text-dim">Blur <span id="bg-blur-val" class="font-mono">0px</span><input id="bg-blur" type="range" min="0" max="24" value="0" oninput="tuneWallpaper()" class="w-full accent-accent"></label>
+      </div>
+      <label class="block text-xs text-dim mt-3">Show through <span id="bg-veil-val" class="font-mono">100%</span>
+        <input id="bg-veil" type="range" min="0" max="100" value="100" oninput="tuneWallpaper()" class="w-full accent-accent">
+      </label>
+      <p class="text-[11px] text-dim mt-1">How much of the wallpaper comes through the app itself. At 100% only the bubbles and inputs stay solid.</p>
+      </div>
+    </div>
+
+  </div>
+</div>
   <!-- Edit Pin Modal -->
-  <div id="edit-pin-modal" class="modal-content bg-white dark:bg-[#0a0a0a] w-[calc(100%-1rem)] max-w-lg rounded-xl shadow-2xl border border-gray-200 dark:border-gray-800 hf flex flex-col" onclick="event.stopPropagation()">
-    <div class="px-4 sm:px-6 py-4 border-b border-gray-200 dark:border-gray-800 flex justify-between items-center bg-gray-50 dark:bg-[#111]">
+  <div id="edit-pin-modal" class="modal-content bg-surface w-[calc(100%-1rem)] max-w-lg rounded-xl shadow-2xl border border-line hf flex flex-col" onclick="event.stopPropagation()">
+    <div class="px-4 sm:px-6 py-4 border-b border-line flex justify-between items-center bg-surface-2">
       <h3 class="font-semibold text-lg">Edit Sketchboard Pin</h3>
-      <button onclick="closeModals()" class="text-gray-500 hover:text-black dark:hover:text-white"><i data-lucide="x" class="w-5 h-5"></i></button>
+      <button onclick="closeModals()" class="text-dim hover:text-main"><i data-lucide="x" class="w-5 h-5"></i></button>
     </div>
     <div class="p-4 sm:p-6">
-      <textarea id="edit-pin-ta" rows="6" class="w-full border border-gray-200 dark:border-gray-700 bg-transparent rounded-lg p-3 text-base md:text-sm outline-none focus:border-black dark:focus:border-white resize-y" placeholder="Pin content..."></textarea>
+      <textarea id="edit-pin-ta" rows="6" class="w-full border border-line bg-transparent rounded-lg p-3 text-base md:text-sm outline-none focus:border-accent resize-y" placeholder="Pin content..."></textarea>
       <input type="hidden" id="edit-pin-id">
     </div>
-    <div class="px-4 sm:px-6 py-4 border-t border-gray-200 dark:border-gray-800 flex justify-end space-x-3 bg-gray-50 dark:bg-[#111]">
-      <button onclick="closeModals()" class="px-4 py-2 text-sm text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-md">Cancel</button>
-      <button onclick="savePinEdit()" class="bg-black dark:bg-white text-white dark:text-black px-6 py-2 rounded-lg text-sm font-medium hover:opacity-80">Save Pin</button>
+    <div class="px-4 sm:px-6 py-4 border-t border-line flex justify-end space-x-3 bg-surface-2">
+      <button onclick="closeModals()" class="px-4 py-2 text-sm text-dim hover:bg-surface-2 rounded-md">Cancel</button>
+      <button onclick="savePinEdit()" class="bg-accent text-onaccent px-6 py-2 rounded-lg text-sm font-medium hover:opacity-80">Save Pin</button>
     </div>
   </div>
 </div>
 
 <script>
+/* ── ICONS ──────────────────────────────────────────────────────────────
+   A drop-in for lucide.createIcons(): same name, same call sites. Each
+   [data-lucide] element becomes an <svg> pointing at the sprite, keeping the
+   element's own class and id so layout and lookups by id still work.
+
+   data-lucide is kept on the replacement rather than consumed, because two
+   places swap an icon by rewriting it (sun <-> moon) and then calling this
+   again. data-icon records what was drawn, so a second call is a no-op unless
+   the name actually changed. */
+const ICON_NS='http://www.w3.org/2000/svg';
+function createIcons(root){
+  const scope=root&&root.querySelectorAll?root:document;
+  scope.querySelectorAll('[data-lucide]').forEach(el=>{
+    const name=el.getAttribute('data-lucide');
+    if(el.namespaceURI===ICON_NS && el.dataset.icon===name) return;
+    const svg=document.createElementNS(ICON_NS,'svg');
+    for(const a of el.attributes) svg.setAttribute(a.name,a.value);
+    svg.setAttribute('viewBox','0 0 24 24');
+    svg.setAttribute('fill','none');
+    svg.setAttribute('stroke','currentColor');
+    svg.setAttribute('stroke-width','2');
+    svg.setAttribute('stroke-linecap','round');
+    svg.setAttribute('stroke-linejoin','round');
+    svg.setAttribute('aria-hidden','true');
+    svg.dataset.icon=name;
+    const use=document.createElementNS(ICON_NS,'use');
+    use.setAttribute('href','#i-'+name);
+    svg.appendChild(use);
+    el.replaceWith(svg);
+  });
+}
+window.lucide={createIcons};
+
 marked.setOptions({breaks:true,gfm:true});
-marked.use(window.markedKatex({ throwOnError: false, displayMode: true }));
+
+/* ── KATEX ON DEMAND ────────────────────────────────────────────────────
+   74KB of JS plus a stylesheet, for a feature most conversations never use.
+   Loaded the first time a message actually contains maths, then the message
+   is re-rendered so nothing is lost by having missed the first pass. */
+let _katexReady=null;
+/* One repaint after KaTeX arrives, coalesced so a burst of maths-bearing
+   messages does not schedule a repaint each. */
+let _mathRepaint=null;
+function repaintMath(){
+  clearTimeout(_mathRepaint);
+  _mathRepaint=setTimeout(()=>{
+    /* renderAllMessages rebuilds from S.msgs, which still holds the source
+       text, so no bubble has to carry a copy of its own markdown just for
+       this one repaint. */
+    const cc=$('chat-container');
+    if(!cc || !S.msgs.length) return;
+    const atBottom = cc.scrollHeight - cc.scrollTop - cc.clientHeight < 40;
+    renderAllMessages();
+    if(atBottom) cc.scrollTop=cc.scrollHeight;
+  }, 60);
+}
+function hasMath(s){ return /\\$\\$[\\s\\S]+?\\$\\$|\\$[^$\\n]+?\\$|\\\\\\(|\\\\\\[/.test(s||''); }
+function ensureKatex(){
+  if(_katexReady) return _katexReady;
+  const load=(tag,attrs)=>new Promise((ok,no)=>{
+    const e=document.createElement(tag); Object.assign(e,attrs);
+    e.onload=ok; e.onerror=no; document.head.appendChild(e);
+  });
+  _katexReady=(async()=>{
+    await load('link',{rel:'stylesheet',href:'https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css'});
+    await load('script',{src:'https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js'});
+    await load('script',{src:'https://cdn.jsdelivr.net/npm/marked-katex-extension@5.0.0/lib/index.umd.js'});
+    marked.use(window.markedKatex({ throwOnError:false, displayMode:true }));
+  })().catch(e=>{ console.warn('KaTeX unavailable', e); });
+  return _katexReady;
+}
 
 // Chat content comes from the AI/model and must be treated as untrusted.
 // Beyond script execution, a bare DOMPurify default profile still allows
 // <style>, <form>/<input>, and inline position:fixed/z-index styles, any of
 // which can hijack or blank out the whole page without any JS running.
 const DOMPURIFY_CONFIG = {
-    FORBID_TAGS: ['style','iframe','object','embed','form','input','button','select','textarea','base','meta','link'],
-    FORBID_ATTR: ['formaction'],
+    /* svg and math are here because both have historically been the way round
+       a sanitiser: the parser switches to a foreign content mode inside them,
+       so markup that looked inert on the way in becomes live on the way out.
+       Nothing in a chat reply needs either. */
+    FORBID_TAGS: ['style','iframe','object','embed','form','input','button','select',
+                  'textarea','base','meta','link','svg','math','template','noscript',
+                  'title','frame','frameset','portal'],
+    /* srcset and ping are URL-bearing attributes that ALLOWED_URI_REGEXP does
+       not police; xlink:href is the SVG way of writing href; autofocus and
+       dirname are input-shaped attacks that survive tag removal on stray
+       elements. */
+    FORBID_ATTR: ['formaction','srcset','ping','xlink:href','autofocus','dirname',
+                  'is','slot','contenteditable'],
     ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto):|[^a-z]|[a-z+.\\-]+(?:[^a-z+.\\-:]|$))/i,
+    /* stops a reply from minting an element whose id or name shadows a real
+       property of document or window, which is how a sanitised page still ends
+       up handing an attacker a reference it should not have */
+    SANITIZE_DOM: true,
+    SANITIZE_NAMED_PROPS: true,
 };
 DOMPurify.addHook('uponSanitizeAttribute', (node, data) => {
     if (data.attrName === 'style') {
         data.attrValue = data.attrValue
             .replace(/position\\s*:\\s*fixed/gi, 'position:relative')
-            .replace(/z-index\\s*:[^;]*/gi, '');
+            .replace(/z-index\\s*:[^;]*/gi, '')
+            /* An inline style that fetches a URL is a way for a reply to phone
+               home: the request itself carries whatever the author managed to
+               put in the URL, and it happens with no script at all. */
+            .replace(/url\\s*\\(/gi, 'none(')
+            .replace(/(?:expression|behavior|-moz-binding)\\s*\\(/gi, 'none(')
+            .replace(/@import/gi, '');
     }
 });
 DOMPurify.addHook('afterSanitizeAttributes', (node) => {
@@ -2542,6 +8218,164 @@ const S={
 
 const $=id=>document.getElementById(id);
 
+
+/* The message list is pulled up behind the header so messages pass under it
+   rather than being cut off at its edge, and that pull has to equal the bar's
+   height exactly. It is not a constant: 64px in most themes, 52 in Zen, 44 in
+   Console, and any of them can change with the density setting or a font. A
+   hard-coded 4rem left Zen pulled twelve pixels too far.
+
+   Cheap: one observer for one element, firing only when the bar actually
+   changes shape. */
+/* A panel docked in the column would be invisible - and unreachable - the
+   moment the layout stops having a column. */
+function railOnLayoutChange(){
+  if(!railAvailable() && _dockedId){
+    const id=_dockedId;
+    undockPanel();
+    openModal(id);              // reopens it as a modal, where there is room
+  }
+  if(!railAvailable()) delete document.documentElement.dataset.rail;
+}
+addEventListener('resize', railOnLayoutChange);
+
+function watchHeaderHeight(){
+  const h = document.getElementById('chat-header');
+  if(!h || !window.ResizeObserver) return;
+  const set = () => {
+    const px = Math.round(h.getBoundingClientRect().height);
+    if(px > 0) document.documentElement.style.setProperty('--hdr-h', px + 'px');
+  };
+  new ResizeObserver(set).observe(h);
+  set();
+}
+
+/* ── THE LOOK FOLLOWS THE ACCOUNT ───────────────────────────────────────
+   rp_ui is a localStorage key, so everything built in the Appearance panel used
+   to belong to one browser on one machine. This keeps the same object on the
+   account: pushed a moment after it changes, pulled when the app starts.
+
+   Whoever saved last wins. Merging two divergent themes field by field would
+   produce a third theme nobody chose.
+
+   colourCache is stripped on the way out. It is derived output - the engine
+   rebuilds it from the palette in a frame - and it is the largest thing in
+   there by some way, which matters against a 256KB row. */
+let _prefsAt = +(localStorage.getItem('rp_ui_at') || 0);
+let _prefsTimer = 0, _prefsBusy = false, _prefsApplying = false;
+/* Nothing may be sent before the account has been read once. */
+let _prefsReady = false;
+
+function prefsPayload(){
+  const r = UI.raw();
+  const out = {};
+  for(const k in r) if(k !== 'colourCache') out[k] = r[k];
+  /* A file picked on this machine cannot be read from another one, so the
+     account is told there is no wallpaper rather than told about one it will
+     never find. */
+  if(out.bgKind === 'localvideo' || out.bgKind === 'localimage'){
+    delete out.bg; delete out.bgSrc; delete out.bgKind;
+  }
+  return JSON.stringify({
+    ui: out,
+    skin: document.documentElement.dataset.skin || 'graphite',
+    layout: document.documentElement.dataset.layout || 'studio',
+    density: document.documentElement.dataset.density || 'comfortable',
+    dark: document.documentElement.classList.contains('dark'),
+  });
+}
+
+async function pushPrefs(){
+  if(_prefsBusy) return;
+  _prefsBusy = true;
+  try{
+    const d = await api('prefs', {op:'put', data: prefsPayload()});
+    if(d && d.ok){
+      _prefsAt = d.updated_at;
+      localStorage.setItem('rp_ui_at', String(_prefsAt));
+    } else if(d && d.error){
+      /* said once, not on every keystroke that follows */
+      if(!window._prefsWarned){ window._prefsWarned = true; toast(d.error, 5000); }
+    }
+  } finally { _prefsBusy = false; }
+}
+
+/* Every save schedules one push. The Appearance sliders write on every step, so
+   without this a single drag would be fifty round trips.
+
+   And nothing at all is scheduled until the account has been read. A machine
+   with no local copy boots empty, and the boot sequence writes to UI on its way
+   up; without this gate that emptiness reaches the account before the account
+   has been looked at, and overwrites whatever was there. That is not a
+   theoretical race - it is how this deleted a working theme the first time it
+   ran. */
+function queuePrefsPush(){
+  if(!_prefsReady || _prefsApplying) return;
+  clearTimeout(_prefsTimer);
+  _prefsTimer = setTimeout(pushPrefs, 1500);
+}
+
+/* Answers with what it found, because what to do next depends on it:
+   'applied' took the account's copy, 'stale' means ours is the later one,
+   'empty' means the account has none yet, 'failed' means we do not know. */
+async function pullPrefs(){
+  let d;
+  try{ d = await api('prefs', {op:'get'}); }catch(e){ return 'failed'; }
+  if(!d || d.error) return 'failed';
+  if(!d.data) return 'empty';
+  /* Only if the account's copy is actually newer than what this browser last
+     pushed. Otherwise a machine that has been offline would overwrite itself
+     with its own older state on every start. */
+  if(d.updated_at <= _prefsAt) return 'stale';
+  let p; try{ p = JSON.parse(d.data); }catch{ return 'failed'; }
+  if(!p || typeof p.ui !== 'object') return 'failed';
+
+  const keep = UI.raw().colourCache;          // derived, and this browser's own
+  const next = Object.assign({}, p.ui);
+  if(keep) next.colourCache = keep;
+  _prefsApplying = true;
+  try{ UI.save(next); } finally { _prefsApplying = false; }
+
+  const el = document.documentElement;
+  if(p.skin)    { el.dataset.skin = p.skin;       setCookie('rp_skin', p.skin); }
+  if(p.layout)  { el.dataset.layout = p.layout;   setCookie('rp_layout', p.layout); }
+  if(p.density) { el.dataset.density = p.density; setCookie('rp_density', p.density); }
+  el.classList.toggle('dark', !!p.dark);
+  setCookie('aiphp_theme', p.dark ? 'dark' : 'light');
+  localStorage.setItem('aiphp_theme', p.dark ? 'dark' : 'light');
+
+  _prefsAt = d.updated_at;
+  localStorage.setItem('rp_ui_at', String(_prefsAt));
+  return 'applied';
+}
+
+function setCookie(k, v){
+  try{
+    localStorage.setItem(k, v);
+    document.cookie = k + '=' + encodeURIComponent(v) + ';path=/;max-age=31536000;samesite=lax';
+  }catch(e){}
+}
+
+/* Pull once the app is up, then repaint everything the pulled state describes.
+   Failing quietly is right here: no network should mean the local look, not no
+   look. */
+async function syncPrefsOnStart(){
+  let verdict = 'failed';
+  try{ verdict = await pullPrefs(); }catch(e){}
+  if(verdict === 'applied'){
+    _prefsApplying = true;
+    try{
+      _baseCache = {};
+      applyColour(); applyLook(); applyBubble();
+    } finally { _prefsApplying = false; }
+  }
+  /* only now may this machine write */
+  _prefsReady = true;
+  /* Seed an account that has nothing, or hand up a copy that is newer than the
+     one stored. Never after 'failed': not knowing what is up there is exactly
+     the case where writing over it is worst. */
+  if(verdict === 'empty' || verdict === 'stale') pushPrefs();
+}
 async function api(action,data={},method='POST'){
     const o={method,headers:{'Content-Type':'application/json','X-CSRF-Token':S.csrf,'X-Session-Id':S.session}};
     if(method!=='GET')o.body=JSON.stringify(data);
@@ -2620,10 +8454,37 @@ async function streamFetch(action, payload, tries = 3) {
 }
 
 function toast(msg,dur=2400){const t=$('toast');t.textContent=msg;t.classList.remove('hf');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.add('hf'),dur);}
-function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+/* Escapes for HTML text AND for either kind of quoted attribute. The
+   apostrophe matters here more than usual: nearly every list in this app
+   builds its handlers as onclick="fn('\${value}')", so an unescaped apostrophe
+   ends the JS string and the rest of the value is executed. */
+function esc(s){
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/\`/g,'&#96;');
+}
+/* For a value that lands inside a JS string literal inside an attribute -
+   esc() alone is not enough there, because the browser un-escapes the
+   attribute before the JS parser ever sees it. */
+function escJs(s){
+  return String(s).replace(/[\\\\'"\`\\r\\n\\u2028\\u2029<>&]/g,
+    c=>'\\\\u'+c.charCodeAt(0).toString(16).padStart(4,'0'));
+}
+/* A URL that is about to go inside a CSS url(). Only http(s), and the two
+   characters that could end the string are removed rather than escaped. */
+function cssUrl(u){
+  try{ const p=new URL(String(u), location.href);
+    if(p.protocol!=='https:' && p.protocol!=='http:') return '';
+    return p.href.replace(/["'()\\\\]/g,'');
+  }catch(e){ return ''; }
+}
 
 function formatContent(rawText) {
     if (!rawText) return '';
+    /* KaTeX is not loaded until a message needs it. When one does, fetch it and
+       repaint the conversation once it is ready - the first pass renders the
+       maths as plain text, the second renders it properly. */
+    if (!_katexReady && hasMath(rawText)) ensureKatex().then(repaintMath);
     let thoughtHtml = '';
     let mainText = rawText;
 
@@ -2639,14 +8500,14 @@ function formatContent(rawText) {
         
         thoughtHtml = \`
             <details class="mb-3 group/think" \${isOpen}>
-                <summary class="cursor-pointer text-xs font-semibold text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 select-none flex items-center w-max">
-                    <span class="border border-gray-200 dark:border-gray-700 rounded-md px-2 py-1 flex items-center space-x-1.5 bg-gray-50 dark:bg-[#1a1a1a]">
+                <summary class="cursor-pointer text-xs font-semibold text-dim hover:text-body select-none flex items-center w-max">
+                    <span class="border border-line rounded-md px-2 py-1 flex items-center space-x-1.5 bg-surface-2">
                         <i data-lucide="brain-circuit" class="w-3.5 h-3.5"></i>
                         <span>Thought Process</span>
                         <i data-lucide="chevron-down" class="w-3.5 h-3.5 transition-transform group-open/think:rotate-180"></i>
                     </span>
                 </summary>
-                <div class="mt-2 text-sm text-gray-500 dark:text-gray-400 border-l-2 border-gray-300 dark:border-gray-700 pl-3 py-1 whitespace-pre-wrap font-mono overflow-x-auto">
+                <div class="mt-2 text-sm text-dim border-l-2 border-line-2 pl-3 py-1 whitespace-pre-wrap font-mono overflow-x-auto">
                     \${esc(thoughtContent)}
                 </div>
             </details>
@@ -2670,8 +8531,8 @@ function formatContent(rawText) {
         const topBar = document.createElement('div');
         topBar.className = 'flex items-center justify-between px-3 py-1.5 bg-[rgba(127,127,127,0.08)] border-b border-[rgba(127,127,127,0.12)]';
         topBar.innerHTML = \`
-            <span class="text-xs font-mono text-gray-500 lowercase">\${lang}</span>
-            <button onclick="copyCodeBlock(this)" class="flex items-center space-x-1.5 text-xs text-gray-500 hover:text-black dark:hover:text-white transition-colors">
+            <span class="text-xs font-mono text-dim lowercase">\${lang}</span>
+            <button onclick="copyCodeBlock(this)" class="flex items-center space-x-1.5 text-xs text-dim hover:text-main transition-colors">
                 <i data-lucide="copy" class="w-3.5 h-3.5"></i>
                 <span class="copy-label">Copy</span>
             </button>
@@ -2685,10 +8546,43 @@ function formatContent(rawText) {
     return thoughtHtml + tempDiv.innerHTML;
 }
 
+/* Opened against its button and hung off <body>.
+
+   It used to sit inside #composer-shell>div, which is glass - and the backdrop
+   of an element inside a backdrop-filtered ancestor is that ancestor's backdrop
+   root, not the page. So the picker had a blur with nothing behind it to blur,
+   and read as a flat translucent panel while the message menu, a direct child
+   of <body>, looked like glass. Same rules, different place in the tree.
+
+   Fixed rather than absolute, because it is now positioned against the viewport
+   rather than against a composer that scrolls with the layout. */
 function toggleThinkingPicker(e) {
     e.stopPropagation();
-    $('think-picker').classList.toggle('hf');
+    const p = $('think-picker');
+    const wasOpen = !p.classList.contains('hf');
+    if (wasOpen) { p.classList.add('hf'); return; }
+    if (p.parentElement !== document.body) document.body.appendChild(p);
+    p.classList.remove('hf');
+    placeThinkingPicker();
 }
+/* Above the button, left-aligned with it, and nudged back inside the window if
+   that would put it off the edge. */
+function placeThinkingPicker(){
+    const p = $('think-picker'), b = $('think-btn');
+    if (!p || !b || p.classList.contains('hf')) return;
+    const r = b.getBoundingClientRect();
+    p.style.position = 'fixed';
+    p.style.bottom = 'auto';
+    p.style.right = 'auto';
+    const w = p.offsetWidth || 208, h = p.offsetHeight || 200;
+    let left = r.left;
+    left = Math.max(8, Math.min(left, innerWidth - w - 8));
+    let top = r.top - h - 8;
+    if (top < 8) top = Math.min(r.bottom + 8, innerHeight - h - 8);
+    p.style.left = left + 'px';
+    p.style.top  = top + 'px';
+}
+addEventListener('resize', placeThinkingPicker);
 function copyCodeBlock(btn) {
     const wrapper = btn.closest('.code-block-wrapper');
     const codeEl = wrapper.querySelector('code');
@@ -2706,7 +8600,7 @@ function copyCodeBlock(btn) {
     }
 }
 function thinkingIndicatorHTML(){
-    return '<span class="flex items-center space-x-2"><svg class="animate-spin w-4 h-4 text-purple-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-9-9"/></svg><span class="text-xs text-gray-400">Thinking...</span></span>';
+    return '<span class="flex items-center space-x-2"><svg class="animate-spin w-4 h-4 text-accent-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-9-9"/></svg><span class="text-xs text-dim">Thinking...</span></span>';
 }
 
 function setThinkingEffort(effort) {
@@ -2773,26 +8667,8 @@ ta.addEventListener('keydown', e => {
     $('persona-avatar').addEventListener('input',updateAvatarPreview);
     $('login-pass').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin();});
     
-    $('key-provider').addEventListener('change', e => {
-        const p = e.target.value;
-        const cont = $('custom-url-container');
-        cont.classList.remove('hf');
-        if (p === 'custom') {
-            $('custom-url-label').textContent = 'Custom API URL';
-            $('key-custom-url').placeholder = 'http://localhost:11434/v1/chat/completions';
-            $('key-model').placeholder = 'e.g. mistral-large-latest';
-        } else if (p === 'cloudflare') {
-            $('custom-url-label').textContent = 'Cloudflare Account ID';
-            $('key-custom-url').placeholder = 'e.g. a3b5c7d...';
-            $('key-model').placeholder = 'e.g. @cf/meta/llama-3-8b-instruct';
-} else if (p === 'gemini') {
-            cont.classList.add('hf');
-            $('key-model').placeholder = 'e.g. gemini-2.0-flash';
-        } else {
-            cont.classList.add('hf');
-            $('key-model').placeholder = 'e.g. mistral-large-latest';
-        }
-    });
+    // one place decides what the form shows for a provider (see syncKeyForm)
+    $('key-provider').addEventListener('change', syncKeyForm);
 
     const cc=$('chat-container');
     cc.addEventListener('scroll',()=>{
@@ -2821,6 +8697,10 @@ function applyBootstrap(d){
     $('login-screen').classList.add('hf');
     $('app').classList.remove('hf');
     S.csrf=d.csrf_token; S.username=d.username; S.session=d.session_id;
+    /* now that there is a session, ask the account what this user's app should
+       look like. Deliberately not awaited: the local look is already painted,
+       and a slow network should delay the correction, not the app. */
+    syncPrefsOnStart();
     S.personas=d.personas||[];
     S.currentPersonaId = d.current_persona_id || (S.personas[0]?S.personas[0].id:null);
     S.memory=d.memory||{}; S.sessions=d.sessions||[];
@@ -2829,6 +8709,7 @@ function applyBootstrap(d){
     S.sketchGlobal = d.sketchboard_active===undefined ? true : (d.sketchboard_active==1);
     S.gen = d.gen || {preset:'default'};
     S.genCustom = d.gen_custom || {};
+    applyLook();                 // the scopes are only knowable once we know the chat
     const cur = S.sessions.find(function(s){return s.id===S.session;});
     S.sessionLabel = (cur && cur.label) || S.session;
 
@@ -2836,6 +8717,7 @@ function applyBootstrap(d){
     updateHeader(); populateMemoryForm();
     renderAllMessages(); scrollToBottom();
     renderSketchboard();
+    renderSessionRail();          // after S.sessions exists, not before
     resumeFollowIfRunning();
     // API keys and personas load lazily when their modal opens (see openModal).
 }
@@ -2845,8 +8727,22 @@ async function doLogin(){
     err.classList.add('hf');
     btn.innerHTML='<svg class="animate-spin w-4 h-4 mr-2"viewBox="0 0 24 24"fill="none"stroke="currentColor"stroke-width="2"><path d="M21 12a9 9 0 11-9-9"/></svg>Signing in...';
     try{
-        const r=await fetch('?action=login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('login-user').value.trim(),password:$('login-pass').value})});
+        const r=await fetch('?action=login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+            username:$('login-user').value.trim(), password:$('login-pass').value, code:$('login-code').value||undefined})});
         const d=await r.json();
+        /* The server asks for a code without confirming the password was
+           right, so this branch reveals nothing on its own. */
+        if(d.mfa_required){
+          /* The server says only "try again", whatever actually happened, so
+             there is nothing here to count down or explain. */
+          $('login-mfa').classList.remove('hf');
+          const code=$('login-code');
+          code.value='';
+          code.focus();
+          if(d.error){ err.textContent=d.error; err.classList.remove('hf'); }
+          btn.innerHTML='<span>Sign In</span>';
+          return;
+        }
         if(d.error){err.textContent=d.error;err.classList.remove('hf');btn.innerHTML='<span>Sign In</span>';return;}
         
         const initD = await fetch('?action=bootstrap',{headers:{'X-Session-Id':S.session}}).then(x=>x.json());
@@ -2907,39 +8803,42 @@ function buildMsgEl(msg){
     
     const persona = S.personas.find(p => p.id == S.currentPersonaId) || S.personas[0] || {avatar: 'AI'};
     const av = persona.avatar || 'AI';
-    const avatarHtml=av.startsWith('http')?\`<img src="\${esc(av)}"class="w-full h-full object-cover">\`:\`<span class="text-xs font-bold text-gray-600 dark:text-gray-400">\${esc(av.substring(0,2))}</span>\`;
+    const avatarHtml=av.startsWith('http')?\`<img src="\${esc(av)}"class="w-full h-full object-cover">\`:\`<span class="text-xs font-bold text-body">\${esc(av.substring(0,2))}</span>\`;
     
     const pill=showPill&&!isGreeting?\`
-      <div class="variant-pill flex items-center space-x-1.5 mt-2.5 text-xs text-gray-500 bg-gray-50 dark:bg-[#1a1a1a] w-max px-2 py-1.5 rounded-md border border-gray-200 dark:border-gray-800">
-        <button onclick="changeVariation('\${msg.id}',-1)"\${ai===0?' disabled':''}class="hover:text-black dark:hover:text-white disabled:opacity-30 p-0.5"><i data-lucide="chevron-left"class="w-3.5 h-3.5"></i></button>
+      <div class="variant-pill flex items-center space-x-1.5 mt-2.5 text-xs text-dim bg-surface-2 w-max px-2 py-1.5 rounded-md border border-line">
+        <button onclick="changeVariation('\${msg.id}',-1)"\${ai===0?' disabled':''}class="hover:text-main disabled:opacity-30 p-0.5"><i data-lucide="chevron-left"class="w-3.5 h-3.5"></i></button>
         <span class="min-w-[2.5rem] text-center">\${ai+1}/\${vars.length}</span>
-        <button onclick="changeVariation('\${msg.id}',1)"\${isLast?' disabled':''}class="hover:text-black dark:hover:text-white disabled:opacity-30 p-0.5"><i data-lucide="chevron-right"class="w-3.5 h-3.5"></i></button>
-        <div class="w-px h-3 bg-gray-300 dark:bg-gray-700 mx-1"></div>
-        <span class="text-[10px] px-1.5 py-0.5 rounded \${isLast?'text-green-600 dark:text-green-400 bg-green-100 dark:bg-green-900/30':'text-amber-600 dark:text-amber-400 bg-amber-100 dark:bg-amber-900/30'}">\${isLast?'Latest':'Older'}</span>
+        <button onclick="changeVariation('\${msg.id}',1)"\${isLast?' disabled':''}class="hover:text-main disabled:opacity-30 p-0.5"><i data-lucide="chevron-right"class="w-3.5 h-3.5"></i></button>
+        <div class="w-px h-3 bg-gray-300 mx-1"></div>
+        <span class="text-[10px] px-1.5 py-0.5 rounded \${isLast?'text-green-600 bg-green-100 dark:bg-green-900/30':'text-amber-600 bg-amber-100 dark:bg-amber-900/30'}">\${isLast?'Latest':'Older'}</span>
       </div>\`:'';
     // An empty bot row is what a failed generation leaves behind: the message
     // was saved, the reply was not. Offer the retry rather than a blank bubble.
-    const failedHtml = isGreeting ? '' : \`<span class="flex flex-wrap items-center gap-2 text-xs text-gray-500 dark:text-gray-400"><i data-lucide="alert-triangle" class="w-3.5 h-3.5 text-amber-500 flex-shrink-0"></i><span>No reply was generated — your message was saved.</span><button onclick="regenDrop('\${msg.id}')" class="px-2 py-0.5 rounded border border-gray-300 dark:border-gray-700 hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-700 dark:text-gray-300">Retry</button></span>\`;
+    const failedHtml = isGreeting ? '' : \`<span class="flex flex-wrap items-center gap-2 text-xs text-dim"><i data-lucide="alert-triangle" class="w-3.5 h-3.5 text-warn flex-shrink-0"></i><span>No reply was generated — your message was saved.</span><button onclick="regenDrop('\${msg.id}')" class="px-2 py-0.5 rounded border border-line-2 hover:bg-surface-2 text-body">Retry</button></span>\`;
     const vdata=encodeURIComponent(JSON.stringify(vars));
     const idata=encodeURIComponent(JSON.stringify(ids));
     wrap.innerHTML=\`
       <div class="flex w-full md:max-w-[85%] max-w-[95%] space-x-3 md:space-x-4">
-        <div class="w-8 h-8 rounded-full bg-gray-100 dark:bg-[#111] border border-gray-200 dark:border-gray-800 flex items-center justify-center flex-shrink-0 mt-1 overflow-hidden">\${avatarHtml}</div>
+        <div class="w-8 h-8 rounded-full bg-surface-2 border border-line flex items-center justify-center flex-shrink-0 mt-1 overflow-hidden">\${avatarHtml}</div>
         <div class="flex flex-1 min-w-0 items-start space-x-2">
           <div class="\${!isGreeting && isLatest ? 'swipeable' : ''} min-w-0" id="bb-\${msg.id}" data-group="\${esc(msg.group_id||'')}" data-vars="\${vdata}" data-ids="\${idata}" data-ai="\${ai}">
-            <div class="msg-content text-sm leading-relaxed bg-white dark:bg-[#111] border border-gray-100 dark:border-gray-800 rounded-2xl rounded-tl-sm p-4 shadow-sm w-fit max-w-full break-words">\${content ? formatContent(content) : failedHtml}</div>
+            <div data-side="ai" class="msg-content text-sm leading-relaxed bg-surface border border-line rounded-2xl rounded-tl-sm p-4 shadow-sm w-fit max-w-full break-words">\${content ? formatContent(content) : failedHtml}</div>
             \${pill}
           </div>
-          <div class="flex-shrink-0 pt-2"><button onclick="toggleDropdown(event,'\${msg.id}',true)" class="p-1 text-gray-400 hover:text-black dark:hover:text-white rounded opacity-0 group-hover:opacity-100 transition-opacity"><i data-lucide="more-vertical"class="w-4 h-4"></i></button></div>
+          <div class="flex-shrink-0 pt-2"><button onclick="toggleDropdown(event,'\${msg.id}',true)" class="msg-more p-1 text-dim hover:text-main rounded-full opacity-0 group-hover:opacity-100 transition-opacity"><i data-lucide="more-vertical"class="w-4 h-4"></i></button></div>
         </div>
       </div>\`;
   }else{
     wrap.innerHTML=\`
       <div class="flex w-full md:max-w-[80%] max-w-[95%] items-start justify-end space-x-2 ml-auto">
-        <div class="flex-shrink-0 pt-2"><button onclick="toggleDropdown(event,'\${msg.id}',false)" class="p-1 text-gray-400 hover:text-black dark:hover:text-white rounded opacity-0 group-hover:opacity-100 transition-opacity"><i data-lucide="more-vertical"class="w-4 h-4"></i></button></div>
-        <div class="msg-content bg-black dark:bg-white text-white dark:text-black text-sm rounded-2xl rounded-tr-sm px-4 py-2.5 shadow-sm break-words w-fit max-w-full">\${formatContent(msg.content||'')}</div>
+        <div class="flex-shrink-0 pt-2"><button onclick="toggleDropdown(event,'\${msg.id}',false)" class="msg-more p-1 text-dim hover:text-main rounded-full opacity-0 group-hover:opacity-100 transition-opacity"><i data-lucide="more-vertical"class="w-4 h-4"></i></button></div>
+        <div data-side="user" class="msg-content bg-accent text-onaccent text-sm rounded-2xl rounded-tr-sm px-4 py-2.5 shadow-sm break-words w-fit max-w-full">\${formatContent(msg.content||'')}</div>
       </div>\`;
   }
+  /* dressed before it is inserted, so a streamed reply never flashes the
+     default bubble and then change under the reader */
+  if(typeof dressRow==='function') dressRow(wrap);
   return wrap;
 }
 
@@ -3070,7 +8969,7 @@ async function handleSend(){
     S.msgs.push({id:tbid,role:'bot',variants:[''],variant_ids:[tbid],active_index:0,group_id:''});
     appendMsgEl(S.msgs[S.msgs.length-1]);
     const typing=document.querySelector(\`[data-msg-id="\${tbid}"] .msg-content\`);
-    if(typing)typing.innerHTML='<span class="flex items-center space-x-2"><svg class="animate-spin w-4 h-4 text-gray-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-9-9"/></svg><span class="text-xs text-gray-400">Imagine about the scenes...</span></span>';
+    if(typing)typing.innerHTML='<span class="flex items-center space-x-2"><svg class="animate-spin w-4 h-4 text-dim" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-9-9"/></svg><span class="text-xs text-dim">Imagine about the scenes...</span></span>';
     if(!S.userScrolled)scrollToBottom();
 
     let gotDone = false;
@@ -3173,6 +9072,3276 @@ for await (const data of parseStream(resp)) {
     }
 }
 
+/* ── APPEARANCE ─────────────────────────────────────────────────────────
+   Everything here is a CSS variable or one attribute on <html>; the markup
+   never changes, so a theme costs nothing but a repaint. */
+const SKINS = [
+  ['graphite','Graphite','Flat and quiet'], ['aurora','Aurora','Glass over colour'],
+  ['vellum','Vellum','Warm paper'],        ['clay','Clay','Soft and physical'],
+  ['void','Void','OLED black'],            ['sherbet','Sherbet','Loud and sweet'],
+];
+const LAYOUTS = [
+  ['studio','Studio','Classic sidebar'], ['rail','Rail','Icon rail + sessions'],
+  ['trio','Trio','Three columns'],       ['zen','Zen','Chrome disappears'],
+  ['deck','Deck','Floating cards'],      ['console','Console','Dense cockpit'],
+  ['ledger','Ledger','Top bar + nav'],   ['split','Split','Rail + wide list'],
+  ['canvas','Canvas','No side nav'],     ['tiles','Tiles','Panels on a ground'],
+];
+
+function setPref(k,v){ document.documentElement.dataset[k]=v; localStorage.setItem('rp_'+k,v);
+  document.cookie='rp_'+k+'='+encodeURIComponent(v)+'; path=/; max-age=31536000; samesite=lax'; }
+
+function setSkin(v){ setPref('skin',v); _baseCache={}; _skinTokens=null; applyColour(); if($('colour-panel')?.children.length) renderColourTab();
+  toast('Palette: '+v); }
+function toggleDensity(){ setPref('density', document.documentElement.dataset.density==='compact'?'comfortable':'compact'); renderAppearance(); }
+
+function applyUserFont(force){
+  const name = force!==undefined ? force : $('font-input').value.trim();
+  const u=UI.get();
+  document.querySelectorAll('link[data-userfont]').forEach(l=>l.remove());
+  if(!name){ delete u.font; delete u.fontName; document.documentElement.style.removeProperty('--font-user'); UI.set(u); $('font-input').value=''; toast('Font reset'); return; }
+  const l=document.createElement('link'); l.rel='stylesheet'; l.dataset.userfont='1';
+  l.href='https://fonts.googleapis.com/css2?family='+encodeURIComponent(name).replace(/%20/g,'+')+':wght@400;500;600;700&display=swap';
+  document.head.appendChild(l);
+  const stack = \`'\${name.replace(/'/g,'')}'\`;
+  document.documentElement.style.setProperty('--font-user', stack);
+  u.font=stack; u.fontName=name; UI.set(u); toast('Font: '+name);
+}
+
+/* ── cursor ──────────────────────────────────────────────────────────── */
+let _cur=null, _hot=[0,0];
+
+/* Cursors that need no link at all. Drawn as SVG rather than shipped as PNGs:
+   a few hundred bytes each, sharp at any pointer size, and they inherit nothing
+   from the page so they look the same everywhere. The hotspot for each is the
+   point you actually aim with, which saves guessing it from the alpha. */
+const CURSOR_KIT=[
+  {name:'Arrow', hot:[2,2], svg:'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><path d="M4 2 4 26 10.5 20 14.5 29 19 27 15 18.5 24 18.5Z" fill="#fff" stroke="#111" stroke-width="2.2" stroke-linejoin="round"/></svg>'},
+  {name:'Arrow dark', hot:[2,2], svg:'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><path d="M4 2 4 26 10.5 20 14.5 29 19 27 15 18.5 24 18.5Z" fill="#111" stroke="#fff" stroke-width="2.2" stroke-linejoin="round"/></svg>'},
+  {name:'Ring', hot:[16,16], svg:'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><circle cx="16" cy="16" r="9" fill="none" stroke="#111" stroke-width="4.5"/><circle cx="16" cy="16" r="9" fill="none" stroke="#fff" stroke-width="2.2"/></svg>'},
+  {name:'Dot', hot:[16,16], svg:'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><circle cx="16" cy="16" r="6" fill="#fff" stroke="#111" stroke-width="2.4"/></svg>'},
+  {name:'Cross', hot:[16,16], svg:'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><g stroke="#111" stroke-width="5" stroke-linecap="round"><path d="M16 4v9M16 19v9M4 16h9M19 16h9"/></g><g stroke="#fff" stroke-width="2.2" stroke-linecap="round"><path d="M16 4v9M16 19v9M4 16h9M19 16h9"/></g></svg>'},
+  {name:'Pen', hot:[3,28], svg:'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><path d="M3 29 6 21 23 4l4 4L10 25Z" fill="#fff" stroke="#111" stroke-width="2.2" stroke-linejoin="round"/><path d="M6 21 10 25" stroke="#111" stroke-width="2.2"/></svg>'},
+  {name:'Heart', hot:[16,6], svg:'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><path d="M16 28S4 20.5 4 13a6.5 6.5 0 0 1 12-3.5A6.5 6.5 0 0 1 28 13c0 7.5-12 15-12 15Z" fill="#ff5d7a" stroke="#fff" stroke-width="2.2" stroke-linejoin="round"/></svg>'},
+  {name:'Star', hot:[16,3], svg:'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><path d="m16 3 3.8 8.2 8.9 1.1-6.6 6.1 1.8 8.8L16 22.9 8.1 27.2l1.8-8.8L3.3 12.3l8.9-1.1Z" fill="#ffd15c" stroke="#111" stroke-width="2" stroke-linejoin="round"/></svg>'},
+];
+/* Drawn as SVG but handed over as PNG. safeCursorData allows only raster types
+   into a live cursor: url(), and that allowlist is the guard against a data URI
+   from a scraped page becoming something else - so the built-ins go through it
+   rather than around it. Rasterising here costs one canvas each and means the
+   rule does not have to learn a new format to trust.
+
+   64px, not 32: the browser scales a cursor down for the pointer size it wants,
+   and scaling down looks better than scaling up. */
+function rasterise(svg, size){
+  return new Promise(res=>{
+    const img=new Image();
+    img.onload=()=>{
+      const c=document.createElement('canvas'); c.width=c.height=size;
+      const x=c.getContext('2d');
+      x.imageSmoothingEnabled=true; x.drawImage(img,0,0,size,size);
+      res(c.toDataURL('image/png'));
+    };
+    img.onerror=()=>res('');
+    img.src='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg);
+  });
+}
+/* The picker already knows how to show a list of candidates and tune one, so
+   the built-ins go in through the same door as a scraped page. */
+async function useCursorKit(){
+  const S=64, k=S/32;
+  const urls=await Promise.all(CURSOR_KIT.map(c=>rasterise(c.svg,S)));
+  const list=CURSOR_KIT.map((c,i)=>({dataUri:urls[i], name:c.name, size:S,
+    /* the hotspots are written against the 32px artboard */
+    hot:[Math.round(c.hot[0]*k), Math.round(c.hot[1]*k)]}))
+    .filter(c=>c.dataUri);
+  if(!list.length){ toast('Could not draw the built-in cursors'); return; }
+  showCursorChoices(list);
+  $('cursor-results').scrollIntoView({block:'nearest'});
+}
+async function findCursors(){
+  const url=$('cursor-url').value.trim(); if(!url) return;
+  const btn=$('cursor-find'); btn.disabled=true; btn.textContent='…';
+  try{
+    const r=await api('resolveCursor',{url});
+    if(!r || r.error) throw new Error((r&&r.error)||'Could not read that page');
+    showCursorChoices(r.cursors);
+  }catch(e){ toast(e.message,5000); }
+  finally{ btn.disabled=false; btn.textContent='Find'; }
+}
+function showCursorChoices(list){
+  $('cursor-results').innerHTML = list.map((c,i)=>
+    \`<button onclick="chooseCursor(\${i})" class="aspect-square rounded-lg border border-line hover:border-accent p-1 flex items-center justify-center bg-surface-2">
+       <img src="\${c.dataUri}" style="max-width:100%;max-height:100%;image-rendering:pixelated"></button>\`).join('');
+  window._curList=list;
+  if(list.length===1) chooseCursor(0);
+}
+function chooseCursor(i){
+  _cur=window._curList[i];
+  _curOrig=_cur ? _cur.dataUri : null;
+  $('cursor-tuner').classList.remove('hf');
+  if(_cur && _cur.hot){
+    /* a built-in was drawn around a known point; only a scraped image has to be
+       guessed at from its alpha */
+    const s=_cur.size || 64;
+    _hotN=[_cur.hot[0]/s, _cur.hot[1]/s];
+    renderCursorAt();
+  } else {
+    guessHotspot();
+    /* guessHotspot measures the natural size; the size the user asked for is
+       applied after it has had its say */
+    setTimeout(renderCursorAt, 0);
+  }
+}
+
+function uploadCursor(e){
+  const f=e.target.files[0]; if(!f) return;
+  if(f.size>262144){ toast('That file is too big for a cursor (256KB max)',5000); return; }
+  const rd=new FileReader();
+  rd.onload=()=>{
+    _cur={dataUri:rd.result}; _curOrig=rd.result;
+    guessHotspot();
+    /* bounded on the way in: an unbounded upload could not travel with the
+       account, and 128px is larger than any pointer actually drawn */
+    setTimeout(renderCursorAt, 0);
+  };
+  rd.readAsDataURL(f);
+}
+
+/* Where does this cursor point? Read the alpha channel and find the opaque
+   pixel nearest the top-left corner - for an arrow that is the tip. A shape
+   whose ink sits in the middle (a dot, a crosshair) points from its centre
+   instead. Runs in the browser on an image we already hold, so it costs the
+   Worker nothing and needs no support from the source site. */
+function guessHotspot(){
+  const img=new Image();
+  img.onload=()=>{
+    const n=Math.min(img.naturalWidth||32,128), m=Math.min(img.naturalHeight||32,128);
+    const c=document.createElement('canvas'); c.width=n; c.height=m;
+    const x=c.getContext('2d',{willReadFrequently:true}); x.drawImage(img,0,0,n,m);
+    let d; try{ d=x.getImageData(0,0,n,m).data; }catch(err){ _hot=[0,0]; drawCursor(); return; }
+    let minX=n, minY=m, maxX=-1, maxY=-1, best=1e9, bx=0, by=0, ink=0;
+    for(let py=0;py<m;py++) for(let px=0;px<n;px++){
+      if(d[(py*n+px)*4+3] < 96) continue;
+      ink++;
+      if(px<minX)minX=px; if(py<minY)minY=py; if(px>maxX)maxX=px; if(py>maxY)maxY=py;
+      const dist=px*px+py*py;                 // squared distance from the corner
+      if(dist<best){ best=dist; bx=px; by=py; }
+    }
+    if(maxX<0){ _hot=[0,0]; drawCursor(); return; }
+    const cx=(minX+maxX)/2, cy=(minY+maxY)/2;
+    const centred = Math.abs(cx-n/2) < n*0.18 && Math.abs(cy-m/2) < m*0.18;
+    const small   = (maxX-minX) < n*0.55 && (maxY-minY) < m*0.55;
+    _hot = (centred && small) ? [Math.round(cx), Math.round(cy)] : [bx, by];
+    _curSize=[n,m];
+    _hotN=[ _hot[0]/(n||32), _hot[1]/(m||32) ];
+    drawCursor(); applyCursorLive();
+  };
+  img.src=_cur.dataUri;
+}
+let _curSize=[32,32];
+/* The source image, kept apart from the rendered one: every size change redraws
+   from this, so resizing twice is not resizing a resize. */
+let _curOrig=null, _curPx=32;
+/* The hotspot as a fraction of the image rather than a pixel in it. A pixel
+   stops meaning the same thing the moment the image is redrawn at another
+   size; a fraction does not. */
+let _hotN=[0,0];
+
+function drawCursor(){
+  $('cursor-tuner').classList.remove('hf');
+  const cv=$('cursor-canvas'), g=cv.getContext('2d');
+  const img=new Image();
+  img.onload=()=>{
+    const n=_curSize[0]||img.naturalWidth, m=_curSize[1]||img.naturalHeight;
+    const s=Math.min(cv.width/n, cv.height/m);
+    g.clearRect(0,0,cv.width,cv.height);
+    g.imageSmoothingEnabled=false;
+    g.drawImage(img,0,0,n*s,m*s);
+    g.strokeStyle='#ef4444'; g.lineWidth=1.5;
+    const hx=_hot[0]*s, hy=_hot[1]*s;
+    g.beginPath(); g.moveTo(hx-7,hy); g.lineTo(hx+7,hy); g.moveTo(hx,hy-7); g.lineTo(hx,hy+7); g.stroke();
+    g.beginPath(); g.arc(hx,hy,3.5,0,6.284); g.stroke();
+    cv.dataset.scale=s;
+    $('hotspot-label').textContent=_hot[0]+', '+_hot[1];
+  };
+  img.src=_cur.dataUri;
+}
+
+/* Redraws the source at the chosen size and makes that the cursor. There is no
+   CSS for cursor size - the browser draws url() at the image's own dimensions -
+   so a different size means a different image. */
+function renderCursorAt(){
+  const src=_curOrig || (_cur && _cur.dataUri);
+  if(!src) return;
+  const img=new Image();
+  img.onload=()=>{
+    const nw=img.naturalWidth||32, nh=img.naturalHeight||32;
+    const k=_curPx/Math.max(nw,nh);
+    const w=Math.max(1,Math.round(nw*k)), h=Math.max(1,Math.round(nh*k));
+    const c=document.createElement('canvas'); c.width=w; c.height=h;
+    const x=c.getContext('2d');
+    /* smooth when shrinking, keep the edges when growing: pixel art blown up
+       should stay pixel art */
+    x.imageSmoothingEnabled = k < 1;
+    x.drawImage(img,0,0,w,h);
+    _curSize=[w,h];
+    _hot=[Math.min(w-1,Math.round(_hotN[0]*w)), Math.min(h-1,Math.round(_hotN[1]*h))];
+    _cur=Object.assign({}, _cur||{}, {dataUri:c.toDataURL('image/png')});
+    drawCursor(); applyCursorLive();
+  };
+  img.src=src;
+}
+function setCursorSize(px){
+  _curPx=Math.max(12, Math.min(128, +px||32));
+  const lab=$('cursor-size-val'); if(lab) lab.textContent=_curPx+'px';
+  renderCursorAt();
+}
+function pickHotspot(e){
+  const cv=$('cursor-canvas'), r=cv.getBoundingClientRect(), s=Number(cv.dataset.scale)||1;
+  _hot=[ Math.max(0,Math.round((e.clientX-r.left)/s)), Math.max(0,Math.round((e.clientY-r.top)/s)) ];
+  /* remembered as a fraction, so it still points at the same part of the
+     drawing after the size changes */
+  _hotN=[ _hot[0]/(_curSize[0]||32), _hot[1]/(_curSize[1]||32) ];
+  drawCursor(); applyCursorLive();
+}
+/* The resolver returns a data: URI it built itself, but this is the point where
+   it becomes a live CSS value, so it is checked here rather than trusted from
+   further up. */
+function safeCursorData(u){
+  return /^data:image\\/(png|gif|webp|x-icon|vnd\\.microsoft\\.icon|jpeg);base64,[A-Za-z0-9+/=]+$/.test(String(u||'')) ? u : '';
+}
+function applyCursorLive(){
+  const u=safeCursorData(_cur&&_cur.dataUri);
+  const s=document.documentElement.style;
+  if(!u){ s.removeProperty('--cursor'); s.removeProperty('--cursor-pointer'); return; }
+  const hot=(+_hot[0]||0)+' '+(+_hot[1]||0);
+  s.setProperty('--cursor', 'url('+u+') '+hot+', auto');
+  s.setProperty('--cursor-pointer', 'url('+u+') '+hot+', pointer');
+}
+function saveCursor(){
+  if(!_cur) return;
+  const u=UI.get(); u.cursor=_cur.dataUri; u.cursorHot=_hot.join(' ');
+  u.cursorPtr=_cur.dataUri; u.cursorPtrHot=_hot.join(' ');
+  u.cursorPx=_curPx; u.cursorHotN=_hotN.join(' ');
+  UI.set(u); applyCursorLive(); toast('Cursor saved');
+}
+function clearCursor(){
+  const u=UI.get(); delete u.cursor; delete u.cursorHot; delete u.cursorPtr; delete u.cursorPtrHot; UI.set(u);
+  const s=document.documentElement.style;
+  s.removeProperty('--cursor'); s.removeProperty('--cursor-pointer');
+  _cur=null; _curOrig=null; _hotN=[0,0];
+  $('cursor-tuner').classList.add('hf'); $('cursor-results').innerHTML=''; toast('Cursor removed');
+}
+
+
+/* ── A WALLPAPER FROM THIS MACHINE ──────────────────────────────────────
+   IndexedDB, not localStorage. localStorage is a synchronous string store with
+   a quota near five megabytes; a single video would exceed it and take every
+   other setting down with it. IndexedDB holds the Blob itself, and
+   URL.createObjectURL gives the <video> or the CSS something it can read.
+
+   The file stays on the machine it was chosen on. Everything else in the
+   Appearance panel follows the account now, but a forty megabyte video has no
+   business in a settings row - so the account remembers that a local wallpaper
+   is in use, and each machine supplies its own. */
+const BGDB = 'rp_bg';
+function bgIDB(){
+  return new Promise((res, rej)=>{
+    const r = indexedDB.open(BGDB, 1);
+    r.onupgradeneeded = () => { if(!r.result.objectStoreNames.contains('files')) r.result.createObjectStore('files'); };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+function bgPut(blob){
+  return bgIDB().then(db => new Promise((res, rej)=>{
+    const t = db.transaction('files', 'readwrite');
+    t.objectStore('files').put(blob, 'wallpaper');
+    t.oncomplete = () => res(true);
+    t.onerror = () => rej(t.error);
+  }));
+}
+function bgGet(){
+  return bgIDB().then(db => new Promise((res)=>{
+    const t = db.transaction('files', 'readonly');
+    const q = t.objectStore('files').get('wallpaper');
+    q.onsuccess = () => res(q.result || null);
+    q.onerror = () => res(null);
+  })).catch(()=>null);
+}
+function bgDel(){
+  return bgIDB().then(db => new Promise((res)=>{
+    const t = db.transaction('files', 'readwrite');
+    t.objectStore('files').delete('wallpaper');
+    t.oncomplete = () => res(true);
+    t.onerror = () => res(false);
+  })).catch(()=>false);
+}
+
+/* The object URL is revoked and remade rather than kept, because the blob it
+   points at can be replaced while the page is open. */
+let _bgObjURL = null;
+function bgObjectURL(blob){
+  if(_bgObjURL){ try{ URL.revokeObjectURL(_bgObjURL); }catch(e){} }
+  _bgObjURL = URL.createObjectURL(blob);
+  return _bgObjURL;
+}
+
+async function uploadWallpaper(e){
+  const f = e.target.files && e.target.files[0];
+  e.target.value = '';
+  if(!f) return;
+  const isVideo = f.type.indexOf('video/') === 0;
+  const isImage = f.type.indexOf('image/') === 0;
+  if(!isVideo && !isImage){ toast('That is not a picture or a video', 4000); return; }
+  /* Generous, because it never leaves the machine - but not unbounded: past
+     this a phone will simply fail to decode it. */
+  if(f.size > 120 * 1024 * 1024){ toast('That file is over 120MB', 5000); return; }
+  try{
+    await bgPut(f);
+  }catch(err){
+    toast('This browser would not store the file', 5000); return;
+  }
+  const u = UI.get();
+  u.bg = 'local'; u.bgSrc = f.name; u.bgKind = isVideo ? 'localvideo' : 'localimage';
+  UI.set(u);
+  document.documentElement.dataset.wallpaper = '1';
+  await mountLocalWallpaper();
+  tuneWallpaper();
+  const el = $('bg-url'); if(el) el.value = '';
+  toast((isVideo ? 'Video' : 'Picture') + ' set from this machine');
+}
+
+/* Reads the stored blob and puts it where the picture or the video path
+   expects to find it. Missing file, or a different machine: the wallpaper
+   quietly is not there, which is better than a broken one. */
+async function mountLocalWallpaper(){
+  const u = UI.get(), s = document.documentElement.style;
+  const blob = await bgGet();
+  document.getElementById('bg-video')?.remove();
+  if(!blob){
+    s.removeProperty('--bg-user');
+    delete document.documentElement.dataset.wallpaper;
+    return false;
+  }
+  const url = bgObjectURL(blob);
+  if(u.bgKind === 'localvideo' || blob.type.indexOf('video/') === 0){
+    s.removeProperty('--bg-user');
+    mountBgVideo(url);
+  } else {
+    s.setProperty('--bg-user', 'url("' + url + '")');
+  }
+  document.documentElement.dataset.wallpaper = '1';
+  return true;
+}
+const isLocalBg = u => u && (u.bgKind === 'localvideo' || u.bgKind === 'localimage');
+
+/* ── wallpaper ───────────────────────────────────────────────────────── */
+function applyWallpaper(force){
+  const raw = force!==undefined ? force : $('bg-url').value.trim();
+  const u=UI.get(), s=document.documentElement.style;
+  document.getElementById('bg-video')?.remove();
+  const v = raw ? safeMedia(raw) : '';
+  if(raw && !v){ toast('That is not a usable link'); return; }
+  if(!v){ delete u.bg; delete u.bgSrc; delete u.bgKind;
+    delete document.documentElement.dataset.wallpaper;
+    bgDel();                       // the file goes with the setting
+    s.removeProperty('--bg-user'); UI.set(u); $('bg-url').value=''; toast('Wallpaper cleared'); return; }
+  const isVideo = looksVideo(v);
+  u.bg=v; u.bgSrc=v; u.bgKind = isVideo ? 'video' : 'image'; UI.set(u);
+  document.documentElement.dataset.wallpaper='1';
+  if(isVideo){ s.removeProperty('--bg-user'); mountBgVideo(v); }
+  else { s.setProperty('--bg-user','url(\\"'+cssUrl(v)+'\\")'); }
+  tuneWallpaper();
+  toast(isVideo ? 'Video wallpaper applied' : 'Wallpaper applied');
+}
+/* One element, muted and looping, behind everything. Autoplay only survives
+   when it is muted, and a wallpaper with sound would be wrong anyway. */
+function mountBgVideo(srcUrl){
+  const v=document.createElement('video');
+  v.id='bg-video'; v.src=srcUrl;
+  v.muted=true; v.loop=true; v.playsInline=true; v.autoplay=true;
+  v.setAttribute('muted',''); v.setAttribute('playsinline','');
+  v.preload='auto';
+  document.body.insertBefore(v, document.body.firstChild);
+  const nudge=bgVideoKeeper();
+  v.addEventListener('loadeddata', nudge);
+  v.addEventListener('canplay', nudge);
+  nudge();
+}
+/* A wallpaper frozen on its first frame is worse than no wallpaper, and play()
+   has three ordinary ways to lose: called in the same tick the element is
+   inserted it races the first frame; called while the tab is in the background
+   it is refused, and nothing reconsiders when the tab comes forward; and some
+   browsers want a gesture before any media at all. So the request is repeated
+   rather than made once.
+
+   The document listeners go on once, not once per video, or changing the
+   wallpaper would leave one behind every time. The handler looks the element up
+   by id, so it keeps working across those changes. */
+let _bgKeeperOn=false;
+function bgVideoKeeper(){
+  const nudge=()=>{
+    const v=document.getElementById('bg-video');
+    if(!v || v.paused===false || document.hidden) return;
+    const p=v.play&&v.play(); if(p&&p.catch) p.catch(()=>{});
+  };
+  if(!_bgKeeperOn){
+    _bgKeeperOn=true;
+    document.addEventListener('visibilitychange', nudge);
+    document.addEventListener('pointerdown', nudge, {passive:true});
+  }
+  return nudge;
+}
+/* ── LIQUID GLASS ───────────────────────────────────────────────────────
+   The reference implementation, not an impression of it. For one element:
+
+     the signed distance field of its own rounded rectangle
+     -> a convex bevel profile across the last few pixels before the rim
+     -> the surface normal that profile implies
+     -> a straight-down view ray refracted through it, Snell's law, IOR 1.5
+     -> the resulting (dx,dy) encoded into a displacement map
+     -> fed to feDisplacementMap by an SVG filter through backdrop-filter
+
+   so the backdrop is genuinely bent around the edge of the element rather than
+   blurred behind it. The blur is half a pixel: any real amount of frost erases
+   the refraction, and then there is nothing left worth calling glass.
+
+   The one thing not taken from the reference is its scheduling. It has about
+   twenty-five panels and rebuilds all of them; a conversation has hundreds of
+   bubbles. The map depends only on size and corner radius, so it is built once
+   per distinct shape, sizes are rounded to 8px so that hundreds of bubbles
+   share a handful of maps, and nothing off screen is ever built at all. */
+const LG = (function(){
+  const NS='http://www.w3.org/2000/svg';
+  const IOR=1.5, GAIN=3.2, ROUND=8, MAXCACHE=48, MAXPIX=1200*1200;
+  /* Not the sidebar or the session rail. They are the two tallest elements on
+     screen, and a per-element SVG filter on something that size over a playing
+     video costs ~7ms a frame - measured - which is what makes the seam shimmer.
+     They keep the blur, the tint and the rim from the CSS, so they still read
+     as glass; what they lose is a bevel that was a hairline down one edge of a
+     236x910 panel anyway. The refraction stays where the bevel is actually a
+     share of the shape. */
+  const SEL='#chat-header,#sketchboard-sidebar,'
+          + '#composer-shell>div,#chat-container .msg-content,'
+          /* the buttons refract too. A flat accent pill next to a refracting
+             bubble is the one thing that gives the whole material away. */
+          + '#send-btn,#scroll-btn,#think-btn,'
+          /* only the nav item the app itself marks as current. Every row in the
+             sidebar is a .dock-btn, so glassing the class puts a chip behind
+             all of them; and lighting .is-active as well lit two at once,
+             because Current Chat carries the accent permanently. */
+          /* Not the dock pills. They animate their own max-width, and an SVG
+             displacement filter in backdrop-filter puts them on a composited
+             layer whose clip is not reliably reapplied while that runs - which
+             is the ghost label bleeding out of the pill and the striping along
+             the bar. There is nothing to lose: the bevel is the outer 9px of an
+             element, and a 34px pill has no interior left to bend. */
+          + '#sketchboard-sidebar button.bg-accent,'
+          + '#new-pin-input,.rs-search,'
+          /* the things that sit on top of everything else, which is where glass
+             is most obvious and where it was most conspicuously missing */
+          + '#global-dropdown,#think-picker,#toast,.modal-content';
+  const cache=new Map();
+  /* what currently wears a filter, so it can be taken back off. Without this a
+     nav item you have moved away from keeps its chip: the element stops
+     matching the selector but nobody tells it. */
+  const dressed=new Set();
+  let defs=null, seq=0, queue=[], pumping=false, io=null, mo=null, ro=null, live=false;
+
+  const supported=(function(){
+    try{ const d=document.createElement('div'); d.style.backdropFilter='url(#a)';
+      return d.style.backdropFilter.indexOf('url')!==-1; }catch(e){ return false; }
+  })();
+
+  function svgDefs(){
+    if(defs) return defs;
+    const svg=document.createElementNS(NS,'svg');
+    svg.setAttribute('aria-hidden','true');
+    svg.style.cssText='position:fixed;left:0;top:0;width:0;height:0;pointer-events:none';
+    defs=document.createElementNS(NS,'defs');
+    svg.appendChild(defs); document.body.appendChild(svg);
+    return defs;
+  }
+  const cl8=v=>Math.max(0,Math.min(255,Math.round(v)));
+
+  /* signed distance to a rounded box with its own radius per corner:
+     negative inside, zero on the boundary, positive outside */
+  function sd(px,py,w,h,r){
+    const cx=px-w/2, cy=py-h/2;
+    const rad = cx<0 ? (cy<0?r[0]:r[3]) : (cy<0?r[1]:r[2]);
+    const qx=Math.abs(cx)-w/2+rad, qy=Math.abs(cy)-h/2+rad;
+    const ax=Math.max(qx,0), ay=Math.max(qy,0);
+    return Math.sqrt(ax*ax+ay*ay)+Math.min(Math.max(qx,qy),0)-rad;
+  }
+
+  function build(w,h,r,edge){
+    const strength=edge*GAIN;
+    const c=document.createElement('canvas'); c.width=w; c.height=h;
+    const ctx=c.getContext('2d');
+    const img=ctx.createImageData(w,h), d=img.data;
+    const eta=1/IOR, e=0.8, dt=0.001;
+    for(let y=0;y<h;y++){
+      for(let x=0;x<w;x++){
+        const i=(y*w+x)*4;
+        const inside=-sd(x+0.5,y+0.5,w,h,r);
+        /* the plateau and everything outside stay put: 128 is no displacement */
+        if(inside>=edge || inside<-1){ d[i]=128; d[i+1]=128; d[i+2]=128; d[i+3]=255; continue; }
+        let gx=(sd(x+e,y,w,h,r)-sd(x-e,y,w,h,r))/(2*e);
+        let gy=(sd(x,y+e,w,h,r)-sd(x,y-e,w,h,r))/(2*e);
+        const gl=Math.hypot(gx,gy)||1; gx/=gl; gy/=gl;
+        const t=Math.min(Math.max(inside/edge,0),1);
+        const h0=Math.pow(1-Math.pow(1-t,4),0.25);
+        const h1=Math.pow(1-Math.pow(1-Math.min(t+dt,1),4),0.25);
+        const slope=(h1-h0)/dt;
+        const nx=gx*slope, ny=gy*slope, nl=Math.hypot(nx,ny,1);
+        const nX=nx/nl, nY=ny/nl, nZ=1/nl;
+        const cosI=nZ, k=1-eta*eta*(1-cosI*cosI);
+        let dx=0, dy=0;
+        if(k>=0){ const b=eta*cosI-Math.sqrt(k); dx=b*nX; dy=b*nY; }
+        const fall=1-t;
+        d[i]=cl8(128+dx*strength*fall);
+        d[i+1]=cl8(128+dy*strength*fall);
+        d[i+2]=128; d[i+3]=255;
+      }
+    }
+    ctx.putImageData(img,0,0);
+    return {url:c.toDataURL(), w:w, h:h, strength:strength};
+  }
+
+  /* one map per distinct shape, most recently used kept */
+  function mapFor(w,h,r,edge){
+    const k=w+'x'+h+'|'+r.join(',')+'|'+edge;
+    let m=cache.get(k);
+    if(m){ cache.delete(k); cache.set(k,m); return m; }
+    m=build(w,h,r,edge);
+    cache.set(k,m);
+    if(cache.size>MAXCACHE) cache.delete(cache.keys().next().value);
+    return m;
+  }
+
+  function radii(el,w,h){
+    const cs=getComputedStyle(el);
+    const c=v=>Math.max(0,Math.min(parseFloat(v)||0, w/2, h/2));
+    return [c(cs.borderTopLeftRadius), c(cs.borderTopRightRadius),
+            c(cs.borderBottomRightRadius), c(cs.borderBottomLeftRadius)];
+  }
+
+  function dress(el){
+    if(!el.isConnected){ dressed.delete(el); return; }
+    /* it may have stopped matching between being queued and being reached */
+    if(!el.matches(SEL)){ strip(el); return; }
+    const rect=el.getBoundingClientRect();
+    if(rect.width<10 || rect.height<10) return;
+    /* Rounded UP, never to nearest, and that is the whole point.
+       feDisplacementMap does not read "outside the map" as "do not displace" -
+       it reads transparent black there, R=0 and G=0, and computes an offset of
+       scale x (0 - 0.5). At scale 96 that is the backdrop dragged 48px sideways
+       in whatever strip the map failed to cover. Round to nearest and half the
+       elements get a map a few pixels too small, which is a hard bright seam
+       down their edge that looks exactly like a broken renderer.
+       Rounding up keeps the sharing - a map larger than the element is clipped
+       by the element - and there is no uncovered strip to read. */
+    const w=Math.max(16,Math.ceil(rect.width /ROUND)*ROUND);
+    const h=Math.max(16,Math.ceil(rect.height/ROUND)*ROUND);
+    if(w*h>MAXPIX) return;
+    const r=radii(el,w,h);
+    const edge=Math.max(9,Math.min(Math.min(w,h)*0.5,30));
+    const sig=w+'x'+h+'|'+r.join(',');
+    if(el._lgSig===sig) return;
+    el._lgSig=sig;
+    const m=mapFor(w,h,r,edge);
+    if(!el._lgId) el._lgId='lg-f-'+(seq++);
+    let f=document.getElementById(el._lgId);
+    if(!f){
+      f=document.createElementNS(NS,'filter');
+      f.setAttribute('id', el._lgId);
+      f.setAttribute('x','-15%'); f.setAttribute('y','-15%');
+      f.setAttribute('width','130%'); f.setAttribute('height','130%');
+      f.setAttribute('color-interpolation-filters','sRGB');
+      svgDefs().appendChild(f);
+    }
+    f.innerHTML='<feImage x="0" y="0" width="'+m.w+'" height="'+m.h
+      +'" preserveAspectRatio="none" href="'+m.url+'" result="map"/>'
+      +'<feDisplacementMap in="SourceGraphic" in2="map" scale="'+m.strength
+      +'" xChannelSelector="R" yChannelSelector="G"/>';
+    const fx='url(#'+el._lgId+') blur(var(--glass-blur,0.5px)) saturate(var(--glass-sat,1.4)) brightness(1.04)';
+    el.style.backdropFilter=fx;
+    el.style.webkitBackdropFilter=fx;
+    dressed.add(el);
+  }
+
+  function strip(el){
+    el.style.removeProperty('backdrop-filter');
+    el.style.removeProperty('-webkit-backdrop-filter');
+    el._lgSig=null;
+    if(el._lgId){ document.getElementById(el._lgId)?.remove(); el._lgId=null; }
+    el._lgSize=null;
+    dressed.delete(el);
+  }
+
+  /* the pixel loop is not cheap, so it is spread over frames rather than run
+     for everything the moment the switch is flipped */
+  function pump(){
+    if(pumping) return;
+    pumping=true;
+    requestAnimationFrame(function step(){
+      let budget=2;
+      while(budget-- > 0 && queue.length) dress(queue.shift());
+      if(queue.length) requestAnimationFrame(step); else pumping=false;
+    });
+  }
+  function enqueue(el){ if(queue.indexOf(el)<0){ queue.push(el); pump(); } }
+
+  function observe(){
+    if(!io) io=new IntersectionObserver(es=>{
+      es.forEach(e=>{ if(e.isIntersecting) enqueue(e.target); });
+    },{rootMargin:'200px'});
+    /* The map is built for one exact size and feImage places it at that size in
+       user units - it is not stretched to fit. So an element that changes size
+       while staying visible keeps a map that no longer covers it, and past the
+       old width the filter has nothing to read and stops dead. That is the seam
+       down the middle of the sketchboard when it goes from w-80 to full width
+       on a phone. Scrolling into view was the only thing that used to trigger a
+       rebuild; changing shape has to as well. */
+    if(!ro && window.ResizeObserver) ro=new ResizeObserver(es=>{
+      es.forEach(e=>{
+        const t=e.target;
+        const k=Math.round(e.contentRect.width)+'x'+Math.round(e.contentRect.height);
+        if(t._lgSize===k) return;
+        t._lgSize=k;
+        t._lgSig=null;
+        if(dressed.has(t)) enqueue(t);
+      });
+    });
+    const want=new Set(document.querySelectorAll(SEL));
+    /* whatever no longer belongs gives the filter back before anything new is
+       taken on, so the button you just left does not stay lit */
+    Array.from(dressed).forEach(el=>{ if(!want.has(el) || !el.isConnected) strip(el); });
+    want.forEach(el=>{ io.observe(el); if(ro) ro.observe(el); });
+  }
+
+  let reobs=0;
+  function refresh(){
+    if(!live) return;
+    clearTimeout(reobs);
+    reobs=setTimeout(observe, 120);
+  }
+
+  function start(){
+    if(live || !supported) return;
+    if(window.matchMedia && matchMedia('(prefers-reduced-transparency: reduce)').matches) return;
+    live=true;
+    observe();
+    /* messages arrive, get edited and stream in; the set of glass elements is
+       not fixed the way the reference's is */
+    if(!mo){
+      mo=new MutationObserver(refresh);
+      const box=document.getElementById('chat-container');
+      if(box) mo.observe(box,{childList:true,subtree:false});
+    }
+    addEventListener('resize', onResize);
+  }
+  let rz=0;
+  function onResize(){
+    clearTimeout(rz);
+    rz=setTimeout(()=>{
+      document.querySelectorAll(SEL).forEach(el=>{ el._lgSig=null; });
+      queue.length=0; observe();
+    },200);
+  }
+  function stop(){
+    live=false;
+    if(io){ io.disconnect(); io=null; }
+    if(mo){ mo.disconnect(); mo=null; }
+    if(ro){ ro.disconnect(); ro=null; }
+    removeEventListener('resize', onResize);
+    queue.length=0; pumping=false;
+    document.querySelectorAll(SEL).forEach(strip);
+  }
+  return {start:start, stop:stop, refresh:refresh, supported:supported};
+})();
+
+/* One switch for the whole app rather than one per surface: glass that is on
+   for the header and off for the composer under it does not read as a material,
+   it reads as a mistake. */
+function toggleGlass(){
+  const u=UI.get(); u.glass = !u.glass; UI.set(u);
+  applyGlass(); toast(u.glass ? 'Liquid glass on' : 'Liquid glass off');
+}
+/* One number, and the six-times multiplier on the floating surfaces lives in
+   the stylesheet so the two stay in step. */
+function tuneGlass(){
+  const v=$('glass-blur') ? +$('glass-blur').value : 0.5;
+  if($('glass-blur-val')) $('glass-blur-val').textContent=v+'px';
+  const u=UI.get(); u.glassBlur=v; UI.set(u);
+  document.documentElement.style.setProperty('--glass-blur', v+'px');
+  /* the shape of the refraction does not change with the frost, so nothing
+     needs rebuilding - the maps are keyed on size and radius alone */
+}
+/* What colour a label must be to survive on a glassed accent control.
+
+   The engine's --accent-text is fitted to the accent at full strength; glass
+   paints it thinner than that, over the page. This composites the two exactly
+   as the browser will and asks which ink clears more on the result. */
+const GLASS_ACCENT_ALPHA = 0.72;
+function glassAccentInk(){
+  try{
+    const cs = getComputedStyle(document.documentElement);
+    const acc = CL.rgba(cs.getPropertyValue('--accent') || '#4A57D6');
+    const bg  = CL.rgba(cs.getPropertyValue('--bg') || '#FFFFFF');
+    const a = GLASS_ACCENT_ALPHA;
+    const mixed = CL.hex([0,1,2].map(i => Math.round(acc[i]*a + bg[i]*(1-a))));
+    const pick = CL.pickInk([mixed]);
+    return {ink: pick.ink, on: mixed, worst: pick.worst};
+  }catch(e){ return null; }
+}
+
+/* --surface is translucent on the glass skins, so a percentage of it compounds
+   with its own alpha and every glass fill comes out thinner than it reads. CSS
+   cannot flatten a colour over another one; this can. */
+function glassBase(){
+  try{
+    const cs = getComputedStyle(document.documentElement);
+    const bg = CL.rgba(cs.getPropertyValue('--bg') || '#FFFFFF');
+    return {
+      surface: CL.flat(cs.getPropertyValue('--surface') || '#FFFFFF', bg),
+      nav:     CL.flat(cs.getPropertyValue('--sidebar-bg') || '#FFFFFF', bg),
+    };
+  }catch(e){ return null; }
+}
+
+function applyGlass(){
+  const on = !!UI.get().glass;
+  const d=document.documentElement;
+  const gb=UI.get().glassBlur;
+  if(gb!=null) d.style.setProperty('--glass-blur', gb+'px');
+  if($('glass-blur')){ const v=gb==null?0.5:gb;
+    $('glass-blur').value=v; $('glass-blur-val').textContent=v+'px'; }
+  if(on) d.dataset.glass='on'; else delete d.dataset.glass;
+  if(on) LG.start(); else LG.stop();
+  if(on){
+    const k = glassAccentInk();
+    if(k) d.style.setProperty('--glass-accent-ink', k.ink);
+    const b = glassBase();
+    if(b){
+      d.style.setProperty('--glass-base', b.surface);
+      d.style.setProperty('--glass-base-nav', b.nav);
+    }
+  } else {
+    d.style.removeProperty('--glass-accent-ink');
+    /* --glass-base stays: the no-glass fills are built from it too, and it is
+       just the surface flattened over the page - true whether glass is on. */
+    const b2 = glassBase();
+    if(b2){
+      d.style.setProperty('--glass-base', b2.surface);
+      d.style.setProperty('--glass-base-nav', b2.nav);
+    }
+  }
+  const t=$('glass-toggle');
+  if(t){
+    t.className='w-11 h-6 rounded-full relative flex-shrink-0 '+(on?'bg-success':'bg-surface-3');
+    const k=t.firstElementChild;
+    /* left, not transform: a 20px knob in a 44px track sits at 2px or 22px,
+       which is how every other switch in this app is positioned. The Tailwind
+       offset plus a transform put it at 42px, outside its own track. */
+    if(k) k.style.left = on ? '22px' : '2px';
+  }
+  /* the ink a bubble needs depends on what is behind it, and glass changes
+     that */
+  if(typeof applyBubble==='function') applyBubble();
+}
+
+function tuneWallpaper(){
+  const op=$('bg-op').value/100, bl=$('bg-blur').value;
+  const ve=$('bg-veil') ? +$('bg-veil').value : 100;
+  $('bg-op-val').textContent=Math.round(op*100)+'%'; $('bg-blur-val').textContent=bl+'px';
+  if($('bg-veil-val')) $('bg-veil-val').textContent=ve+'%';
+  const u=UI.get(); u.bgOpacity=op; u.bgBlur=+bl; u.bgVeil=ve; UI.set(u);
+  const s=document.documentElement.style;
+  s.setProperty('--bg-user-opacity',op);
+  s.setProperty('--bg-user-blur',bl+'px');
+  /* blur(0px) is a filter that changes nothing and still puts the whole
+     full-screen layer through the filter pipeline, where the compositor tiles
+     it - and the tile edges are the seam that runs through everything. */
+  if(+bl > 0) s.setProperty('--bg-user-filter','blur('+bl+'px)');
+  else s.removeProperty('--bg-user-filter');
+  /* the share of the app surface that stays, which is the inverse of how much
+     of the picture you asked to see */
+  s.setProperty('--wall-veil',(100-ve)+'%');
+  /* Without glass there is no blur doing the work, so a surface at zero is
+     simply not there. The chrome keeps a floor whatever the slider says. */
+  s.setProperty('--chrome-veil', Math.max(62, 100-ve)+'%');
+
+}
+
+/* Marks the dock pill for whatever is currently open, so the Deck theme can
+   fill it. Cheap: one class swap, no re-render. */
+function setActiveNav(el){
+  document.querySelectorAll('#main-nav .dock-btn, #nav-footer .dock-btn')
+    .forEach(b=>b.classList.toggle('is-active', b===el));
+  /* which button is lit is part of the engine's selector, so the set it
+     watches changes every time you move around */
+  if(typeof LG!=='undefined') LG.refresh();
+}
+document.addEventListener('click', e=>{
+  const b = e.target.closest('#main-nav .dock-btn, #nav-footer .dock-btn');
+  if (b && !/doLogout/.test(b.getAttribute('onclick')||'')) setActiveNav(b);
+}, true);
+
+/* ── PERSONALISATION: Theme -> Style -> Colour ──────────────────────────
+   Each theme declares the options it actually has, and the Style tab builds
+   its controls from that declaration. Adding a theme therefore never means
+   editing the settings screen, and one theme's options can never leak into
+   another's. Values are stored per theme, so switching away and back brings
+   your setup with you. */
+
+/* option kinds:
+     choice  -> segmented buttons.  vals: [[id, label, cssValue?], ...]
+     toggle  -> on/off
+     range   -> slider with a unit
+   \`apply\` says where the value lands: a data-attribute on <html>, or a
+   custom property. Nothing here touches markup. */
+const THEME_OPTS = {
+  radius:  {id:'radius',  label:'Corners', kind:'choice', prop:'--radius',
+            vals:[['sharp','Sharp','2px'],['soft','Soft','8px'],['round','Round','14px'],['pill','Pill','22px']], def:'soft'},
+  density: {id:'density', label:'Density', kind:'choice', attr:'density',
+            vals:[['comfortable','Comfortable'],['compact','Compact']], def:'comfortable'},
+  depth:   {id:'depth',   label:'Separation', kind:'choice', attr:'depth',
+            vals:[['line','Hairline'],['shadow','Shadow'],['flat','Flat']], def:'line'},
+  width:   {id:'width',   label:'Reading width', kind:'choice', prop:'--measure',
+            vals:[['narrow','Narrow','42rem'],['medium','Medium','46rem'],['wide','Wide','60rem'],['full','Full','100%']], def:'medium'},
+  navsize: {id:'navsize', label:'Sidebar', kind:'choice', prop:'--nav-w',
+            vals:[['slim','Slim','13rem'],['normal','Normal','17rem'],['wide','Wide','20rem']], def:'normal'},
+  zoom:    {id:'zoom',    label:'Interface zoom', kind:'range', prop:'--ui-scale',
+            min:80, max:150, step:5, unit:'%', scale:0.01, def:100},
+  dockpos: {id:'dockpos', label:'Dock position', kind:'choice', attr:'dockpos',
+            vals:[['bottom','Bottom'],['top','Top']], def:'bottom'},
+  dockstyle:{id:'dockstyle',label:'Dock shape', kind:'choice', attr:'dockstyle',
+            vals:[['island','Floating island'],['taskbar','Taskbar']], def:'island'},
+  frame:   {id:'frame',   label:'Conversation frame', kind:'choice', attr:'frame',
+            vals:[['off','Fill the space'],['on','Framed']], def:'off'},
+  gap:     {id:'gap',     label:'Card inset', kind:'range', prop:'--deck-gap', min:6, max:36, step:2, unit:'px', def:18},
+  motion:  {id:'motion',  label:'Motion', kind:'toggle', attr:'motion', on:'full', off:'reduced', def:'full'},
+};
+const O = (...keys)=>keys.map(k=>THEME_OPTS[k]);
+
+const THEMES = [
+  {id:'studio',  name:'Studio',  desc:'Classic sidebar, one reading measure. The safe default.',
+   opts:O('zoom','radius','density','depth','width','navsize','motion')},
+  {id:'console', name:'Console', desc:'Dense cockpit. Status band, docked inspector, compact rows.',
+   desktopOnly:true, opts:O('zoom','radius','density','depth','navsize','motion')},
+  {id:'rail',    name:'Rail',    desc:'Icon rail plus a session panel, Slack-shaped.',
+   desktopOnly:true, opts:O('zoom','radius','density','depth','motion')},
+  {id:'trio',    name:'Trio',    desc:'Three columns: nav, conversations, chat.',
+   desktopOnly:true, opts:O('zoom','radius','density','depth','motion')},
+  {id:'deck',    name:'Deck',    desc:'Floating card on a tinted ground, with a dock for nav.',
+   desktopOnly:true, opts:O('zoom','radius','gap','dockstyle','dockpos','density','motion')},
+  {id:'zen',     name:'Zen',     desc:'The chrome disappears. Just the story.',
+   opts:O('zoom','radius','width','motion')},
+  {id:'ledger',  name:'Ledger',  desc:'Admin dashboard: full-width top bar, nav below it.',
+   desktopOnly:true, opts:O('zoom','radius','frame','density','depth','width','navsize','motion')},
+  {id:'split',   name:'Split',   desc:'Desktop messenger. Icon rail, a wide conversation list, then the chat.',
+   desktopOnly:true, opts:O('zoom','radius','density','depth','motion')},
+  {id:'canvas',  name:'Canvas',  desc:'No side nav at all. One horizontal strip, then full-width conversation.',
+   desktopOnly:true, opts:O('zoom','radius','density','depth','motion')},
+  {id:'tiles',   name:'Tiles',   desc:'Panels on a tinted ground. Shows a wallpaper best.',
+   desktopOnly:true, opts:O('zoom','radius','gap','frame','density','depth','width','navsize','motion')},
+];
+
+/* ── APPEARANCE SCOPES ──────────────────────────────────────────────────
+   Everything about how the app LOOKS can be set at three levels: everywhere,
+   for one persona, or for one chat. The most specific one that defines a
+   setting wins; anything a scope leaves alone is inherited.
+
+   This is the only place that knows about scopes. UI.get() hands back the
+   merged view, UI.set() writes into whichever scope the user has selected, so
+   every existing caller reads what is on screen and writes where they pointed
+   without any of them having to know a scope exists. */
+/* colourCache is deliberately absent: it is derived output, not a preference.
+   Routing it through the scope layer meant clearing a scope re-created it on
+   the very next apply. */
+const LOOK_KEYS = ['bubble','colour','font','fontName','bg','bgSrc',
+  'bgOpacity','bgBlur','cursor','cursorHot','cursorPtr','cursorPtrHot'];
+let _scope = 'global';                       // global | persona | session
+
+function scopeId(which){
+  if(which==='persona') return S.currentPersonaId ? 'persona:'+S.currentPersonaId : null;
+  if(which==='session') return S.session ? 'session:'+S.session : null;
+  return null;
+}
+/* least specific first, so later ones overwrite earlier ones */
+function activeScopeIds(){ return [scopeId('persona'), scopeId('session')].filter(Boolean); }
+
+const UI = {
+  raw(){ try{ return JSON.parse(localStorage.getItem('rp_ui')||'{}'); }catch(e){ return {}; } },
+  save(o){
+    localStorage.setItem('rp_ui', JSON.stringify(o));
+    /* The look is account state, not machine state - except while we are in
+       the middle of applying the account's own copy, which must not be sent
+       straight back. */
+    if(typeof queuePrefsPush === 'function' && !_prefsApplying) queuePrefsPush();
+  },
+  get(){
+    const r=this.raw(), out=Object.assign({}, r);
+    delete out.scopes; delete out.boot;
+    for(const id of activeScopeIds()){
+      const s=(r.scopes||{})[id]; if(!s) continue;
+      for(const k of LOOK_KEYS) if(k in s) out[k]=s[k];
+    }
+    return out;
+  },
+  set(o){
+    const r=this.raw(), id=scopeId(_scope);
+    if(!id){
+      /* global: keep the scope table, replace everything else */
+      const next=Object.assign({}, o);
+      if(r.scopes) next.scopes=r.scopes;
+      if(r.boot)   next.boot=r.boot;
+      this.save(next);
+      return;
+    }
+    r.scopes=r.scopes||{};
+    const s={};
+    /* absent means "inherit", so a delete in a scope falls back to the level
+       above rather than clearing the setting outright */
+    for(const k of LOOK_KEYS) if(k in o) s[k]=o[k];
+    r.scopes[id]=s;
+    for(const k in o) if(LOOK_KEYS.indexOf(k)<0) r[k]=o[k];
+    this.save(r);
+  },
+  /* does this scope define anything of its own? */
+  scopeHas(which){ const id=scopeId(which); return !!(id && (this.raw().scopes||{})[id]); },
+  clearScope(which){
+    const id=scopeId(which); if(!id) return;
+    const r=this.raw(); if(r.scopes) delete r.scopes[id];
+    this.save(r);
+  },
+};
+
+/* Re-applies every look setting from whatever is now in effect. Called after a
+   scope change and after switching chat or persona. */
+function applyLook(){
+  const u=UI.get(), s=document.documentElement.style;
+  applyColour(); applyBubble();
+  document.querySelectorAll('link[data-userfont]').forEach(l=>l.remove());
+  if(u.font){
+    s.setProperty('--font-user', u.font);
+    if(u.fontName){
+      const l=document.createElement('link'); l.rel='stylesheet'; l.dataset.userfont='1';
+      l.href='https://fonts.googleapis.com/css2?family='+encodeURIComponent(u.fontName).replace(/%20/g,'+')+':wght@400;500;600;700&display=swap';
+      document.head.appendChild(l);
+    }
+  } else s.removeProperty('--font-user');
+  if(u.cursor){
+    s.setProperty('--cursor','url('+u.cursor+') '+(u.cursorHot||'0 0')+', auto');
+    s.setProperty('--cursor-pointer','url('+(u.cursorPtr||u.cursor)+') '+(u.cursorPtrHot||u.cursorHot||'0 0')+', pointer');
+  } else { s.removeProperty('--cursor'); s.removeProperty('--cursor-pointer'); }
+  document.getElementById('bg-video')?.remove();
+  applyGlass();
+  applyPlainBubbleAlpha();
+  if(isLocalBg(u)){
+    /* the blob is read asynchronously; everything else here can carry on */
+    mountLocalWallpaper();
+  }
+  if(u.bg) document.documentElement.dataset.wallpaper='1';
+  else delete document.documentElement.dataset.wallpaper;
+  if(u.bg){
+    s.setProperty('--wall-veil', (100-(u.bgVeil==null?100:u.bgVeil))+'%');
+    s.setProperty('--chrome-veil', Math.max(62,100-(u.bgVeil==null?100:u.bgVeil))+'%');
+    s.setProperty('--bg-user-opacity', u.bgOpacity==null?1:u.bgOpacity);
+    s.setProperty('--bg-user-blur', (u.bgBlur||0)+'px');
+    if((u.bgBlur||0) > 0) s.setProperty('--bg-user-filter','blur('+u.bgBlur+'px)');
+    else s.removeProperty('--bg-user-filter');
+    if(isLocalBg(u)){ /* mounted above, from IndexedDB */ }
+    else if(u.bgKind==='video' || looksVideo(u.bg)){ s.removeProperty('--bg-user'); mountBgVideo(u.bg); }
+    else s.setProperty('--bg-user','url("'+cssUrl(u.bg)+'")');
+  } else s.removeProperty('--bg-user');
+  snapshotLook();
+}
+
+/* The pre-paint script runs before anything knows which chat will open, so it
+   cannot resolve a scope. It replays this flat snapshot of whatever was last
+   in effect instead - right on every reload of the same chat, and corrected a
+   frame later on the rare occasion it is not. */
+function snapshotLook(){
+  const r=UI.raw(), e=UI.get(), b={};
+  for(const k of LOOK_KEYS) if(e[k]!==undefined) b[k]=e[k];
+  if(r.colourCache) b.colourCache=r.colourCache;
+  r.boot=b; UI.save(r);
+}
+
+function themeById(id){ return THEMES.find(t=>t.id===id) || THEMES[0]; }
+function currentTheme(){ return themeById(document.documentElement.dataset.layout||'studio'); }
+
+/* Writes one option's value to wherever its declaration says it belongs. */
+function applyOpt(opt, value){
+  const el = document.documentElement;
+  if (opt.kind === 'toggle'){
+    if (opt.attr) el.dataset[opt.attr] = value ? opt.on : opt.off;
+    return;
+  }
+  if (opt.kind === 'range'){
+    // a scaled range stores the number the user sees but writes the value CSS
+    // needs, e.g. 120% -> 1.2
+    if (opt.prop) el.style.setProperty(opt.prop, opt.scale ? (value*opt.scale) : (value + (opt.unit||'')));
+    if (opt.attr) el.dataset[opt.attr] = value;
+    return;
+  }
+  const row = opt.vals.find(v=>v[0]===value) || opt.vals[0];
+  if (opt.prop) el.style.setProperty(opt.prop, row[2]);
+  if (opt.attr) el.dataset[opt.attr] = row[0];
+}
+
+function styleValues(themeId){
+  const u = UI.get();
+  return (u.styles && u.styles[themeId]) || {};
+}
+function setStyleValue(themeId, optId, value){
+  const u = UI.get();
+  u.styles = u.styles || {};
+  u.styles[themeId] = u.styles[themeId] || {};
+  u.styles[themeId][optId] = value;
+  UI.set(u);
+}
+
+/* Re-applies every option a theme declares. Called on theme switch and at
+   boot, so a theme is never left wearing the previous theme's settings. */
+function applyThemePreset(id){
+  const t = themeById(id);
+  document.documentElement.dataset.layout = t.id;
+  localStorage.setItem('rp_layout', t.id);
+  document.cookie = 'rp_layout='+encodeURIComponent(t.id)+'; path=/; max-age=31536000; samesite=lax';
+  const saved = styleValues(t.id);
+  // clear the previous theme's custom properties before applying this one's
+  Object.values(THEME_OPTS).forEach(o=>{ if(o.prop) document.documentElement.style.removeProperty(o.prop); });
+  t.opts.forEach(o=>{
+    const v = (saved[o.id] !== undefined) ? saved[o.id] : o.def;
+    applyOpt(o, o.kind==='toggle' ? (v===true || v===o.on) : v);
+  });
+  /* A theme without a column cannot hold a docked panel, and changing theme is
+     not a resize - so the handler that rescues one has to be called here too,
+     or the panel is left inside a hidden column with no way back to it. */
+  if(typeof railOnLayoutChange==='function') railOnLayoutChange();
+}
+
+
+/* ── COLOUR ENGINE ──────────────────────────────────────────────────────
+   sRGB <-> OKLab <-> OKLCH, then every token is fitted by solving for the
+   lightness that hits a WCAG luminance target rather than by nudging a hex
+   until it looks right. Working in OKLCH keeps hue and chroma fixed while
+   lightness moves, so a colour stays recognisably itself while it becomes
+   legible.
+
+   Contrast targets: 7:1 (AAA) for body text, 4.5:1 (AA) for secondary text,
+   accent text and semantic colours, 3:1 for non-text boundaries. */
+const CL = (function(){
+  const pow=Math.pow, cbrt=Math.cbrt;
+  const s2l=c=>c<=0.04045?c/12.92:pow((c+0.055)/1.055,2.4);
+  const l2s=c=>c<=0.0031308?12.92*c:1.055*pow(c,1/2.4)-0.055;
+
+  function srgbToOklab(r,g,b){
+    const R=s2l(r),G=s2l(g),B=s2l(b);
+    const l=cbrt(0.4122214708*R+0.5363325363*G+0.0514459929*B);
+    const m=cbrt(0.2119034982*R+0.6806995451*G+0.1073969566*B);
+    const s=cbrt(0.0883024619*R+0.2817188376*G+0.6299787005*B);
+    return [0.2104542553*l+0.7936177850*m-0.0040720468*s,
+            1.9779984951*l-2.4285922050*m+0.4505937099*s,
+            0.0259040371*l+0.7827717662*m-0.8086757660*s];
+  }
+  function oklabToLinear(L,a,b){
+    const l=L+0.3963377774*a+0.2158037573*b, m=L-0.1055613458*a-0.0638541728*b,
+          s=L-0.0894841775*a-1.2914855480*b, l3=l*l*l, m3=m*m*m, s3=s*s*s;
+    return [ 4.0767416621*l3-3.3077115913*m3+0.2309699292*s3,
+            -1.2684380046*l3+2.6097574011*m3-0.3413193965*s3,
+            -0.0041960863*l3-0.7034186147*m3+1.7076147010*s3];
+  }
+  const D2R=Math.PI/180, R2D=180/Math.PI;
+  const oklchToOklab=(L,C,h)=>[L,C*Math.cos(h*D2R),C*Math.sin(h*D2R)];
+  function oklabToOklch(L,a,b){ let h=Math.atan2(b,a)*R2D; if(h<0)h+=360; return [L,Math.hypot(a,b),h]; }
+  const inGamut=(v,e=1e-4)=>v[0]>=-e&&v[0]<=1+e&&v[1]>=-e&&v[1]<=1+e&&v[2]>=-e&&v[2]<=1+e;
+
+  /* CSS Color 4 style gamut map: hold L and h, bisect chroma down until the
+     colour fits sRGB. Clipping RGB directly would shift the hue instead. */
+  function gamutClamp(L,C,h){
+    L=Math.min(1,Math.max(0,L));
+    let lin=oklabToLinear.apply(null,oklchToOklab(L,C,h));
+    if(inGamut(lin)) return lin;
+    let lo=0,hi=C;
+    for(let i=0;i<12;i++){ const m=(lo+hi)/2;
+      if(inGamut(oklabToLinear.apply(null,oklchToOklab(L,m,h)))) lo=m; else hi=m; }
+    return oklabToLinear.apply(null,oklchToOklab(L,lo,h)).map(v=>Math.min(1,Math.max(0,v)));
+  }
+  const oklchToRgb=(L,C,h)=>gamutClamp(L,C,h).map(v=>Math.round(Math.min(1,Math.max(0,l2s(v)))*255));
+  const hex=rgb=>'#'+rgb.map(v=>v.toString(16).padStart(2,'0')).join('').toUpperCase();
+  const oklchHex=(L,C,h)=>hex(oklchToRgb(L,C,h));
+  function hexToRgb(s){ s=String(s).replace('#','');
+    if(s.length===3) s=s.split('').map(c=>c+c).join('');
+    return [parseInt(s.slice(0,2),16),parseInt(s.slice(2,4),16),parseInt(s.slice(4,6),16)]; }
+  const hexToOklch=s=>{ const c=hexToRgb(s); return oklabToOklch.apply(null,srgbToOklab(c[0]/255,c[1]/255,c[2]/255)); };
+
+  const relLum=rgb=>0.2126*s2l(rgb[0]/255)+0.7152*s2l(rgb[1]/255)+0.0722*s2l(rgb[2]/255);
+  const lumHex=h=>relLum(hexToRgb(h));
+  const ratio=(y1,y2)=>(Math.max(y1,y2)+0.05)/(Math.min(y1,y2)+0.05);
+  const cr=(a,b)=>ratio(lumHex(a),lumHex(b));
+
+  /* the largest chroma sRGB can hold at this lightness and hue - used to make
+     "vivid" mean the same thing on a green as on a blue */
+  function maxChroma(L,h){ let lo=0,hi=0.45;
+    for(let i=0;i<14;i++){ const m=(lo+hi)/2;
+      if(inGamut(oklabToLinear.apply(null,oklchToOklab(L,m,h)))) lo=m; else hi=m; }
+    return lo; }
+
+  /* the lightness whose luminance hits targetY at this chroma and hue */
+  function solveY(C,h,targetY){ let lo=0,hi=1;
+    for(let i=0;i<13;i++){ const m=(lo+hi)/2;
+      if(relLum(oklchToRgb(m,C,h))<targetY) lo=m; else hi=m; }
+    return hi; }
+  const yCapFor=(Ybg,k)=>(Ybg+0.05)/k-0.05;     // brightest a colour may be
+  const yFloorFor=(Ybg,k)=>k*(Ybg+0.05)-0.05;   // darkest a colour may be
+  const clamp=(v,a,b)=>Math.min(b,Math.max(a,v));
+
+  /* Any CSS colour string -> [r,g,b,a]. Goes through a canvas so oklab(),
+     color-mix() and rgba() from the skins all resolve the same way. */
+  let _cx=null;
+  function rgba(str){
+    if(!_cx){ const c=document.createElement('canvas'); c.width=c.height=1;
+      _cx=c.getContext('2d',{willReadFrequently:true}); }
+    _cx.clearRect(0,0,1,1); _cx.fillStyle='#000'; _cx.fillStyle=String(str).trim();
+    const norm=_cx.fillStyle;
+    _cx.clearRect(0,0,1,1); _cx.fillStyle=norm; _cx.fillRect(0,0,1,1);
+    const d=_cx.getImageData(0,0,1,1).data;
+    return [d[0],d[1],d[2],d[3]/255];
+  }
+  /* source-over: what you actually see when a translucent skin surface sits
+     on the page background. Glass skins are unusable to fit against otherwise. */
+  function over(top,bot){ const a=top[3];
+    return [top[0]*a+bot[0]*(1-a),top[1]*a+bot[1]*(1-a),top[2]*a+bot[2]*(1-a),1]; }
+  function flat(str,under){ const c=rgba(str);
+    return hex(over(c,under?(under.length?under:[255,255,255,1]):[255,255,255,1]).slice(0,3).map(Math.round)); }
+
+  /* one ink for a set of surfaces: white or near-black, whichever clears more */
+  function pickInk(list){
+    const w=Math.min.apply(null,list.map(c=>cr('#FFFFFF',c)));
+    const b=Math.min.apply(null,list.map(c=>cr('#0A0A0A',c)));
+    return w>=b ? {ink:'#FFFFFF',polarity:'white',worst:w} : {ink:'#0A0A0A',polarity:'black',worst:b};
+  }
+  /* a label crosses the whole sweep, so ONE ink must clear every stop */
+  const Y_WHITE_INK=1.05/4.5-0.05, Y_BLACK_INK=4.5*0.05-0.05;
+  function fitStop(h,polarity){
+    const o=hexToOklch(h), Y=lumHex(h);
+    if(polarity==='white'? Y<=Y_WHITE_INK : Y>=Y_BLACK_INK) return h;
+    let L=solveY(o[1],o[2],polarity==='white'?Y_WHITE_INK:Y_BLACK_INK), out=h;
+    for(let i=0;i<12;i++){
+      out=oklchHex(L,Math.min(o[1],maxChroma(L,o[2])),o[2]);
+      const y=lumHex(out);
+      if(polarity==='white'? y<=Y_WHITE_INK : y>=Y_BLACK_INK) return out;
+      L+= polarity==='white' ? -0.004 : 0.004;
+    }
+    return out;
+  }
+  const fitGradient=(stops,p)=>stops.map(s=>fitStop(s,p));
+
+  /* the OKLab mean of a gradient: the single colour it reads as from far away */
+  function gradSolid(stops){ let L=0,a=0,b=0;
+    for(const s of stops){ const c=hexToRgb(s), o=srgbToOklab(c[0]/255,c[1]/255,c[2]/255);
+      L+=o[0]; a+=o[1]; b+=o[2]; }
+    return oklabToOklch(L/stops.length,a/stops.length,b/stops.length); }
+
+  /* Move a colour toward a hue, holding its lightness.
+
+     Except at the very ends of the scale: sRGB carries no chroma at all at
+     L=1 or L=0, so a pure white surface (Graphite, Void) would come back
+     unchanged and Tint would appear broken on exactly the two skins where a
+     tint is most visible. There, pull the lightness in just far enough for a
+     hue to exist. Alpha is preserved, which is what keeps glass glassy. */
+  function tintTo(str,under,h,amount){
+    const c=rgba(str), solid=over(c,under), o=hexToOklch(hex(solid.slice(0,3).map(Math.round)));
+    let L=o[0];
+    if(L>0.985) L=1-amount*0.022; else if(L<0.06) L=amount*0.030;
+    const C=Math.min(o[1]+amount*0.055,maxChroma(L,h));
+    const out=oklchToRgb(L,C,h);
+    return c[3]<0.999 ? 'rgba('+out[0]+','+out[1]+','+out[2]+','+(+c[3].toFixed(3))+')'
+                      : hex(out);
+  }
+
+  /* Moves a surface lighter or darker while keeping its hue, its chroma and
+     its alpha. Same shape as tintTo, and for the same reasons: composite over
+     whatever is under it first, work in OKLCH so the shift is perceptual
+     rather than a naive channel scale, and hand back the format it came in so
+     the glass skins stay glassy. Chroma is re-clamped because the gamut
+     narrows sharply at both ends of the lightness range. */
+  function shiftL(str,under,amount){
+    const c=rgba(str), solid=over(c,under), o=hexToOklch(hex(solid.slice(0,3).map(Math.round)));
+    const L=clamp(o[0]+amount, 0.03, 0.99);
+    const C=Math.min(o[1], maxChroma(L,o[2]));
+    const out=oklchToRgb(L,C,o[2]);
+    return c[3]<0.999 ? 'rgba('+out[0]+','+out[1]+','+out[2]+','+(+c[3].toFixed(3))+')'
+                      : hex(out);
+  }
+
+  /* ── seeded palettes ──────────────────────────────────────────────────
+     FNV-1a for the hash, mulberry32 for the draws: both are a handful of
+     integer ops, and the same seed always gives the same palette on every
+     device, which is the whole point of a shareable seed. */
+  function seedHash(str){
+    const s=String(str).trim().toLowerCase();
+    if(/^\\d{1,10}$/.test(s)) return (Number(s)>>>0)||1;
+    let h=0x811c9dc5;
+    for(let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,0x01000193)>>>0; }
+    return h||1;
+  }
+  function mulberry32(a){ return function(){
+    a=(a+0x6D2B79F5)>>>0; let t=a;
+    t=Math.imul(t^(t>>>15),t|1); t^=t+Math.imul(t^(t>>>7),t|61);
+    return ((t^(t>>>14))>>>0)/4294967296; }; }
+  function draw(r,table){ let x=r(),acc=0; for(const row of table){ acc+=row[1]; if(x<acc) return row[0]; }
+    return table[table.length-1][0]; }
+  const SCHEMES=[['analogous',.32],['split',.30],['triad',.18],['complement',.12],['mono',.08]];
+  const VIVID=[[.42,.30],[.68,.45],[.90,.25]], TINTS=[[.25,.30],[.55,.45],[.85,.25]];
+  const HUENAMES=[[15,'crimson'],[45,'ember'],[75,'amber'],[105,'olive'],[140,'fern'],[170,'jade'],
+    [200,'lagoon'],[235,'azure'],[275,'indigo'],[310,'orchid'],[340,'rose'],[361,'crimson']];
+  function paletteFromSeed(seed){
+    const r=mulberry32(seedHash(seed)), L=0.62;
+    const h0=r()*360, scheme=draw(r,SCHEMES), t=draw(r,VIVID), tint=draw(r,TINTS);
+    const flip=r()<0.5?1:-1, jitter=(r()-0.5)*10;
+    const delta = scheme==='analogous'?flip*32 : scheme==='split'?(flip>0?150:210)
+                : scheme==='triad'?(flip>0?120:240) : scheme==='complement'?180 : flip*12;
+    const h2=((h0+delta+jitter)%360+360)%360;
+    const name=HUENAMES.find(x=>h0<=x[0])[1];
+    return { accent:oklchHex(L,t*maxChroma(L,h0),h0), accent2Hue:h2, tint:tint,
+             label:(t>.8?'vivid ':t<.5?'muted ':'')+name+' '+scheme };
+  }
+
+  /* Steps a foreground away from its background until the colour that will
+     actually be PAINTED clears the ratio. solveY answers in continuous
+     lightness; 8-bit sRGB rounding can land the rendered hex a hundredth of a
+     ratio point on the wrong side, which is where 4.47:1 comes from.
+     0.006 in OKLCH L is about 1.5 sRGB codes: under the visual threshold,
+     over the quantisation step. */
+  function nudge(fg,bg,min){
+    if(cr(fg,bg)>=min) return fg;
+    const o=hexToOklch(fg), away=lumHex(fg)>=lumHex(bg)?1:-1;
+    let L=o[0], out=fg;
+    for(let i=0;i<48;i++){
+      L=clamp(L+away*0.006,0,1);
+      out=oklchHex(L,Math.min(o[1],maxChroma(L,o[2])),o[2]);
+      if(cr(out,bg)>=min) return out;
+      if(L<=0||L>=1) break;
+    }
+    /* ran out of lightness on this side: the other end of the scale always
+       works, because contrast(white,X) * contrast(black,X) = 21 exactly, so
+       one of them is at least sqrt(21) = 4.58 for every possible colour. */
+    return cr('#FFFFFF',bg)>=cr('#000000',bg)?'#FFFFFF':'#000000';
+  }
+
+  return {hex,hexToRgb,hexToOklch,oklchHex,oklchToRgb,relLum,lumHex,ratio,cr,maxChroma,nudge,
+          solveY,yCapFor,yFloorFor,clamp,rgba,over,flat,pickInk,fitGradient,gradSolid,
+          tintTo,shiftL,paletteFromSeed,seedHash,srgbToOklab,oklabToOklch,Y_WHITE_INK,Y_BLACK_INK};
+})();
+
+/* Gradient presets. Stops are retuned at load so one ink clears all of them -
+   the authored values are close but not guaranteed, and a label that is
+   legible at one end of the sweep and not the other is the usual failure. */
+const GRADS = [
+ {id:'nightfall',  name:'Nightfall',   angle:160, ink:'white', stops:['#6D5AE6','#2B1D8F']},
+ {id:'ember',      name:'Ember',       angle:135, ink:'white', stops:['#F2600C','#C11D45']},
+ {id:'reef',       name:'Reef',        angle:120, ink:'white', stops:['#0E9C8A','#0E6C8E']},
+ {id:'bloom',      name:'Bloom',       angle:145, ink:'white', stops:['#E14C93','#6D4BE0']},
+ {id:'citrus',     name:'Citrus',      angle:130, ink:'black', stops:['#FFC24D','#FF7A45']},
+ {id:'moss',       name:'Moss',        angle:150, ink:'white', stops:['#4A8A3F','#186B4E']},
+ {id:'ultraviolet',name:'Ultraviolet', angle:155, ink:'white', stops:['#9B37D6','#4A1CA0']},
+ {id:'glacier',    name:'Glacier',     angle:140, ink:'black', stops:['#A9D8F5','#8FB4EE']},
+ {id:'rosewood',   name:'Rosewood',    angle:145, ink:'white', stops:['#CC4468','#8A2F52']},
+ {id:'sandstone',  name:'Sandstone',   angle:135, ink:'black', stops:['#F0C89A','#E0A277']},
+ {id:'signal',     name:'Signal',      angle:125, ink:'white', stops:['#0E9C7E','#0B7FB8','#3B4FE0']},
+ {id:'dusk',       name:'Dusk',        angle:150, ink:'white', stops:['#D2603F','#9B3F90','#4A2E96']},
+].map(g=>({...g, stops:CL.fitGradient(g.stops,g.ink)}));
+
+/* every property the engine may write, so a reset knows exactly what to undo */
+const COLOUR_PROPS = ['--accent','--accent-fill','--accent-grad','--accent-text','--accent-soft',
+  '--accent-2','--info','--ring','--bubble-user','--bg','--surface','--surface-2','--sidebar-bg',
+  '--header-bg','--composer-bg','--border','--border-strong','--text','--text-dim'];
+
+/* Reads the skin's own values with every engine override temporarily lifted,
+   so deriving from the current state can never compound on itself. */
+/* Keyed on skin+mode because that is all it depends on: the skin blocks are
+   static CSS, so the same key always reads back the same values. Cleared
+   wherever either of those two changes. */
+let _baseCache={};
+function skinBase(){
+  const el=document.documentElement, st=el.style, held={};
+  const ck=(el.dataset.skin||'graphite')+'|'+(el.classList.contains('dark')?'dark':'light');
+  if(_baseCache[ck]) return _baseCache[ck];
+  COLOUR_PROPS.forEach(p=>{ const v=st.getPropertyValue(p); if(v){ held[p]=v; st.removeProperty(p); } });
+  const cs=getComputedStyle(el), get=n=>cs.getPropertyValue(n).trim();
+  const bg=CL.rgba(get('--bg')||'#FFFFFF');
+  const base={
+    dark: el.classList.contains('dark'),
+    bgRaw:get('--bg'), surfaceRaw:get('--surface'), surface2Raw:get('--surface-2'),
+    sidebarRaw:get('--sidebar-bg'), headerRaw:get('--header-bg'), composerRaw:get('--composer-bg'),
+    borderRaw:get('--border'), borderStrongRaw:get('--border-strong'),
+    bgUnder:bg,
+    bg:CL.flat(get('--bg')||'#FFFFFF'),
+    surface:CL.flat(get('--surface')||'#FFFFFF', bg),
+    text:CL.flat(get('--text')||'#000000', bg),
+    textDim:CL.flat(get('--text-dim')||'#666666', bg),
+  };
+  Object.keys(held).forEach(p=>st.setProperty(p,held[p]));
+  return (_baseCache[ck]=base);
+}
+
+/* ── derivation ─────────────────────────────────────────────────────────
+   Everything is fitted against the skin's real surface, so switching from
+   Graphite to Void re-derives rather than carrying stale numbers over. */
+function deriveColour(cfg, base){
+  const T={}, notes=[], dark=base.dark;
+  const Ysurf=CL.lumHex(base.surface), Ytext=CL.lumHex(base.text);
+  const grad = cfg.grad && cfg.grad.stops && cfg.grad.stops.length>1 ? cfg.grad : null;
+
+  let o = grad ? CL.gradSolid(grad.stops) : CL.hexToOklch(cfg.accent||'#4A57D6');
+  let La=o[0], Ca=o[1], ha=o[2];
+  if(Ca<0.012) Ca=0.012;
+
+  /* --accent is the INK role: it has to read as text and as an icon on the
+     skin's surface, so it is capped (light) or floored (dark) at 4.5:1. */
+  const La0=La;
+  La = dark ? Math.max(La, CL.solveY(Ca,ha,CL.yFloorFor(Ysurf,4.5)))
+            : Math.min(La, CL.solveY(Ca,ha,CL.yCapFor (Ysurf,4.5)));
+  if(Math.abs(La-La0)>0.005)
+    notes.push('accent lightness moved '+(La0*100).toFixed(0)+'%->'+(La*100).toFixed(0)+'% for 4.5:1 on the surface');
+  T['--accent']=CL.nudge(CL.oklchHex(La,Ca,ha), base.surface, 4.5);
+  T['--accent-fill']=grad?CL.oklchHex(La0,Ca,ha):T['--accent'];
+
+  /* the ink that sits on an accent-filled control. With a gradient the label
+     crosses every stop, so all of them vote. */
+  /* With a gradient set, .bg-accent paints the gradient as a background-image
+     over the solid, so a label never actually sits on --accent. Letting the
+     solid vote here drags the ink toward a compromise that serves neither the
+     gradient nor the solid. */
+  const inkOver = grad ? grad.stops : [T['--accent']];
+  let pick=CL.pickInk(inkOver);
+  if(grad && pick.worst<4.5){
+    const ink=pick.ink;
+    const fitted=CL.fitGradient(grad.stops,pick.polarity).map(s=>CL.nudge(s,ink,4.5));
+    grad.fitted=fitted; pick=CL.pickInk(fitted);
+    notes.push('gradient stops retuned so one label colour clears every stop');
+  }
+  T['--accent-text']=pick.ink;
+  T['--accent-grad']= grad
+    ? 'linear-gradient('+(grad.angle||135)+'deg,'+(grad.fitted||grad.stops).join(',')+')'
+    : 'none';
+
+  /* soft fills must hold body text at AAA and still show the accent on top */
+  T['--accent-soft']=fitSoftFill(dark?0.249:0.958, Math.min(0.075,Ca*0.42), ha, Ytext, T['--accent'], dark, notes);
+  T['--bubble-user']=fitSoftFill(dark?0.285:0.950, Math.min(0.065,Ca*0.38), ha, Ytext, null, dark, notes);
+  T['--accent-2']=CL.oklchHex(La,Ca,(cfg.accent2Hue!=null&&!grad?cfg.accent2Hue:(ha+150)%360));
+  T['--info']=T['--accent'];
+  const rgb=CL.hexToRgb(T['--accent']);
+  T['--ring']='0 0 0 3px rgba('+rgb[0]+','+rgb[1]+','+rgb[2]+','+(dark?0.35:0.28)+')';
+
+  /* Tint bleeds the accent hue into the skin's neutrals. Off by default -
+     it is the setting that most changes a skin's character, so it is opt-in.
+     Alpha is preserved, which is what keeps the glass skins glassy. */
+  const tint=cfg.tint||0;
+  /* How light the interface itself is, apart from what colour it is. Mode gives
+     two fixed steps; this is everything between and either side of them.
+     Negative darkens, positive lightens, the skin's own value is zero. */
+  let lift=cfg.lift||0;
+  if(lift){
+    /* How far the surface can go before the best ink there is stops clearing
+       7:1 on it. Pure white in dark mode, pure black in light: if those cannot
+       manage it, no re-fitting of the text will, because the text has nowhere
+       further to move. */
+    const surfaceAt=l=>{
+      let s=base.surfaceRaw, b=base.bgRaw;
+      if(l){ s=CL.shiftL(s,base.bgUnder,l); b=CL.shiftL(b,base.bgUnder,l); }
+      if(tint>0){ s=CL.tintTo(s,base.bgUnder,ha,tint); b=CL.tintTo(b,base.bgUnder,ha,tint); }
+      return CL.lumHex(CL.flat(s, CL.rgba(b)));
+    };
+    /* 7.05, not 7: the value that comes out of this is put through a further
+       gamut map and an 8-bit hex round before anything is painted, and on a
+       boundary this thin those alone can cost the last hundredth. */
+    const ok = Y => dark ? CL.ratio(1,Y)>=7.05 : CL.ratio(0,Y)>=7.05;
+    if(!ok(surfaceAt(lift))){
+      /* zero always passes - it is the skin's own value - so bisect toward it */
+      let lo=0, hi=lift;
+      for(let i=0;i<16;i++){ const m=(lo+hi)/2; if(ok(surfaceAt(m))) lo=m; else hi=m; }
+      /* toward zero, never away from it: toFixed rounds to nearest and could
+         hand back a value larger than the one just proved safe */
+      lift=Math.trunc(lo*1000)/1000;
+      notes.push('lightness held at '+Math.round(lift*100)+': past that, body text cannot clear 7:1 on the surface');
+    }
+  }
+  if(tint>0 || lift){
+    const u=base.bgUnder;
+    let pairs=[['--bg',base.bgRaw],['--surface',base.surfaceRaw],['--surface-2',base.surface2Raw],
+      ['--sidebar-bg',base.sidebarRaw],['--header-bg',base.headerRaw],['--composer-bg',base.composerRaw],
+      ['--border',base.borderRaw],['--border-strong',base.borderStrongRaw]];
+    /* lightness first, then hue: tinting is a chroma move and the gamut it has
+       to fit inside depends on the lightness it is being applied at */
+    if(lift)   pairs=pairs.map(p=>[p[0], p[1]?CL.shiftL(p[1],u,lift):p[1]]);
+    if(tint>0) pairs=pairs.map(p=>[p[0], p[1]?CL.tintTo(p[1],u,ha,tint):p[1]]);
+    pairs.forEach(p=>{ if(p[1]) T[p[0]]=p[1]; });
+    /* the surface moved, so re-check the text that sits on it */
+    const newSurf=CL.flat(T['--surface']||base.surfaceRaw, CL.rgba(T['--bg']||base.bgRaw));
+    const Yn=CL.lumHex(newSurf);
+    if(CL.ratio(Ytext,Yn)<7.0){
+      const t=CL.hexToOklch(base.text);
+      T['--text']=CL.nudge(CL.oklchHex(dark?CL.solveY(t[1],t[2],CL.yFloorFor(Yn,7)):CL.solveY(t[1],t[2],CL.yCapFor(Yn,7)),t[1],t[2]), newSurf, 7.0);
+      notes.push('body text re-fitted after tinting the surface');
+    }
+    const d=CL.hexToOklch(base.textDim);
+    if(CL.ratio(CL.lumHex(base.textDim),Yn)<4.5){
+      T['--text-dim']=CL.nudge(CL.oklchHex(dark?CL.solveY(d[1],d[2],CL.yFloorFor(Yn,4.5)):CL.solveY(d[1],d[2],CL.yCapFor(Yn,4.5)),d[1],d[2]), newSurf, 4.5);
+      notes.push('secondary text re-fitted after tinting the surface');
+    }
+  }
+
+  /* Tint moves the surface AFTER the accent family was fitted to the untinted
+     one, so every ratio that is held against the surface is checked once more
+     against the surface that will actually be painted. Each of these is a
+     no-op when it already passes. */
+  const surfNow=T['--surface']?CL.flat(T['--surface'],CL.rgba(T['--bg']||base.bgRaw)):base.surface;
+  const textNow=T['--text']||base.text;
+  T['--accent']=CL.nudge(T['--accent'],surfNow,4.5);
+  T['--info']=T['--accent'];
+  T['--accent-soft']=CL.nudge(T['--accent-soft'],textNow,7.0);
+  T['--bubble-user']=CL.nudge(T['--bubble-user'],textNow,7.0);
+  const dimNow=T['--text-dim']||base.textDim;
+  if(CL.cr(dimNow,surfNow)<4.5) T['--text-dim']=CL.nudge(dimNow,surfNow,4.5);
+  /* the ink follows the accent it sits on */
+  T['--accent-text']=CL.pickInk(grad?(grad.fitted||grad.stops):[T['--accent']]).ink;
+  const ringRgb=CL.hexToRgb(T['--accent']);
+  T['--ring']='0 0 0 3px rgba('+ringRgb[0]+','+ringRgb[1]+','+ringRgb[2]+','+(dark?0.35:0.28)+')';
+  const report=[
+    ['Body text',      textNow,          surfNow,           7.0],
+    ['Secondary text', T['--text-dim']||base.textDim, surfNow, 4.5],
+    ['Accent as text', T['--accent'],    surfNow,           4.5],
+    ['Button label',   T['--accent-text'], grad?(grad.fitted||grad.stops)[0]:T['--accent'], 4.5],
+    ['Text on chip',   textNow,          T['--accent-soft'], 7.0],
+    ['Text in bubble', textNow,          T['--bubble-user'], 7.0],
+  ].map(r=>({label:r[0], got:+CL.cr(r[1],r[2]).toFixed(2), min:r[3], pass:CL.cr(r[1],r[2])>=r[3]-0.005}));
+
+  return {tokens:T, notes:notes, report:report, lift:lift};
+}
+
+/* Walks a soft fill away from the text until body text is AAA on it and the
+   accent still shows against it. 0.012 per step is about 3 sRGB codes: fine
+   enough not to overshoot, coarse enough to converge inside the cap. */
+function fitSoftFill(L0,C,h,Ytext,overHex,dark,notes){
+  let L=L0, out=CL.oklchHex(L,C,h);
+  for(let i=0;i<14;i++){
+    const Ys=CL.lumHex(out);
+    if(CL.ratio(Ytext,Ys)>=7.0 && (!overHex||CL.ratio(CL.lumHex(overHex),Ys)>=3.0)) return out;
+    L=CL.clamp(L+(dark?-0.012:0.012),0,1); out=CL.oklchHex(L,C,h);
+  }
+  notes.push('a soft fill hit its correction cap');
+  return out;
+}
+
+let _colourReport=null;
+
+/* Applies the saved colour, caching the result per skin+mode so the pre-paint
+   bootstrap can replay it without running the engine before first paint. */
+function applyColour(){
+  const el=document.documentElement, u=UI.get(), c=u.colour;
+  COLOUR_PROPS.forEach(p=>el.style.removeProperty(p));
+  if(!c || (!c.accent && !c.grad && !c.tint && !c.lift)){ _colourReport=null; return; }
+  const base=skinBase();
+  const out=deriveColour(c, base);
+  Object.keys(out.tokens).forEach(p=>{ if(out.tokens[p] && out.tokens[p]!=='none') el.style.setProperty(p,out.tokens[p]); });
+  if(out.tokens['--accent-grad']==='none') el.style.removeProperty('--accent-grad');
+  const r=UI.raw();
+  r.colourCache=Object.assign({}, r.colourCache||{});
+  r.colourCache[el.dataset.skin+'|'+(base.dark?'dark':'light')]=out.tokens;
+  UI.save(r);
+  /* If the engine had to hold the lightness short of what was asked, keep the
+     figure it settled on rather than the request. The slider then sits at the
+     limit instead of at a number that did nothing, which is the only way the
+     ceiling on a near-white palette is visible at all.
+
+     After UI.save(r), not before: r was read at the top of this function, so
+     saving it afterwards would write back a snapshot taken before this value
+     existed and silently undo it. */
+  if(out.lift!=null && (u.colour.lift||0)!==out.lift){
+    u.colour.lift=out.lift; UI.set(u);
+  }
+  _colourReport=out;
+  /* the accent moved, so the ink that survives on a thinned copy of it moved -
+     and so did the surfaces every glass fill is built from */
+  if(UI.get().glass){
+    const k = (typeof glassAccentInk==='function') ? glassAccentInk() : null;
+    if(k) el.style.setProperty('--glass-accent-ink', k.ink);
+    const b = (typeof glassBase==='function') ? glassBase() : null;
+    if(b){ el.style.setProperty('--glass-base', b.surface);
+           el.style.setProperty('--glass-base-nav', b.nav); }
+  }
+}
+/* Both bubble tabs read the same state, so whichever is open has to follow a
+   change made from the other. */
+function renderBubbleTabs(){
+  if($('bubble-panel')?.innerHTML) renderBubbleTab();
+  if($('bubbleset-panel')?.innerHTML) renderBubbleSetup();
+}
+
+function setColour(patch){
+  const u=UI.get(); u.colour=Object.assign({},u.colour||{},patch);
+  UI.set(u);
+  const r=UI.raw(); r.colourCache={}; UI.save(r);   // every cached mode is stale
+  applyColour(); renderColourTab();
+}
+function resetColour(){
+  const u=UI.get(); delete u.colour; UI.set(u);
+  const r=UI.raw(); delete r.colourCache; UI.save(r);
+  applyColour(); renderColourTab(); toast('Colours reset to the palette');
+}
+
+
+/* One miniature per layout. The column ratios are the real ones, so the
+   mockup answers the only question the card cannot: how much of the screen
+   does each part take. */
+const THEME_MOCK = {
+  studio:  '<span class="tm-nav"><i></i><i></i><i></i><i></i></span>' + tmMain(),
+  console: '<span class="tm-nav"><i></i><i></i><i></i><i></i><i></i></span>'
+           + tmMain(true) + '<span class="tm-panel"></span>',
+  rail:    '<span class="tm-rail"><i></i><i></i><i></i><i></i></span>'
+           + '<span class="tm-list"><i></i><i></i><i></i><i></i></span>' + tmMain(),
+  trio:    '<span class="tm-nav"><i></i><i></i><i></i></span>'
+           + '<span class="tm-list"><i></i><i></i><i></i><i></i></span>' + tmMain(),
+  deck:    tmMain() + '<span class="tm-dock"><i></i><i></i><i></i><i></i></span>',
+  zen:     tmMain(),
+  ledger:  '<span class="tm-top"></span><span class="tm-nav"><i></i><i></i><i></i><i></i></span>' + tmMain(),
+  split:   '<span class="tm-rail"><i></i><i></i><i></i><i></i></span>'
+           + '<span class="tm-list wide"><i></i><i></i><i></i><i></i><i></i></span>' + tmMain(),
+  canvas:  '<span class="tm-top strip"><i></i><i></i><i></i><i></i></span>' + tmMain(),
+  tiles:   '<span class="tm-nav tile"><i></i><i></i><i></i><i></i></span>' + tmMain(true, true),
+};
+const THEME_COLS = {
+  studio:'26% 1fr', console:'17% 1fr 19%', rail:'9% 23% 1fr',
+  trio:'16% 24% 1fr', deck:'1fr', zen:'1fr',
+  ledger:'24% 1fr', split:'11% 34% 1fr', canvas:'1fr', tiles:'26% 1fr',
+};
+function tmMain(band, tiled){
+  return '<span class="tm-main'+(tiled?' tiled':'')+'">'
+    + '<span class="tm-bar"></span>'
+    + (band?'<span class="tm-band"></span>':'')
+    + '<span class="tm-msg a"></span><span class="tm-msg u"></span><span class="tm-msg a"></span>'
+    + '<span class="tm-inp"></span></span>';
+}
+function themeMock(id){
+  return '<span class="tm" data-mock="'+id+'" style="grid-template-columns:'+(THEME_COLS[id]||'1fr')+'">'
+    + (THEME_MOCK[id]||tmMain()) + '</span>';
+}
+
+/* ── UI ──────────────────────────────────────────────────────────────── */
+function apTab(name){
+  document.querySelectorAll('.ap-panel').forEach(p=>p.classList.toggle('hf', p.dataset.panel!==name));
+  document.querySelectorAll('.ap-tab').forEach(b=>{
+    const on = b.dataset.tab===name;
+    b.classList.toggle('border-accent', on);
+    b.classList.toggle('text-main', on);
+    b.classList.toggle('text-dim', !on);
+  });
+  if (name==='style')  renderStyleTab();
+  renderScopeBar(name==='colour' || name==='bubble' || name==='bubbleset' || name==='more');
+  if (name==='colour') renderColourTab();
+  if (name==='bubble') renderBubbleTab();
+  if (name==='bubbleset') renderBubbleSetup();
+  if (name==='more')   renderMoreTab();
+}
+
+function renderThemeTab(){
+  const cur = currentTheme().id;
+  $('theme-grid').innerHTML = THEMES.map(t=>\`
+    <button onclick="pickTheme('\${t.id}')" class="text-left p-2.5 rounded-lg border transition-colors \${t.id===cur
+      ? 'border-accent bg-accent-soft' : 'border-line hover:border-line-2'}">
+      \${themeMock(t.id)}
+      <span class="flex items-center gap-2 mt-2">
+        <span class="text-sm font-semibold">\${t.name}</span>
+        \${t.desktopOnly?'<span class="text-[9px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-surface-2 text-dim">PC only</span>':''}
+      </span>
+      <span class="block text-[11px] text-dim leading-snug mt-0.5">\${t.desc}</span>
+    </button>\`).join('');
+}
+function pickTheme(id){ applyThemePreset(id); renderThemeTab(); toast('Theme: '+themeById(id).name); }
+
+function renderStyleTab(){
+  const t = currentTheme(), saved = styleValues(t.id);
+  $('style-theme-name').textContent = t.name;
+  $('style-options').innerHTML = t.opts.map(o=>{
+    const v = (saved[o.id]!==undefined) ? saved[o.id] : o.def;
+    if (o.kind==='choice') return \`
+      <div>
+        <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">\${o.label}</p>
+        <div class="flex flex-wrap gap-1.5">\${o.vals.map(x=>\`
+          <button onclick="chooseStyle('\${o.id}','\${x[0]}')" class="px-3 py-1.5 rounded-lg border text-xs transition-colors \${x[0]===v
+            ? 'border-accent bg-accent-soft text-main font-semibold' : 'border-line text-dim hover:border-line-2'}">\${x[1]}</button>\`).join('')}</div>
+      </div>\`;
+    if (o.kind==='range') return \`
+      <div>
+        <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">\${o.label} <span class="font-mono text-main">\${v}\${o.unit||''}</span></p>
+        <input type="range" min="\${o.min}" max="\${o.max}" step="\${o.step||1}" value="\${v}"
+          oninput="chooseStyle('\${o.id}', +this.value)" class="w-full accent-accent">
+      </div>\`;
+    const on = (v===true || v===o.on);
+    return \`
+      <div class="flex items-center justify-between">
+        <p class="text-sm font-medium">\${o.label}</p>
+        <button onclick="chooseStyle('\${o.id}', \${!on})" class="w-11 h-6 rounded-full relative transition-colors flex-shrink-0 \${on?'bg-success':'bg-surface-3'}">
+          <span class="absolute top-0.5 w-5 h-5 rounded-full bg-surface shadow transition-[background-color,border-color,color,box-shadow,scale]" style="left:\${on?'22px':'2px'}"></span>
+        </button>
+      </div>\`;
+  }).join('') || '<p class="text-xs text-dim">This theme has no options yet.</p>';
+}
+function chooseStyle(optId, value){
+  const t = currentTheme(), o = t.opts.find(x=>x.id===optId);
+  if (!o) return;
+  setStyleValue(t.id, optId, value);
+  applyOpt(o, value);
+  renderStyleTab();
+}
+
+function renderAppearance(){
+  renderThemeTab();
+  apTab('theme');
+  const u=UI.get();
+  $('font-input').value = u.fontName||'';
+  $('bg-url').value = u.bgSrc||'';
+  if(u.bgOpacity!=null){ $('bg-op').value=Math.round(u.bgOpacity*100); $('bg-op-val').textContent=Math.round(u.bgOpacity*100)+'%'; }
+  if(u.bgBlur!=null){ $('bg-blur').value=u.bgBlur; $('bg-blur-val').textContent=u.bgBlur+'px'; }
+  if($('bg-veil')){ const ve=u.bgVeil==null?100:u.bgVeil;
+    $('bg-veil').value=ve; $('bg-veil-val').textContent=ve+'%'; }
+  if(u.cursor){
+    _cur={dataUri:u.cursor}; _curOrig=u.cursor;
+    _hot=(u.cursorHot||'0 0').split(' ').map(Number);
+    _curPx=u.cursorPx||32;
+    _hotN=(u.cursorHotN||'0 0').split(' ').map(Number);
+    const sl=$('cursor-size'); if(sl){ sl.value=_curPx; $('cursor-size-val').textContent=_curPx+'px'; }
+    drawCursor();
+  }
+}
+
+
+/* ── CHAT BUBBLES ───────────────────────────────────────────────────────
+   The designs live in their own stylesheet and their own manifest, both
+   fetched on demand.
+
+   The chosen design's id is stamped on each message ROW, not on <html>, so the
+   two sides can wear different designs. @scope then resolves each row against
+   its own id. It has to be an ancestor of .msg-content: inside @scope a plain
+   selector never matches the scope root itself, only its descendants.
+
+   Per-design colour tokens ride on the same row, so --b1 on an AI row and --b1
+   on a user row are two independent values rather than one collision. */
+let BUBBLES=null, _bubLoad=null, _bubPeek=null;
+const BUB_ALL='All';
+const SIDES=['ai','user'];
+
+function bubbleSheet(){
+  if(document.getElementById('bubble-sheet')) return;
+  const l=document.createElement('link');
+  l.id='bubble-sheet'; l.rel='stylesheet';
+  l.href='?action=asset&f=bubbles.css&v='+(window.APP_V||'0');
+  document.head.appendChild(l);
+}
+function loadBubbles(){
+  if(BUBBLES) return Promise.resolve(BUBBLES);
+  bubbleSheet();
+  if(!_bubLoad) _bubLoad=fetch('?action=asset&f=bubbles.json&v='+(window.APP_V||'0'))
+    .then(r=>r.json()).then(j=>(BUBBLES=j));
+  return _bubLoad;
+}
+const bubById=id=>(BUBBLES||[]).find(b=>b.id===+id);
+
+/* ── stored shape ───────────────────────────────────────────────────────
+   { ai:{...}, user:{...}|null }  - a null user side means "same as theirs",
+   which is what one-design-for-everything looks like. The older flat shape is
+   read as the AI side so nobody's saved bubble is lost. */
+function bubbleStore(){
+  const u=UI.get(), b=u.bubble;
+  if(!b) return {ai:null, user:null};
+  if(b.ai!==undefined || b.user!==undefined) return {ai:b.ai||null, user:b.user||null};
+  return {ai:b.id?b:null, user:null};                 // migrate the flat form
+}
+/* What a side actually renders with.
+   Three states, and they have to stay distinct: absent means "follow the other
+   side", {id:null} means "no design, use the app's own bubble", and anything
+   with an id is that design. Collapsing the first two is what made Default put
+   one side's design onto both. */
+function sideCfg(side){
+  const s=bubbleStore();
+  if(side!=='user') return s.ai;
+  return (s.user===undefined || s.user===null) ? s.ai : s.user;
+}
+function writeStore(store){
+  /* The hover preview holds what each row looked like BEFORE the preview, so
+     mouseleave can put it back. Once something is actually stored that snapshot
+     describes a past that no longer exists, and restoring it would undo the
+     change that was just made - which is what made Default look like it had not
+     applied until the page was reloaded. */
+  _bubPeek=null;
+  const u=UI.get(); u.bubble=store; UI.set(u); applyBubble();
+}
+
+/* Any CSS colour in, #RRGGBB out, with the alpha handed back separately so a
+   translucent design stays translucent after it is recoloured. */
+function splitColour(str){
+  const c=CL.rgba(str);
+  return {hex:CL.hex([Math.round(c[0]),Math.round(c[1]),Math.round(c[2])]), a:c[3]};
+}
+const joinColour=(hex,a)=>{ if(a>=0.999) return hex;
+  const r=CL.hexToRgb(hex); return 'rgba('+r[0]+','+r[1]+','+r[2]+','+(+a.toFixed(3))+')'; };
+
+/* Rotate a whole design by one hue delta, holding each colour's authored
+   lightness. Keeping the RELATIVE hues is what makes a recoloured design still
+   read as that design rather than as a flat wash. */
+function recolour(defaults, hue, vivid, lift){
+  const parts=defaults.map(splitColour);
+  const oks=parts.map(p=>CL.hexToOklch(p.hex));
+  const chromatic=oks.filter(o=>o[1]>0.02);
+  const h0=chromatic.length?chromatic[0][2]:0;
+  return oks.map((o,i)=>{
+    const grey=o[1]<=0.02;
+    const h=grey?o[2]:(((hue+(o[2]-h0))%360)+360)%360;
+    const L=CL.clamp(o[0]+lift,0.02,0.99);
+    const C=Math.min((grey?o[1]:o[1]*vivid), CL.maxChroma(L,h));
+    return joinColour(CL.oklchHex(L,C,h), parts[i].a);
+  });
+}
+
+/* Which colours a design exposes. A locked design hands over the palette its
+   CSS hardcoded; an unlocked one is already driven by the four side colours. */
+/* Which designs draw their motif as a glyph, and what that glyph started as.
+   Built from the stylesheet at patch time rather than guessed at runtime: the
+   rules read var(--bub-glyph, "<original>"), so this list and those fallbacks
+   are the same set by construction. */
+const BUB_GLYPHS = {
+  41:["👑"],
+  42:["💖"],
+  45:["📌"],
+  46:["✨"],
+  47:["🌸"],
+  48:["✦"],
+  49:["🎵"],
+  50:["💤"],
+  100:["💎","👑"]
+};
+
+function bubbleSlots(b){
+  /* the build names each freed colour by what it controls - the bubble's fill,
+     a decoration, the border - so the picker can say so instead of numbering */
+  if(b.locked && b.vars.length) return b.vars.map((v,i)=>({token:v[0], def:v[1], label:v[2]||('Colour '+(i+1))}));
+  return [{token:'--bub-ai-bg', def:b.ai[0], label:'Their fill'},
+          {token:'--bub-ai-tx', def:b.ai[1], label:'Their text'},
+          {token:'--bub-user-bg', def:b.user[0], label:'Your fill'},
+          {token:'--bub-user-tx', def:b.user[1], label:'Your text'}];
+}
+
+/* What the glyph designs are wearing. Nothing is set unless it was changed, so
+   a design nobody has touched paints the fallback written into its own rule. */
+function glyphVars(b, cfg){
+  const out={};
+  if(!b || !BUB_GLYPHS[b.id]) return out;
+  const g=cfg.glyphs||{};
+  if(g.a) out['--bub-glyph']  = JSON.stringify(g.a);
+  if(g.b) out['--bub-glyph2'] = JSON.stringify(g.b);
+  if(g.size) out['--bub-glyph-size'] = g.size+'px';
+  if(g.color) out['--bub-glyph-color'] = g.color;
+  return out;
+}
+
+/* Makes the bubble see-through without touching the words in it.
+   opacity on the element would take the text with it, and a design's fill is
+   its own CSS - a gradient, an image, or both layered - so there is nothing to
+   put an alpha on from outside. What there IS, because every design was made
+   recolourable, is a custom property per colour it paints. Multiplying the
+   alpha of those rebuilds the design's own gradients translucent, at whatever
+   complexity the design happens to have.
+
+   Text slots keep their alpha. Fading the fill is the point; fading the words
+   is what makes a translucent bubble unreadable. */
+function alphaVars(b, cfg){
+  const a = cfg.alpha==null ? 1 : +cfg.alpha;
+  if(!(a>=0) || a>0.995) return {};
+  const out={};
+  for(const s of bubbleSlots(b)){
+    if(/text|ink|label|chữ/i.test(s.label||'') || /-tx$/.test(s.token)) continue;
+    const base=(cfg.vars && cfg.vars[s.token]) || s.def;
+    if(!base) continue;
+    const c=CL.rgba(base);
+    if(!c) continue;
+    out[s.token]='rgba('+Math.round(c[0])+','+Math.round(c[1])+','+Math.round(c[2])
+               +','+(+(c[3]*a).toFixed(3))+')';
+  }
+  return out;
+}
+
+/* The emoji wallpaper, generated the way the userscript generates it: one SVG
+   pattern of the chosen emoji, tinted by the side's own fill. Scoped to the
+   design AND the side, so a dual setup cannot cross-tint. */
+function emojiCSS(b, cfg, side){
+  const list=(cfg.emoji&&cfg.emoji.length)?cfg.emoji:[b.emoji||'\\u2B50'];
+  const angle=cfg.angle||0, alpha=cfg.alpha==null?0.85:cfg.alpha;
+  const w=50,h=46,fs=22,n=list.length,pw=Math.max(w*n,w),ph=h*2;
+  let texts='';
+  for(let i=-2;i<=n+1;i++){
+    const e=list[((i%n)+n)%n];
+    texts+='<text x="'+(i*w+w/2)+'" y="'+(h/2)+'" font-size="'+fs+'" text-anchor="middle" dominant-baseline="central">'+e+'</text>';
+    texts+='<text x="'+(i*w+w)+'" y="'+(h+h/2)+'" font-size="'+fs+'" text-anchor="middle" dominant-baseline="central">'+e+'</text>';
+  }
+  const svg='<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%"><defs><pattern id="p" width="'+pw+'" height="'+ph+'" patternUnits="userSpaceOnUse" patternTransform="rotate('+angle+')">'+texts+'</pattern></defs><rect width="100%" height="100%" fill="url(#p)"/></svg>';
+  const enc=encodeURIComponent(svg).replace(/'/g,'%27').replace(/"/g,'%22');
+  const v=(cfg.vars||{});
+  const c=CL.rgba(v['--bub-'+side+'-bg'] || (side==='user'?b.user[0]:b.ai[0]) || '#ffffff');
+  const tint='rgba('+Math.round(c[0])+','+Math.round(c[1])+','+Math.round(c[2])+','+alpha+')';
+  return '@scope ([data-bubble="'+b.id+'"]){ .msg-content[data-side="'+side+'"]{'
+       + 'background:linear-gradient('+tint+','+tint+'),url("data:image/svg+xml;charset=utf-8,'+enc+'")!important} }';
+}
+
+/* ── applying ───────────────────────────────────────────────────────────
+   Stamps every message row with its side's design and that side's colours.
+   Rows created later are stamped by buildMsgEl, so a streaming reply arrives
+   already dressed. */
+function dressRow(row){
+  const side = row.querySelector('.msg-content[data-side="user"]') ? 'user' : 'ai';
+  const cfg = sideCfg(side);
+  const prev = row._bubProps || [];
+  prev.forEach(p=>row.style.removeProperty(p));
+  row._bubProps = [];
+  row.style.removeProperty('--bub-font');
+  const mc0=row.querySelector('.msg-content');
+  if(!cfg || !cfg.id){
+    delete row.dataset.bubble;
+    if(mc0){ dressExtras(mc0, null); mc0.style.removeProperty('color'); }
+    return;
+  }
+  row.dataset.bubble = cfg.id;
+  const _b = bubById(cfg.id);
+  const vars = Object.assign({}, cfg.vars || {}, customVars(cfg),
+                             _b ? alphaVars(_b, cfg) : {},
+                             _b ? glyphVars(_b, cfg) : {});
+  Object.keys(vars).forEach(k=>{ row.style.setProperty(k, vars[k]); row._bubProps.push(k); });
+  if(mc0) dressExtras(mc0, cfg);
+  if(cfg.font) row.style.setProperty('--bub-font', cfg.font);
+  const mc=row.querySelector('.msg-content');
+  if(mc){
+    const h=_halo[side];
+    if(h){ mc.dataset.halo=''; row.style.setProperty('--bub-halo', h); row._bubProps.push('--bub-halo'); }
+    else delete mc.dataset.halo;
+    /* Inline and important, because the design's own colour lives in an @scope
+       block and scope proximity is settled before specificity - no selector
+       written here could outrank it. */
+    const k=_ink[side];
+    if(k) mc.style.setProperty('color', k, 'important');
+    else mc.style.removeProperty('color');
+  }
+}
+/* Every colour a design actually paints behind its own text: the background
+   colour, then every stop of every gradient layered over it. Reading them off
+   the computed style is the only way to see the design's CSS, the user's
+   recolouring and the theme's variables resolved together.
+
+   url() layers are cut out first. A data: URI holding an SVG is full of things
+   that look like colour tokens, and none of them are the ones under the text. */
+function bgStops(cs, under){
+  const out=[];
+  const add=str=>{ const c=CL.rgba(str); if(c[3]>0.04) out.push(CL.flat(str, under)); };
+  add(cs.backgroundColor);
+  let img=cs.backgroundImage||'';
+  if(img && img!=='none'){
+    img=img.replace(/url\\((?:[^()]|\\([^()]*\\))*\\)/gi,'');
+    const re=/(?:rgba?|hsla?|oklab|oklch|lab|lch|color)\\([^()]*(?:\\([^()]*\\)[^()]*)*\\)|#[0-9a-fA-F]{3,8}/g;
+    for(const m of img.matchAll(re)) add(m[0]);
+  }
+  return out;
+}
+
+/* How much of what is behind the bubble the bubble actually stops.
+   Not background-color: a design paints its fill as a gradient in
+   background-image and leaves the colour transparent, so reading the colour
+   alone reports every gradient design as see-through. The gradient's weakest
+   stop is the honest answer - if that is opaque the fill covers the box, and if
+   the opacity slider has thinned it the number drops and says so. */
+function bgCover(cs){
+  let lo=CL.rgba(cs.backgroundColor)[3];
+  let img=cs.backgroundImage||'';
+  if(img && img!=='none'){
+    img=img.replace(/url\\((?:[^()]|\\([^()]*\\))*\\)/gi,'');
+    const re=/(?:rgba?|hsla?|oklab|oklch|lab|lch|color)\\([^()]*(?:\\([^()]*\\)[^()]*)*\\)|#[0-9a-fA-F]{3,8}/g;
+    const ms=[...img.matchAll(re)];
+    if(ms.length) lo=Math.max(lo, Math.min.apply(null, ms.map(m=>CL.rgba(m[0])[3])));
+  }
+  return lo;
+}
+
+/* One measurement per side, not per row: reading computed style is a forced
+   style recalc, and a long conversation has hundreds of rows. */
+function probeSide(side, id){
+  const probe=document.createElement('div');
+  probe.setAttribute('data-bubble', id);
+  probe.style.cssText='position:absolute;left:-9999px;top:0;visibility:hidden';
+  /* the same custom properties the real rows get, or this measures a bubble
+     nobody is looking at - and a see-through one is exactly the case where the
+     answer changes */
+  const _cfg=sideCfg(side)||{}, _b=bubById(id);
+  const _v=Object.assign({}, _cfg.vars||{}, _b?alphaVars(_b,_cfg):{},
+                         _b?glyphVars(_b,_cfg):{});
+  Object.keys(_v).forEach(k=>probe.style.setProperty(k,_v[k]));
+  const inner=document.createElement('div');
+  inner.className='msg-content'; inner.setAttribute('data-side', side);
+  inner.textContent='Ag';
+  probe.appendChild(inner); document.body.appendChild(probe);
+  const cs=getComputedStyle(inner);
+  const patterned = cs.backgroundImage && cs.backgroundImage!=='none';
+  /* the widest blur radius in whatever shadow the design already declares */
+  let blur=0;
+  if(cs.textShadow && cs.textShadow!=='none'){
+    for(const m of cs.textShadow.matchAll(/(-?[\\d.]+)px/g)) blur=Math.max(blur, Math.abs(+m[1]));
+  }
+  const isGlow = blur > 2.5;      // a soft glow is the design speaking; leave it
+  const inkRGB=CL.rgba(cs.color);
+  const inkY=CL.relLum([inkRGB[0],inkRGB[1],inkRGB[2]]);
+
+  /* Measure first, decide after. Both passes need the same answer - what the
+     text is actually sitting on - and the halo used to choose before anyone had
+     worked it out, which is how a design could be left to a glow that was not
+     doing anything.
+
+     A see-through bubble is showing whatever is behind it, and behind it may be
+     a photograph whose luminance no computed style can report; worst stays null
+     there and the halo takes the case, because the halo works without knowing. */
+  const under=CL.rgba(getComputedStyle(document.documentElement).getPropertyValue('--surface')||'#ffffff');
+  const stops=bgStops(cs, under);
+  const covers = bgCover(cs) > 0.85;
+  /* A see-through bubble is only a mystery when there is a picture behind it.
+     Over the app's own surface it composites to something knowable, and
+     bgStops has already done that compositing. */
+  const behindIsKnown = covers || !document.documentElement.dataset.wallpaper;
+  const inkHex=CL.hex([inkRGB[0],inkRGB[1],inkRGB[2]].map(Math.round));
+  const worst = (stops.length && behindIsKnown)
+    ? Math.min.apply(null, stops.map(s=>CL.cr(inkHex,s)))
+    : null;
+
+  /* what the ink could be instead, if swapping it would finish the job */
+  let ink=null;
+  if(UI.get().bubbleInk!==false && worst!==null && worst<4.5){
+    const better=CL.pickInk(stops);
+    /* Only when the swap actually delivers. Asking merely for "better" let a
+       design be repainted from 1.00 to 1.98 - still unreadable, colours changed
+       for nothing. If neither ink clears 4.5:1 the fill is a pattern that
+       matches any text colour you could pick, and that is the halo's problem. */
+    if(better.worst >= 4.5) ink=better.ink;
+  }
+
+  /* The outline. It stands down for a design that declares its own glow, on the
+     grounds that the design has an opinion about legibility - but only while the
+     opinion is holding up. Below 3:1 it demonstrably is not, and Moon Dunes at
+     1.35 was being left to a glow doing nothing. */
+  let halo=null;
+  const stillShort = (ink ? false : (worst===null || worst < 4.5));
+  /* Patterned OR unknowable. Asking only about the pattern missed every clear
+     design - a bubble you can see the wallpaper through has no pattern and the
+     worst backdrop of the lot. */
+  const reallyBad = (worst!==null && worst < 3);
+  if(UI.get().bubbleHalo!==false && stillShort
+     && (patterned || !behindIsKnown || reallyBad)
+     && (!isGlow || worst===null || worst < 3)){
+    /* against whichever ink will actually be painted */
+    const finalY = ink ? CL.relLum(CL.rgba(ink)) : inkY;
+    halo = finalY < 0.45 ? 'rgba(255,255,255,.85)' : 'rgba(0,0,0,.6)';
+  }
+  probe.remove();
+  return {halo:halo, ink:ink};
+}
+
+function applyBubble(){
+  applyPlainBubbleAlpha();
+  const store=bubbleStore();
+  const any = (store.ai&&store.ai.id) || (store.user&&store.user.id)
+    || (sideCfg('ai')&&sideCfg('ai').id) || (sideCfg('user')&&sideCfg('user').id);
+  document.querySelectorAll('link[data-bubfont]').forEach(l=>l.remove());
+  document.getElementById('bubble-emoji')?.remove();
+  if(!any){
+    document.querySelectorAll('#chat-container .msg-row').forEach(r=>{ dressRow(r); });
+    return;
+  }
+  bubbleSheet();
+  _halo={}; _ink={};
+  for(const side of SIDES){
+    const cfg=sideCfg(side);
+    if(cfg&&cfg.id){ const m=probeSide(side, cfg.id); _halo[side]=m.halo; _ink[side]=m.ink; }
+  }
+  document.querySelectorAll('#chat-container .msg-row').forEach(dressRow);
+  if(typeof LG!=='undefined') LG.refresh();
+  /* fonts and emoji wallpapers are per side */
+  const css=[], fonts=new Set();
+  for(const side of SIDES){
+    const cfg=sideCfg(side); if(!cfg||!cfg.id) continue;
+    const b=bubById(cfg.id);
+    if(cfg.fontName) fonts.add(cfg.fontName);
+    if(b && b.emoji) css.push(emojiCSS(b, cfg, side));
+  }
+  fonts.forEach(name=>{
+    const l=document.createElement('link'); l.rel='stylesheet'; l.dataset.bubfont='1';
+    l.href='https://fonts.googleapis.com/css2?family='+encodeURIComponent(name).replace(/%20/g,'+')+':wght@400;500;600;700&display=swap';
+    document.head.appendChild(l);
+  });
+  if(css.length){
+    const s=document.createElement('style'); s.id='bubble-emoji';
+    s.textContent=css.join('\\n'); document.head.appendChild(s);
+  }
+}
+
+/* ── editing ────────────────────────────────────────────────────────────
+   _bubSide says which side the picker is aiming at. 'both' keeps the two in
+   step, which is what most people want and what the old single-design
+   behaviour was. */
+let _bubSide='both';
+let _halo={}, _ink={};
+function targetSides(){ return _bubSide==='both' ? SIDES : [_bubSide]; }
+
+function saveBubble(patch){
+  const store=bubbleStore();
+  for(const side of targetSides()){
+    const cur = side==='user'
+      ? ((store.user===undefined||store.user===null) ? (store.ai||{}) : store.user)
+      : (store.ai||{});
+    const cfg = Object.assign({}, cur, patch);
+    const b=bubById(cfg.id);
+    if(b){
+      cfg.emojiCSS = '';                       // rebuilt on apply, per side
+      if(cfg.useFont===false){ delete cfg.font; delete cfg.fontName; }
+      else if(b.font){ cfg.font="'"+b.font+"',var(--font)"; cfg.fontName=b.font; }
+    }
+    store[side]=cfg;
+  }
+  if(_bubSide==='both') store.user=null;       // one design, said once
+  writeStore(store);
+}
+function chooseBubble(id){
+  const b=bubById(id); if(!b) return;
+  _bubPeek=null;
+  saveBubble({id:b.id, vars:{}, manual:{}, hue:null, vivid:1, lift:0, seed:'',
+              useFont:true, emoji:null, angle:0, alpha:1});
+  renderBubbleTabs();
+  toast(_bubSide==='both' ? 'Bubble: '+b.name
+        : (_bubSide==='ai'?'Their bubble: ':'Your bubble: ')+b.name);
+}
+function clearBubble(){
+  /* this one writes around writeStore, so it drops the preview itself */
+  _bubPeek=null;
+  const u=UI.get();
+  if(_bubSide==='both'){
+    delete u.bubble;
+  } else {
+    const store=bubbleStore();
+    /* {id:null} says "this side has no design" out loud. Setting it to null
+       would say "follow the other side", which is how Default used to hand one
+       side's design to both. */
+    const keptUser = (store.user===undefined || store.user===null)
+      ? (store.ai ? Object.assign({}, store.ai) : {id:null})   // it was following ai
+      : store.user;
+    store.user = keptUser;
+    store[_bubSide] = {id:null};
+    u.bubble = store;
+  }
+  UI.set(u);
+  applyBubble(); renderBubbleTabs(); toast('Back to the app bubble');
+}
+/* Hover previews on the real conversation. Nothing is saved, so leaving the
+   grid puts every row back exactly as it was. */
+function peekBubble(id){
+  if(matchMedia('(hover:none)').matches) return;
+  const rows=[...document.querySelectorAll('#chat-container .msg-row')];
+  if(_bubPeek===null) _bubPeek=rows.map(r=>r.dataset.bubble||'');
+  bubbleSheet();
+  const sides=targetSides();
+  rows.forEach(r=>{
+    const side = r.querySelector('.msg-content[data-side="user"]') ? 'user' : 'ai';
+    if(sides.indexOf(side)<0) return;
+    if(id==='' || id==null) delete r.dataset.bubble; else r.dataset.bubble=id;
+  });
+}
+function unpeekBubble(){
+  if(_bubPeek===null) return;
+  const rows=[...document.querySelectorAll('#chat-container .msg-row')];
+  rows.forEach((r,i)=>{ const v=_bubPeek[i];
+    if(v) r.dataset.bubble=v; else delete r.dataset.bubble; });
+  _bubPeek=null;
+}
+
+/* Hue, vividness and lightness are one control surface: each writes all three
+   back, so the sliders and the seed can never disagree about the result. */
+function tuneBubble(patch){
+  const side=_bubSide==='user'?'user':'ai';
+  const cur=sideCfg(side)||{};
+  const cfg=Object.assign({},cur,patch);
+  const b=bubById(cfg.id); if(!b) return;
+  if(cfg.hue==null){ saveBubble(Object.assign(patch,{vars:{}})); renderBubbleTabs(); return; }
+  const slots=bubbleSlots(b);
+  const cols=recolour(slots.map(s=>s.def), cfg.hue, cfg.vivid==null?1:cfg.vivid, cfg.lift||0);
+  const vars={};
+  slots.forEach((s,i)=>{ vars[s.token]=cols[i]; });
+  if(!b.locked){
+    vars['--bub-ai-tx']=CL.nudge(splitColour(vars['--bub-ai-tx']).hex, splitColour(vars['--bub-ai-bg']).hex, 4.5);
+    vars['--bub-user-tx']=CL.nudge(splitColour(vars['--bub-user-tx']).hex, splitColour(vars['--bub-user-bg']).hex, 4.5);
+  }
+  Object.keys(cfg.manual||{}).forEach(k=>{ vars[k]=cfg.manual[k]; });
+  saveBubble(Object.assign(patch,{vars:vars}));
+}
+function seedBubble(seed){
+  if(!seed) seed=Math.random().toString(36).slice(2,8);
+  const p=CL.paletteFromSeed(seed), o=CL.hexToOklch(p.accent);
+  tuneBubble({seed:seed, hue:o[2], vivid:0.7+p.tint, lift:0});
+  renderBubbleTabs(); toast('Seed: '+p.label);
+}
+function setBubbleColour(token,value){
+  const side=_bubSide==='user'?'user':'ai';
+  const cfg=sideCfg(side)||{};
+  const manual=Object.assign({},cfg.manual||{}); manual[token]=value;
+  const vars=Object.assign({},cfg.vars||{}); vars[token]=value;
+  saveBubble({manual:manual, vars:vars});
+  renderBubbleReport();
+}
+
+/* ── SCOPE BAR ──────────────────────────────────────────────────────────
+   Which of the three levels a change lands on. Reads always show what is in
+   effect, so switching the scope never changes what is on screen - it only
+   changes where the NEXT change is written. The dot marks a level that has
+   settings of its own. */
+function renderScopeBar(show){
+  const box=$('ap-scope'); if(!box) return;
+  box.classList.toggle('hf', !show);
+  if(!show) return;
+  const persona=S.personas.find(p=>p.id==S.currentPersonaId);
+  const label=S.sessions.find(s=>s.id===S.session)?.label||'this chat';
+  const btn=(id,text,enabled,has)=>\`
+    <button \${enabled?\`onclick="setScope('\${id}')"\`:'disabled'}
+      class="chip \${_scope===id?'is-on':''} \${enabled?'':'opacity-40'}">
+      \${text}\${has?' <span class="text-accent">&bull;</span>':''}
+    </button>\`;
+  box.innerHTML=\`
+    <div class="flex items-center gap-2 flex-wrap">
+      <span class="text-[10px] font-bold uppercase tracking-wider text-dim">Applies to</span>
+      \${btn('global','Everywhere',true,false)}
+      \${btn('persona', persona?esc(persona.name):'This persona', !!persona, UI.scopeHas('persona'))}
+      \${btn('session', esc(label), !!S.session, UI.scopeHas('session'))}
+      \${_scope!=='global'&&UI.scopeHas(_scope)?\`<button onclick="dropScope()" class="chip">Clear</button>\`:''}
+    </div>
+    <p class="text-[11px] text-dim mt-1.5">\${_scope==='global'
+      ? 'Changes here apply everywhere, unless a persona or a chat overrides them.'
+      : 'Changes here apply only '+(_scope==='persona'?'while this persona is in use.':'in this chat.')}</p>\`;
+}
+function setScope(which){
+  _scope=which;
+  renderScopeBar(true);
+  const open=document.querySelector('.ap-panel:not(.hf)')?.dataset.panel;
+  if(open==='colour') renderColourTab();
+  if(open==='bubble' || open==='bubbleset') renderBubbleTabs();
+  if(open==='more')   renderMoreTab();
+}
+function dropScope(){
+  const which=_scope;
+  UI.clearScope(which);
+  applyLook();
+  renderScopeBar(true);
+  const open=document.querySelector('.ap-panel:not(.hf)')?.dataset.panel;
+  if(open==='colour') renderColourTab();
+  if(open==='bubble' || open==='bubbleset') renderBubbleTabs();
+  if(open==='more')   renderMoreTab();
+  toast('Back to inheriting');
+}
+/* the More tab is plain markup, so re-rendering it means re-filling the fields
+   from whatever is now in effect */
+function renderMoreTab(){
+  const u=UI.get();
+  if($('font-input')) $('font-input').value=u.fontName||'';
+  if($('bg-url'))     $('bg-url').value=u.bgSrc||'';
+  if($('bg-op')){ const v=u.bgOpacity==null?1:u.bgOpacity;
+    $('bg-op').value=Math.round(v*100); $('bg-op-val').textContent=Math.round(v*100)+'%'; }
+  if($('bg-blur')){ $('bg-blur').value=u.bgBlur||0; $('bg-blur-val').textContent=(u.bgBlur||0)+'px'; }
+  if($('bg-veil')){ const ve=u.bgVeil==null?100:u.bgVeil;
+    $('bg-veil').value=ve; $('bg-veil-val').textContent=ve+'%'; }
+}
+
+/* From the persona editor. Only offered for the persona actually in use:
+   styling a persona you are not talking to would show you a preview of
+   somebody else's look. */
+function stylePersona(){
+  closeModals();
+  openModal('appearance-modal');
+  setTimeout(()=>{ renderAppearance(); setScope('persona'); apTab('colour'); },0);
+}
+
+
+/* ── CUSTOM BUBBLE ──────────────────────────────────────────────────────
+   id 'custom' is not in the manifest; its look comes entirely from the
+   reader's own settings. */
+const CUSTOM_ID='custom';
+
+/* Only http(s). A javascript: or data: URL in a src is how a linked "image"
+   becomes script execution. */
+function safeMedia(u){
+  try{ const p=new URL(String(u).trim(), location.href);
+    return (p.protocol==='https:'||p.protocol==='http:') ? p.href : null;
+  }catch(e){ return null; }
+}
+const looksVideo = u => /\\.(mp4|webm|ogv|ogg|mov|m4v)(\\?|$)/i.test(u||'');
+
+/* Keeps at most the visible videos playing. Without this a long conversation
+   decodes one video per message at once. */
+let _vidObs=null;
+function watchVideo(v){
+  if(!_vidObs) _vidObs=new IntersectionObserver(es=>es.forEach(e=>{
+    const el=e.target;
+    if(e.isIntersecting){ el.play?.().catch(()=>{}); } else { el.pause?.(); }
+  }), {rootMargin:'200px'});
+  _vidObs.observe(v);
+}
+
+/* Builds (or updates) the media layer and the corner glyph for one bubble. */
+function dressExtras(mc, cfg){
+  const c=cfg&&cfg.custom;
+  let layer=mc.querySelector(':scope > .bub-layer');
+  const src=c && safeMedia(c.src);
+  if(src){
+    const kind = c.kind==='video' || (c.kind!=='image' && looksVideo(src)) ? 'video' : 'img';
+    if(!layer){ layer=document.createElement('span'); layer.className='bub-layer';
+      mc.insertBefore(layer, mc.firstChild); }
+    let media=layer.firstElementChild;
+    if(!media || media.tagName.toLowerCase()!==kind || media.getAttribute('src')!==src){
+      layer.innerHTML='';
+      media=document.createElement(kind);
+      media.setAttribute('src', src);
+      if(kind==='video'){ media.muted=true; media.loop=true; media.playsInline=true;
+        media.setAttribute('muted',''); media.setAttribute('playsinline','');
+        media.preload='metadata'; watchVideo(media); }
+      else { media.alt=''; media.loading='lazy'; media.decoding='async'; }
+      layer.appendChild(media);
+      const t=document.createElement('span'); t.className='bub-tint'; layer.appendChild(t);
+    }
+  } else if(layer) layer.remove();
+
+  const ext=cfg&&cfg.ext;
+  let node=mc.querySelector(':scope > .bub-ext');
+  if(ext && ext.glyph){
+    if(!node){ node=document.createElement('span'); node.className='bub-ext'; mc.appendChild(node); }
+    node.textContent=ext.glyph;
+    node.dataset.corner=ext.corner||'tr';
+  } else if(node) node.remove();
+}
+
+/* every custom property the custom fill and the glyph write */
+const CUSTOM_PROPS=['--bub-fit','--bub-media-op','--bub-media-blur','--bub-media-sat',
+  '--bub-tint','--bub-tint-op','--bub-ext-size','--bub-custom-fill','--bub-custom-text',
+  '--bub-custom-radius'];
+function customVars(cfg){
+  const c=cfg.custom||{}, e=cfg.ext||{}, out={};
+  out['--bub-fit']=c.fit||'cover';
+  out['--bub-media-op']=c.opacity==null?1:c.opacity;
+  out['--bub-media-blur']=(c.blur||0)+'px';
+  out['--bub-media-sat']=c.sat==null?1:c.sat;
+  out['--bub-tint']=c.tint||'#000000';
+  out['--bub-tint-op']=c.tintOp==null?0.3:c.tintOp;
+  if(e.size) out['--bub-ext-size']=e.size+'px';
+  if(cfg.id===CUSTOM_ID){
+    out['--bub-custom-fill']=c.fill||'#ffffff';
+    out['--bub-custom-text']=c.text||'#16181c';
+    out['--bub-custom-radius']=(c.radius==null?16:c.radius)+'px';
+  }
+  return out;
+}
+
+/* ── PRESETS ────────────────────────────────────────────────────────────
+   A preset is a whole side configuration under a name: whichever design it
+   started from, plus every recolouring done to it. Saved locally with the
+   rest of the look. */
+function presets(){ const u=UI.get(); return Array.isArray(u.presets)?u.presets:[]; }
+function savePresets(list){ const u=UI.get(); u.presets=list; UI.set(u); }
+function savePreset(name){
+  const side=_bubSide==='user'?'user':'ai';
+  const cfg=sideCfg(side);
+  if(!cfg||!cfg.id){ toast('Nothing to save yet'); return; }
+  const list=presets().slice();
+  const label=(name||'').trim() || (bubById(cfg.id)||{name:'Custom'}).name+' '+(list.length+1);
+  list.push({pid:'p'+Date.now().toString(36), name:label.slice(0,40), cfg:JSON.parse(JSON.stringify(cfg))});
+  savePresets(list); renderBubbleTabs(); toast('Saved: '+label);
+}
+function applyPreset(pid){
+  const p=presets().find(x=>x.pid===pid); if(!p) return;
+  saveBubble(JSON.parse(JSON.stringify(p.cfg)));
+  renderBubbleTabs(); toast('Preset: '+p.name);
+}
+function renamePreset(pid){
+  const list=presets().slice(), p=list.find(x=>x.pid===pid); if(!p) return;
+  const name=prompt('Name this preset', p.name);
+  if(name==null) return;
+  p.name=name.trim().slice(0,40)||p.name; savePresets(list); renderBubbleTabs();
+}
+function deletePreset(pid){
+  savePresets(presets().filter(x=>x.pid!==pid)); renderBubbleTabs(); toast('Preset removed');
+}
+function setCustom(patch){
+  const side=_bubSide==='user'?'user':'ai';
+  const cur=sideCfg(side)||{};
+  const custom=Object.assign({}, cur.custom||{}, patch);
+  saveBubble({id:CUSTOM_ID, custom:custom});
+}
+function setExt(patch){
+  const side=_bubSide==='user'?'user':'ai';
+  const cur=sideCfg(side)||{};
+  saveBubble({ext:Object.assign({}, cur.ext||{}, patch)});
+}
+
+/* ── BUBBLE TAB ─────────────────────────────────────────────────────── */
+let _bubQuery='', _bubCat=BUB_ALL, _bubAllCols=false;
+
+/* A card is the design running for real: [data-bubble] on the button is a
+   @scope root, so every rule that design has applies inside it.
+
+   .bub-neutral cancels the user's own colour overrides, EXCEPT on the card for
+   the design they have chosen - that one should show their colours, because
+   that is what they will get. */
+function bubCard(b, chosen){
+  const emoji = b.emoji ? emojiPreviewStyle(b) : '';
+  return \`<button onclick="chooseBubble(\${b.id})" onmouseenter="peekBubble(\${b.id})"
+    data-bubble="\${b.id}" class="bub-card \${chosen?'is-on':''}" title="\${esc(b.name)}">
+    <span class="bub-demo \${chosen?'':'bub-neutral'}"><span class="bub-stage">
+      <span class="msg-content" data-side="ai" style="\${emoji}">Hello</span>
+      <span class="msg-content" data-side="user" style="\${emoji}">Hi there</span>
+    </span></span>
+    <span class="bub-name">\${esc(b.name)}</span>
+  </button>\`;
+}
+/* The emoji wallpaper is injected as one :root-scoped rule for the chosen
+   design, which a card cannot use. Cards get their own small tile inline -
+   one emoji, one repeat, a few hundred bytes rather than four kilobytes. */
+function emojiPreviewStyle(b){
+  const e=b.emoji||'\\u2B50';
+  const svg='<svg xmlns="http://www.w3.org/2000/svg" width="26" height="26"><text x="13" y="13" font-size="13" text-anchor="middle" dominant-baseline="central">'+e+'</text></svg>';
+  const enc=encodeURIComponent(svg).replace(/'/g,'%27');
+  const c=CL.rgba(b.ai[0]||'#ffffff');
+  const tint='rgba('+Math.round(c[0])+','+Math.round(c[1])+','+Math.round(c[2])+',0.82)';
+  return 'background:linear-gradient('+tint+','+tint+'),url("data:image/svg+xml;charset=utf-8,'+enc+'")';
+}
+/* The reader's own: a linked picture or video, washed to taste. */
+function bubCustomCard(chosen){
+  const cfg=sideCfg(_bubSide==='user'?'user':'ai')||{};
+  const c=cfg.custom||{};
+  /* cssUrl() both checks the scheme and strips the characters that could end
+     the url() token; CSS.escape here was worse than nothing, because the
+     backslashes it adds were being stripped again immediately after. */
+  const u = cssUrl(c.src||'');
+  const thumb = u ? 'background-image:url(&quot;'+esc(u)+'&quot;);background-size:cover;background-position:center' : '';
+  return \`<button onclick="chooseCustom()" class="bub-card \${chosen?'is-on':''}" title="Your own picture or video">
+    <span class="bub-demo" style="\${thumb}"><span class="bub-stage">
+      <span class="msg-content" data-side="ai" style="background:var(--surface-2);color:var(--text);border-radius:12px 12px 12px 3px">Yours</span>
+      <span class="msg-content" data-side="user" style="background:var(--accent);color:var(--accent-text);border-radius:12px 12px 3px 12px">&hellip;</span>
+    </span></span>
+    <span class="bub-name">Custom</span>
+  </button>\`;
+}
+function bubPresetCard(p, chosen){
+  const b=p.cfg.id===CUSTOM_ID?null:bubById(p.cfg.id);
+  const inner = b
+    ? \`<span data-bubble="\${b.id}" style="display:contents">
+         <span class="msg-content" data-side="ai">Aa</span>
+         <span class="msg-content" data-side="user">Aa</span></span>\`
+    : \`<span class="msg-content" data-side="ai" style="background:var(--surface-2);color:var(--text)">Aa</span>
+       <span class="msg-content" data-side="user" style="background:var(--accent);color:var(--accent-text)">Aa</span>\`;
+  return \`<button onclick="applyPreset('\${p.pid}')" class="bub-card \${chosen?'is-on':''}" title="\${esc(p.name)}">
+    <span class="bub-demo"><span class="bub-stage">\${inner}</span></span>
+    <span class="bub-name">\${esc(p.name)}</span>
+    <span class="flex gap-2 mt-0.5">
+      <span onclick="event.stopPropagation();renamePreset('\${p.pid}')" class="text-[10px] text-dim underline">Rename</span>
+      <span onclick="event.stopPropagation();deletePreset('\${p.pid}')" class="text-[10px] text-dim underline">Delete</span>
+    </span>
+  </button>\`;
+}
+function chooseCustom(){
+  _bubPeek=null;
+  const cur=sideCfg(_bubSide==='user'?'user':'ai')||{};
+  saveBubble({id:CUSTOM_ID, vars:{}, manual:{}, hue:null, vivid:1, lift:0, useFont:false,
+              custom:Object.assign({fit:'cover',opacity:1,blur:0,sat:1,tint:'#000000',tintOp:0.3,
+                                    fill:'#ffffff',text:'#16181c',radius:16}, cur.custom||{})});
+  renderBubbleTabs();
+}
+
+/* Back to the app's own bubble. Rendered from the live tokens, so it shows the
+   palette and accent that are actually in force. */
+function bubDefaultCard(chosen){
+  return \`<button onclick="clearBubble()" onmouseenter="peekBubble('')"
+    class="bub-card \${chosen?'is-on':''}" title="The app default">
+    <span class="bub-demo"><span class="bub-stage">
+      <span class="msg-content" data-side="ai" style="background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:12px 12px 12px 3px">Hello</span>
+      <span class="msg-content" data-side="user" style="background:var(--accent);background-image:var(--accent-grad,none);color:var(--accent-text);border-radius:12px 12px 3px 12px">Hi there</span>
+    </span></span>
+    <span class="bub-name">Default</span>
+  </button>\`;
+}
+
+/* Says what each side is wearing, so picking "Both" after setting them apart
+   is an informed choice rather than a surprise. */
+function sideSummary(){
+  const a=sideCfg('ai'), u=sideCfg('user');
+  const nm=c=>c&&c.id?(bubById(c.id)||{name:'#'+c.id}).name:'the app default';
+  if(_bubSide==='both')
+    return (a&&u&&a.id!==u.id)
+      ? 'Theirs is '+nm(a)+', yours is '+nm(u)+'. Choosing here sets both to one design.'
+      : 'One design for the whole conversation.';
+  return _bubSide==='ai'
+    ? 'Only their messages change. Yours stay on '+nm(u)+'.'
+    : 'Only your messages change. Theirs stay on '+nm(a)+'.';
+}
+function toggleInk(){
+  const u=UI.get(); u.bubbleInk = (u.bubbleInk===false); UI.set(u);
+  applyBubble(); renderBubbleTabs();
+}
+function toggleHalo(){
+  const u=UI.get(); u.bubbleHalo = (u.bubbleHalo===false); UI.set(u);
+  applyBubble(); renderBubbleTabs();
+}
+function setBubSide(s){
+  _bubSide=s;
+  /* leaving "both" forks the user side off the shared design, so the next
+     choice changes one side without silently moving the other */
+  if(s!=='both'){
+    const st=bubbleStore();
+    if(!st.user && st.ai) { st.user=Object.assign({},st.ai); const u=UI.get(); u.bubble=st; UI.set(u); }
+  }
+  renderBubbleTabs();
+}
+
+function renderBubbleTab(){
+  const box=$('bubble-panel'); if(!box) return;
+  if(!BUBBLES){
+    box.innerHTML='<p class="text-xs text-dim">Loading the designs&hellip;</p>';
+    loadBubbles().then(renderBubbleTab, ()=>{ box.innerHTML='<p class="text-xs text-danger">Could not load the bubble designs.</p>'; });
+    return;
+  }
+  const cfg=sideCfg(_bubSide==='user'?'user':'ai')||{}, sel=cfg.id?bubById(cfg.id):null;
+  const cats=[BUB_ALL].concat([...new Set(BUBBLES.map(b=>b.cat))]);
+  const q=_bubQuery.toLowerCase();
+  const list=BUBBLES.filter(b=>(_bubCat===BUB_ALL||b.cat===_bubCat)
+    && (!q || b.name.toLowerCase().includes(q) || b.cat.toLowerCase().includes(q)));
+
+  const lead=(_bubCat===BUB_ALL&&!q)
+    ? bubDefaultCard(!cfg.id) + bubCustomCard(cfg.id===CUSTOM_ID)
+      + presets().map(p=>bubPresetCard(p,false)).join('')
+    : '';
+  const cards=lead + (list.map(b=>bubCard(b, !!sel && sel.id===b.id)).join('')
+       || (lead?'':'<p class="text-xs text-dim col-span-full">Nothing matches that.</p>'));
+
+  box.innerHTML = \`
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Applies to</p>
+      <div class="flex gap-1.5 flex-wrap mb-1">
+        \${[['both','Both sides'],['ai','Their messages'],['user','Your messages']].map(x=>\`
+          <button onclick="setBubSide('\${x[0]}')" class="chip \${_bubSide===x[0]?'is-on':''}">\${x[1]}</button>\`).join('')}
+      </div>
+      <p class="text-[11px] text-dim mb-4">\${sideSummary()}</p>
+
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Bubble</p>
+      <p class="text-xs text-dim mb-2">\${BUBBLES.length} designs. Hover one to see it on the conversation behind this window.</p>
+      <input id="bub-search" type="text" value="\${esc(_bubQuery)}" placeholder="Search designs&hellip;" spellcheck="false"
+        oninput="_bubQuery=this.value;renderBubbleGrid()"
+        class="w-full bg-transparent border border-line rounded-lg px-3 py-2 text-sm outline-none focus:border-accent mb-2">
+      <div class="flex gap-1.5 overflow-x-auto pb-1 mb-2" id="bub-cats">
+        \${cats.map(c=>\`<button onclick="_bubCat='\${c.replace(/'/g,"\\\\'")}';renderBubbleTabs()"
+          class="chip \${c===_bubCat?'is-on':''}">\${c===BUB_ALL?c:c.replace(/^\\d+\\.\\s*/,'')}</button>\`).join('')}
+      </div>
+      <div id="bub-grid" onmouseleave="unpeekBubble()">\${cards}</div>
+    </div>
+    \${cfg.id
+       ? \`<p class="text-xs text-dim">Colours, recolouring and the corner mark are in <button onclick="apTab('bubbleset')" class="underline text-main">Bubble setup</button>.</p>\`
+       : '<p class="text-xs text-dim">No bubble chosen &mdash; messages use the palette.</p>'}\`;
+  renderBubbleReport();
+  if(window.lucide) lucide.createIcons();
+}
+/* the grid alone, so typing in the search box does not rebuild the controls
+   underneath it and steal the caret */
+function renderBubbleGrid(){
+  const grid=$('bub-grid'); if(!grid||!BUBBLES) return;
+  const cfg=sideCfg(_bubSide==='user'?'user':'ai')||{}, q=_bubQuery.toLowerCase();
+  const list=BUBBLES.filter(b=>(_bubCat===BUB_ALL||b.cat===_bubCat)
+    && (!q || b.name.toLowerCase().includes(q) || b.cat.toLowerCase().includes(q)));
+  const lead=(_bubCat===BUB_ALL&&!q)
+    ? bubDefaultCard(!cfg.id) + bubCustomCard(cfg.id===CUSTOM_ID)
+      + presets().map(p=>bubPresetCard(p,false)).join('')
+    : '';
+  grid.innerHTML=lead + (list.map(b=>bubCard(b, cfg.id===b.id)).join('')
+       || (lead?'':'<p class="text-xs text-dim col-span-full">Nothing matches that.</p>'));
+}
+
+function bubbleControls(b,cfg){
+  const slots=bubbleSlots(b), vars=cfg.vars||{};
+  const alpha=cfg.alpha==null?1:+cfg.alpha;
+  const hue=cfg.hue==null?'':Math.round(cfg.hue);
+  const swatch=(token,label,def)=>\`
+    <label class="flex items-center gap-2 text-xs">
+      <input type="color" value="\${(splitColour(vars[token]||def)).hex}"
+        oninput="setBubbleColour('\${token}',this.value)"
+        class="w-8 h-8 rounded-lg border border-line bg-transparent p-0.5 flex-shrink-0" aria-label="\${label}">
+      <span class="text-dim truncate">\${label}</span>
+    </label>\`;
+
+  return \`
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Chosen</p>
+      <div class="flex items-center justify-between gap-2 mb-3">
+        <span class="text-sm font-semibold">\${b.name} <span class="text-dim font-normal text-xs">\${b.cat.replace(/^\\d+\\.\\s*/,'')}</span></span>
+        <button onclick="clearBubble()" class="px-3 py-1.5 rounded-lg border border-line text-xs flex-shrink-0">Remove</button>
+      </div>
+      <label class="flex items-center justify-between text-sm mb-3">
+        <span>Readable text <span class="text-dim text-xs">darkens the text when the design is too bright behind it</span></span>
+        <button onclick="toggleInk()" class="w-11 h-6 rounded-full relative flex-shrink-0 \${UI.get().bubbleInk===false?'bg-surface-3':'bg-success'}">
+          <span class="absolute top-0.5 w-5 h-5 rounded-full bg-surface shadow" style="left:\${UI.get().bubbleInk===false?'2px':'22px'}"></span>
+        </button>
+      </label>
+      <label class="flex items-center justify-between text-sm mb-3">
+        <span>Outline behind text <span class="text-dim text-xs">helps on picture fills</span></span>
+        <button onclick="toggleHalo()" class="w-11 h-6 rounded-full relative flex-shrink-0 \${UI.get().bubbleHalo===false?'bg-surface-3':'bg-success'}">
+          <span class="absolute top-0.5 w-5 h-5 rounded-full bg-surface shadow" style="left:\${UI.get().bubbleHalo===false?'2px':'22px'}"></span>
+        </button>
+      </label>
+      \${b.font?\`<label class="flex items-center justify-between text-sm mb-3">
+        <span>Use its font <span class="text-dim text-xs">(\${b.font})</span></span>
+        <button onclick="saveBubble({useFont:\${cfg.useFont===false}});renderBubbleTabs()"
+          class="w-11 h-6 rounded-full relative flex-shrink-0 \${cfg.useFont===false?'bg-surface-3':'bg-success'}">
+          <span class="absolute top-0.5 w-5 h-5 rounded-full bg-surface shadow" style="left:\${cfg.useFont===false?'2px':'22px'}"></span>
+        </button>
+      </label>\`:''}
+    </div>
+
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Recolour</p>
+      <p class="text-xs text-dim mb-2">Every colour in the design turns by the same amount, so it keeps its own light and dark structure instead of flattening.</p>
+      <label class="block text-xs text-dim mb-2">Hue <span id="bub-hue-val" class="font-mono text-main">\${hue===''?'as designed':hue+'\\u00B0'}</span>
+        <input type="range" min="0" max="359" value="\${hue===''?0:hue}"
+          oninput="$('bub-hue-val').textContent=this.value+'\\u00B0'" onchange="tuneBubble({hue:+this.value});renderBubbleTabs()"
+          class="w-full accent-accent"></label>
+      <label class="block text-xs text-dim mb-2">Vividness <span id="bub-viv-val" class="font-mono text-main">\${Math.round((cfg.vivid==null?1:cfg.vivid)*100)}%</span>
+        <input type="range" min="0" max="180" step="5" value="\${Math.round((cfg.vivid==null?1:cfg.vivid)*100)}"
+          oninput="$('bub-viv-val').textContent=this.value+'%'" onchange="tuneBubble({vivid:+this.value/100});renderBubbleTabs()"
+          class="w-full accent-accent" \${hue===''?'disabled':''}></label>
+      <label class="block text-xs text-dim mb-2">Lightness <span id="bub-lift-val" class="font-mono text-main">\${Math.round((cfg.lift||0)*100)}</span>
+        <input type="range" min="-20" max="20" step="1" value="\${Math.round((cfg.lift||0)*100)}"
+          oninput="$('bub-lift-val').textContent=this.value" onchange="tuneBubble({lift:+this.value/100});renderBubbleTabs()"
+          class="w-full accent-accent" \${hue===''?'disabled':''}></label>
+      <div class="flex gap-2">
+        <input id="bub-seed" type="text" value="\${esc(cfg.seed||'')}" placeholder="Seed word&hellip;" spellcheck="false"
+          onkeydown="if(event.key==='Enter')seedBubble(this.value)"
+          class="flex-1 min-w-0 bg-transparent border border-line rounded-lg px-3 py-2 text-sm outline-none focus:border-accent">
+        <button onclick="seedBubble($('bub-seed').value)" class="px-3 py-2 rounded-lg bg-accent text-onaccent text-xs font-semibold flex-shrink-0">Apply</button>
+        <button onclick="seedBubble('')" class="px-3 py-2 rounded-lg border border-line text-xs flex-shrink-0 flex items-center gap-1"><i data-lucide="dices" class="w-3.5 h-3.5"></i>Roll</button>
+        <button onclick="tuneBubble({hue:null,vivid:1,lift:0,seed:'',manual:{}});renderBubbleTabs()" class="px-3 py-2 rounded-lg border border-line text-xs flex-shrink-0">Reset</button>
+      </div>
+    </div>
+
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Opacity <span id="bub-op-val" class="font-mono text-main">\${Math.round(alpha*100)}%</span></p>
+      <p class="text-xs text-dim mb-2">Lets the wallpaper through the bubble. The text keeps its own strength &mdash; only the fill fades, so it stays readable all the way down.</p>
+      <input type="range" min="15" max="100" step="5" value="\${Math.round(alpha*100)}"
+        oninput="$('bub-op-val').textContent=this.value+'%'" onchange="saveBubble({alpha:+this.value/100});applyBubble();renderBubbleTabs()"
+        class="w-full accent-accent">
+    </div>
+
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Its colours</p>
+      <div class="grid grid-cols-2 gap-2">\${slots.slice(0,_bubAllCols?999:8).map(s=>swatch(s.token,s.label,s.def)).join('')}
+        \${b.sp?swatch('--bub-sp',b.sp[0],b.sp[1]):''}</div>
+      \${slots.length>8?\`<button onclick="_bubAllCols=!_bubAllCols;renderBubbleTabs()" class="mt-2 text-xs text-dim underline hover:text-main">\${_bubAllCols?'Show fewer':'Show all '+slots.length+' colours'}</button>\`:''}
+    </div>
+
+    \${b.emoji?\`<div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Emoji wallpaper</p>
+      <input id="bub-emoji" type="text" value="\${(cfg.emoji||[b.emoji]).join('')}" maxlength="60"
+        onchange="saveBubble({emoji:[...this.value].filter(c=>c.trim())});renderBubbleTabs()"
+        class="w-full bg-transparent border border-line rounded-lg px-3 py-2 text-base outline-none focus:border-accent mb-2">
+      <label class="block text-xs text-dim mb-2">Angle <span id="bub-ang-val" class="font-mono text-main">\${cfg.angle||0}\\u00B0</span>
+        <input type="range" min="0" max="350" step="10" value="\${cfg.angle||0}"
+          oninput="$('bub-ang-val').textContent=this.value+'\\u00B0'" onchange="saveBubble({angle:+this.value})"
+          class="w-full accent-accent"></label>
+      <label class="block text-xs text-dim">Fill opacity <span id="bub-alp-val" class="font-mono text-main">\${Math.round((cfg.alpha==null?0.85:cfg.alpha)*100)}%</span>
+        <input type="range" min="30" max="100" step="5" value="\${Math.round((cfg.alpha==null?0.85:cfg.alpha)*100)}"
+          oninput="$('bub-alp-val').textContent=this.value+'%'" onchange="saveBubble({alpha:+this.value/100})"
+          class="w-full accent-accent"></label>
+    </div>\`:''}
+
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Readability</p>
+      <div id="bubble-report" class="space-y-1"></div>
+    </div>\`;
+}
+
+
+/* The designs whose decoration is a glyph get to change it. Only those: the
+   variable exists in nine stylesheets and nowhere else, so offering it
+   everywhere would be a control that silently does nothing. */
+const GLYPH_PICKS = ['\u2728','\u2b50','\ud83d\udc51','\ud83d\udc96','\ud83c\udf38','\ud83c\udf1f','\ud83c\udfb5','\ud83d\udca4','\ud83d\udccc','\ud83d\udc8e','\ud83d\udd25','\ud83c\udf19','\u2726','\u2665','\ud83c\udf40','\ud83e\udd8b'];
+
+function glyphControls(b, cfg){
+  const slots = BUB_GLYPHS[b.id];
+  if(!slots) return '';
+  const g = cfg.glyphs||{};
+  const cur = g.a || slots[0];
+  const two = slots.length > 1;
+  const size = g.size || 24;
+  /* A colour emoji brings its own palette and ignores CSS colour. Only the ones
+     the font draws as a single-colour symbol can be recoloured, so the control
+     appears for those and not for the rest. */
+  const monochrome = slots.every(s => /^[\u2000-\u2BFF]+$/.test(s));
+  return \`
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Its mark</p>
+      <p class="text-xs text-dim mb-2">This design decorates itself with a glyph. Swap it for another, or type any character.</p>
+      <div class="flex flex-wrap gap-1.5 mb-2">
+        \${GLYPH_PICKS.map(x=>\`<button onclick="setGlyph('a','\${x}')" class="chip \${cur===x?'is-on':''}" style="font-size:15px">\${x}</button>\`).join('')}
+        <button onclick="setGlyph('a','')" class="chip \${g.a?'':'is-on'}">As designed</button>
+      </div>
+      <input type="text" maxlength="4" value="\${esc(g.a||'')}" placeholder="or type one&hellip;"
+        onchange="setGlyph('a',this.value.trim())"
+        class="w-full bg-transparent border border-line rounded-lg px-3 py-2 text-sm outline-none focus:border-accent mb-3">
+      \${two?\`<p class="text-xs text-dim mb-1">Second mark</p>
+      <input type="text" maxlength="4" value="\${esc(g.b||'')}" placeholder="\${esc(slots[1])}"
+        onchange="setGlyph('b',this.value.trim())"
+        class="w-full bg-transparent border border-line rounded-lg px-3 py-2 text-sm outline-none focus:border-accent mb-3">\`:''}
+      <label class="block text-xs text-dim mb-2">Size <span id="glyph-size-val" class="font-mono text-main">\${size}px</span>
+        <input type="range" min="10" max="56" step="2" value="\${size}"
+          oninput="$('glyph-size-val').textContent=this.value+'px'"
+          onchange="setGlyphSize(+this.value)" class="w-full accent-accent">
+      </label>
+      \${monochrome?\`<label class="flex items-center gap-2 text-xs text-dim">
+        <input type="color" value="\${esc(g.color||'#ffd700')}" onchange="setGlyphColour(this.value)"
+          class="w-8 h-8 rounded-lg border border-line bg-transparent p-0.5 flex-shrink-0">
+        <span>Mark colour</span></label>\`
+      :'<p class="text-[11px] text-dim">This glyph is a colour emoji &mdash; it carries its own palette, so a colour setting would do nothing to it.</p>'}
+    </div>\`;
+}
+function setGlyph(slot, v){
+  const cur = (sideCfg(_bubSide==='user'?'user':'ai')||{}).glyphs || {};
+  const next = Object.assign({}, cur);
+  if(v) next[slot]=v; else delete next[slot];
+  saveBubble({glyphs:next}); renderBubbleTabs();
+}
+function setGlyphSize(px){
+  const cur = (sideCfg(_bubSide==='user'?'user':'ai')||{}).glyphs || {};
+  saveBubble({glyphs:Object.assign({}, cur, {size:px})}); renderBubbleTabs();
+}
+function setGlyphColour(hex){
+  const cur = (sideCfg(_bubSide==='user'?'user':'ai')||{}).glyphs || {};
+  saveBubble({glyphs:Object.assign({}, cur, {color:hex})}); renderBubbleTabs();
+}
+
+/* What there is to set when no design is chosen: how solid the bubble is.
+   Everything else on this tab belongs to a design. */
+function plainBubbleControls(){
+  const u=UI.get();
+  const a=(u.bubbleAlpha==null) ? 100 : Math.round(u.bubbleAlpha*100);
+  return \`
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Opacity <span id="bub-plain-val" class="font-mono text-main">\${a}%</span></p>
+      <p class="text-xs text-dim mb-2">How solid the bubble is. Lower lets the wallpaper through it; the text keeps its own strength either way, so it stays readable all the way down.</p>
+      <input type="range" min="15" max="100" step="5" value="\${a}"
+        oninput="$('bub-plain-val').textContent=this.value+'%'"
+        onchange="setPlainBubbleAlpha(+this.value/100)" class="w-full accent-accent">
+    </div>\`;
+}
+function setPlainBubbleAlpha(a){
+  const u=UI.get(); u.bubbleAlpha=a; UI.set(u);
+  applyPlainBubbleAlpha(); renderBubbleTabs();
+}
+/* The fill is restated at the chosen alpha. Not opacity on the element: that
+   would fade the words with it, which is the thing this is meant to avoid. */
+function applyPlainBubbleAlpha(){
+  const d=document.documentElement, a=UI.get().bubbleAlpha;
+  if(a==null || a>=0.999){
+    delete d.dataset.plainalpha;
+    d.style.removeProperty('--bub-plain');
+    return;
+  }
+  d.dataset.plainalpha='1';
+  d.style.setProperty('--bub-plain', Math.round(a*100)+'%');
+}
+
+/* The controls, on their own tab. They used to live under a grid of 240
+   cards, which meant scrolling the whole catalogue to change one colour. */
+function renderBubbleSetup(){
+  const box=$('bubbleset-panel'); if(!box) return;
+  if(!BUBBLES){
+    box.innerHTML='<p class="text-xs text-dim">Loading&hellip;</p>';
+    loadBubbles().then(renderBubbleSetup, ()=>{ box.innerHTML='<p class="text-xs text-danger">Could not load the designs.</p>'; });
+    return;
+  }
+  const cfg=sideCfg(_bubSide==='user'?'user':'ai')||{};
+  const sel=cfg.id && cfg.id!==CUSTOM_ID ? bubById(cfg.id) : null;
+  if(!cfg.id){
+    /* No design does not mean nothing to set. The bubble still has a fill, and
+       how much of the wallpaper comes through it is worth having either way. */
+    box.innerHTML = plainBubbleControls()
+      + '<p class="text-xs text-dim mt-4">For colours, patterns and corner marks, pick a design in <button onclick="apTab(\\'bubble\\')" class="underline text-main">Bubble</button>.</p>';
+    return;
+  }
+  box.innerHTML = (cfg.id===CUSTOM_ID ? customControls(cfg) : sel ? bubbleControls(sel,cfg) : '')
+    + (sel ? glyphControls(sel, cfg) : '')
+    + extControls(cfg) + presetSaveRow();
+  renderBubbleReport();
+  if(window.lucide) lucide.createIcons();
+}
+
+/* Measures the message elements that are actually on screen. A design whose
+   fill is a gradient or a pattern has no single background colour to measure,
+   and saying so is more use than a number computed from the wrong thing. */
+function renderBubbleReport(){
+  const box=$('bubble-report'); if(!box) return;
+  const rows=[['Their message','ai'],['Your message','user']].map(r=>{
+    /* scoped to the conversation: the picker's own cards are .msg-content too */
+    const el=document.querySelector('#chat-container .msg-content[data-side="'+r[1]+'"]');
+    if(!el) return {label:r[0], note:'no message on screen yet'};
+    const cs=getComputedStyle(el);
+    if(cs.backgroundImage && cs.backgroundImage!=='none') return {label:r[0], note:'patterned fill, not measurable'};
+    const fg=splitColour(cs.color).hex, bg=splitColour(cs.backgroundColor).hex;
+    const got=CL.cr(fg,bg);
+    return {label:r[0], got:+got.toFixed(2), pass:got>=4.5};
+  });
+  box.innerHTML=rows.map(r=>\`
+    <div class="flex items-center justify-between text-xs">
+      <span class="text-dim">\${r.label}</span>
+      \${r.note?\`<span class="text-dim">\${r.note}</span>\`
+        :\`<span class="flex items-center gap-1.5">
+            <span class="font-mono \${r.pass?'text-main':'text-danger'}">\${r.got.toFixed(2)}:1</span>
+            <span class="text-[9px] uppercase tracking-wide px-1.5 py-0.5 rounded \${r.pass?'bg-success-soft text-success':'bg-danger-soft text-danger'}">\${r.pass?'pass':'low'}</span>
+          </span>\`}
+    </div>\`).join('');
+}
+
+
+/* The picture-or-video panel. The wash is the important control: it is what
+   makes one photo work behind both light and dark text, so it gets a colour
+   and a strength rather than a single "darken" slider. */
+function customControls(cfg){
+  const c=cfg.custom||{};
+  return \`
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Your picture or video</p>
+      <p class="text-xs text-dim mb-2">Paste a direct link. A file ending in .mp4, .webm or .mov plays as video, muted and looping, and only while it is on screen.</p>
+      <div class="flex gap-2 mb-3">
+        <input id="cust-src" type="text" value="\${esc(c.src||'')}" placeholder="https://&hellip;" spellcheck="false"
+          onchange="setCustom({src:this.value});renderBubbleTabs()"
+          class="flex-1 min-w-0 bg-transparent border border-line rounded-lg px-3 py-2 text-sm outline-none focus:border-accent">
+        <button onclick="setCustom({src:''});renderBubbleTabs()" class="px-3 py-2 rounded-lg border border-line text-xs flex-shrink-0">Clear</button>
+      </div>
+      <div class="flex gap-1.5 flex-wrap mb-3">
+        \${[['cover','Fill'],['contain','Fit'],['none','Actual size']].map(f=>\`
+          <button onclick="setCustom({fit:'\${f[0]}'});renderBubbleTabs()" class="chip \${(c.fit||'cover')===f[0]?'is-on':''}">\${f[1]}</button>\`).join('')}
+      </div>
+      <label class="block text-xs text-dim mb-2">Picture opacity <span id="cu-op" class="font-mono text-main">\${Math.round((c.opacity==null?1:c.opacity)*100)}%</span>
+        <input type="range" min="10" max="100" step="5" value="\${Math.round((c.opacity==null?1:c.opacity)*100)}"
+          oninput="$('cu-op').textContent=this.value+'%'" onchange="setCustom({opacity:+this.value/100})" class="w-full accent-accent"></label>
+      <label class="block text-xs text-dim mb-2">Blur <span id="cu-bl" class="font-mono text-main">\${c.blur||0}px</span>
+        <input type="range" min="0" max="12" step="1" value="\${c.blur||0}"
+          oninput="$('cu-bl').textContent=this.value+'px'" onchange="setCustom({blur:+this.value})" class="w-full accent-accent"></label>
+      <label class="block text-xs text-dim mb-3">Colour <span id="cu-sat" class="font-mono text-main">\${Math.round((c.sat==null?1:c.sat)*100)}%</span>
+        <input type="range" min="0" max="200" step="10" value="\${Math.round((c.sat==null?1:c.sat)*100)}"
+          oninput="$('cu-sat').textContent=this.value+'%'" onchange="setCustom({sat:+this.value/100})" class="w-full accent-accent"></label>
+    </div>
+
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Wash over it</p>
+      <p class="text-xs text-dim mb-2">A colour laid over the picture. Darken it for light text, lighten it for dark text.</p>
+      <div class="flex gap-2 items-center mb-2">
+        <input type="color" value="\${(splitColour(c.tint||'#000000')).hex}"
+          oninput="setCustom({tint:this.value})"
+          class="w-10 h-9 rounded-lg border border-line bg-transparent p-0.5 flex-shrink-0" aria-label="Wash colour">
+        \${[['#000000','Darken'],['#ffffff','Lighten'],['#1b2a4a','Cool'],['#3a2318','Warm']].map(t=>\`
+          <button onclick="setCustom({tint:'\${t[0]}'});renderBubbleTabs()" class="chip \${(c.tint||'#000000').toLowerCase()===t[0]?'is-on':''}">\${t[1]}</button>\`).join('')}
+      </div>
+      <label class="block text-xs text-dim">Wash strength <span id="cu-tp" class="font-mono text-main">\${Math.round((c.tintOp==null?0.3:c.tintOp)*100)}%</span>
+        <input type="range" min="0" max="90" step="5" value="\${Math.round((c.tintOp==null?0.3:c.tintOp)*100)}"
+          oninput="$('cu-tp').textContent=this.value+'%'" onchange="setCustom({tintOp:+this.value/100})" class="w-full accent-accent"></label>
+    </div>
+
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Bubble itself</p>
+      <div class="grid grid-cols-2 gap-2 mb-2">
+        <label class="flex items-center gap-2 text-xs">
+          <input type="color" value="\${(splitColour(c.fill||'#ffffff')).hex}" oninput="setCustom({fill:this.value})"
+            class="w-8 h-8 rounded-lg border border-line bg-transparent p-0.5 flex-shrink-0"><span class="text-dim">Fill behind</span></label>
+        <label class="flex items-center gap-2 text-xs">
+          <input type="color" value="\${(splitColour(c.text||'#16181c')).hex}" oninput="setCustom({text:this.value})"
+            class="w-8 h-8 rounded-lg border border-line bg-transparent p-0.5 flex-shrink-0"><span class="text-dim">Text</span></label>
+      </div>
+      <label class="block text-xs text-dim">Corner rounding <span id="cu-r" class="font-mono text-main">\${c.radius==null?16:c.radius}px</span>
+        <input type="range" min="0" max="28" step="2" value="\${c.radius==null?16:c.radius}"
+          oninput="$('cu-r').textContent=this.value+'px'" onchange="setCustom({radius:+this.value})" class="w-full accent-accent"></label>
+    </div>
+    <div id="bubble-report" class="hf"></div>\`;
+}
+
+/* A glyph in a corner, on any design. Kept outside the bubble's edge so it can
+   never land on a message. */
+function extControls(cfg){
+  const e=cfg.ext||{};
+  const picks=['','\\u{1F43E}','\\u2B50','\\u2764\\uFE0F','\\u{1F338}','\\u{1F451}','\\u{1F525}','\\u{1F319}','\\u2728','\\u{1F3B5}','\\u{1F340}','\\u{1F41F}'];
+  return \`
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Corner mark</p>
+      <div class="flex gap-1.5 flex-wrap mb-2">
+        \${picks.map(g=>\`<button onclick="setExt({glyph:'\${g}'});renderBubbleTabs()" class="chip \${(e.glyph||'')===g?'is-on':''}" style="font-size:14px">\${g||'None'}</button>\`).join('')}
+      </div>
+      <div class="flex gap-2 items-center">
+        <input type="text" value="\${esc(e.glyph||'')}" maxlength="4" placeholder="or paste one"
+          onchange="setExt({glyph:this.value});renderBubbleTabs()"
+          class="w-28 bg-transparent border border-line rounded-lg px-3 py-2 text-base outline-none focus:border-accent">
+        \${[['tl','Top left'],['tr','Top right'],['bl','Bottom left'],['br','Bottom right']].map(c=>\`
+          <button onclick="setExt({corner:'\${c[0]}'});renderBubbleTabs()" class="chip \${(e.corner||'tr')===c[0]?'is-on':''}">\${c[1]}</button>\`).join('')}
+      </div>
+      <label class="block text-xs text-dim mt-2">Size <span id="ex-sz" class="font-mono text-main">\${e.size||20}px</span>
+        <input type="range" min="12" max="40" step="2" value="\${e.size||20}"
+          oninput="$('ex-sz').textContent=this.value+'px'" onchange="setExt({size:+this.value})" class="w-full accent-accent"></label>
+    </div>\`;
+}
+
+function presetSaveRow(){
+  return \`
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Save it</p>
+      <p class="text-xs text-dim mb-2">Keeps this design and every change you made to it, under a name of your own. It appears at the top of the list.</p>
+      <div class="flex gap-2">
+        <input id="preset-name" type="text" placeholder="Name it&hellip;" maxlength="40"
+          onkeydown="if(event.key==='Enter')savePreset(this.value)"
+          class="flex-1 min-w-0 bg-transparent border border-line rounded-lg px-3 py-2 text-sm outline-none focus:border-accent">
+        <button onclick="savePreset($('preset-name').value)" class="px-3 py-2 rounded-lg bg-accent text-onaccent text-xs font-semibold flex-shrink-0">Save preset</button>
+      </div>
+    </div>\`;
+}
+
+/* ── COLOUR TAB ────────────────────────────────────────────────────────
+   Palette picks the material, Accent picks the colour, Gradient replaces the
+   accent fill, Seed generates a whole scheme from a word, Tint decides how
+   far the accent bleeds into the neutrals. The contrast readout at the bottom
+   is live: it is the engine's own verification, not a separate estimate. */
+function accentSwatches(){
+  const out=[];
+  for(let i=0;i<12;i++){ const h=i*30, L=0.62;
+    out.push(CL.oklchHex(L, 0.75*CL.maxChroma(L,h), h)); }
+  out.push(CL.oklchHex(0.55,0.004,270));      // a deliberate neutral
+  return out;
+}
+function renderColourTab(){
+  const el=document.documentElement, u=UI.get(), c=u.colour||{};
+  const curSkin=el.dataset.skin||'graphite', dark=el.classList.contains('dark');
+  const gid=c.grad?c.grad.id:null;
+  const tint=Math.round((c.tint||0)*100);
+  const lift=Math.round((c.lift||0)*100);
+
+  const skinCards=SKINS.map(s=>\`
+    <button onclick="setSkin('\${s[0]}')" class="skin-card \${s[0]===curSkin?'is-on':''}">
+      <span class="skin-strip" data-skin-preview="\${s[0]}"></span>
+      <span class="block text-xs font-semibold">\${s[1]}</span>
+      <span class="block text-[10px] text-dim leading-tight">\${s[2]}</span>
+    </button>\`).join('');
+
+  const accents=accentSwatches().map(hex=>\`
+    <button onclick="setColour({accent:'\${hex}',grad:null})" title="\${hex}"
+      class="sw \${(!gid && (c.accent||'').toUpperCase()===hex)?'is-on':''}"
+      style="background:\${hex}"></button>\`).join('');
+
+  const grads=GRADS.map(g=>\`
+    <button onclick="pickGradient('\${g.id}')" title="\${g.name}"
+      class="sw \${gid===g.id?'is-on':''}"
+      style="background:linear-gradient(\${g.angle}deg,\${g.stops.join(',')})"></button>\`).join('');
+
+  $('colour-panel').innerHTML = \`
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Palette</p>
+      <p class="text-xs text-dim mb-2">The material the interface is made of. Colour sits on top of it.</p>
+      <div class="grid grid-cols-2 sm:grid-cols-3 gap-2">\${skinCards}</div>
+    </div>
+
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Mode</p>
+      <div class="flex gap-1.5">
+        <button onclick="setMode(false)" class="px-3 py-1.5 rounded-lg border text-xs \${!dark?'border-accent bg-accent-soft font-semibold':'border-line text-dim'}">Light</button>
+        <button onclick="setMode(true)"  class="px-3 py-1.5 rounded-lg border text-xs \${dark?'border-accent bg-accent-soft font-semibold':'border-line text-dim'}">Dark</button>
+      </div>
+    </div>
+
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Accent</p>
+      <div class="grid gap-1.5 mb-2" style="grid-template-columns:repeat(auto-fill,minmax(34px,1fr))">\${accents}</div>
+      <div class="flex gap-2 items-center">
+        <input id="accent-native" type="color" value="\${c.accent||'#4A57D6'}"
+          oninput="previewColour({accent:this.value,grad:null})" onchange="setColour({accent:this.value,grad:null})"
+          class="w-10 h-9 rounded-lg border border-line bg-transparent p-0.5 flex-shrink-0" aria-label="Pick any accent colour">
+        <input id="accent-hex" type="text" value="\${c.accent||''}" placeholder="#4A57D6" spellcheck="false"
+          onchange="typeAccent(this.value)" class="flex-1 min-w-0 bg-transparent border border-line rounded-lg px-3 py-2 text-sm font-mono outline-none focus:border-accent">
+      </div>
+    </div>
+
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Gradient</p>
+      <p class="text-xs text-dim mb-2">Fills buttons and chips. Every stop is retuned so one label colour stays readable across the whole sweep.</p>
+      <div class="grid gap-1.5" style="grid-template-columns:repeat(auto-fill,minmax(34px,1fr))">
+        <button onclick="setColour({grad:null})" title="No gradient"
+          class="sw \${!gid?'is-on':''} flex items-center justify-center text-dim" style="background:var(--surface-2)">
+          <i data-lucide="slash" class="w-3.5 h-3.5"></i></button>
+        \${grads}
+      </div>
+      \${gid?\`<label class="block text-xs text-dim mt-3">Angle <span id="grad-angle-val" class="font-mono text-main">\${c.grad.angle}&deg;</span>
+        <input type="range" min="0" max="350" step="10" value="\${c.grad.angle}"
+          oninput="previewAngle(+this.value)" onchange="setColour({grad:Object.assign({},UI.get().colour.grad,{angle:+this.value})})"
+          class="w-full accent-accent"></label>\`:''}
+    </div>
+
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Seed</p>
+      <p class="text-xs text-dim mb-2">A word or a number becomes a whole scheme. The same seed always gives the same colours.</p>
+      <div class="flex gap-2">
+        <input id="seed-input" type="text" value="\${esc(c.seed||'')}" placeholder="anything at all" spellcheck="false"
+          onkeydown="if(event.key==='Enter')rollSeed(this.value)"
+          class="flex-1 min-w-0 bg-transparent border border-line rounded-lg px-3 py-2 text-sm outline-none focus:border-accent">
+        <button onclick="rollSeed($('seed-input').value)" class="px-3 py-2 rounded-lg bg-accent text-onaccent text-xs font-semibold flex-shrink-0">Apply</button>
+        <button onclick="rollSeed('')" title="Random seed" class="px-3 py-2 rounded-lg border border-line text-xs flex-shrink-0 flex items-center gap-1"><i data-lucide="dices" class="w-3.5 h-3.5"></i>Roll</button>
+      </div>
+      \${c.seedLabel?\`<p class="text-[11px] text-dim mt-2">Generated: <span class="text-main font-medium">\${c.seedLabel}</span></p>\`:''}
+    </div>
+
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Lightness <span id="lift-val" class="font-mono text-main">\${lift>0?'+':''}\${lift}</span></p>
+      <p class="text-xs text-dim mb-2">How light or dark the interface is, apart from what colour it is. Every surface moves together and the text is re-fitted against wherever they land. The slider stops where body text would drop below 7:1 &mdash; on an almost-white or almost-black palette that can be straight away, and the handle springs back to show it.</p>
+      <input type="range" min="-30" max="30" step="2" value="\${lift}"
+        oninput="$('lift-val').textContent=(this.value>0?'+':'')+this.value" onchange="setColour({lift:+this.value/100})" class="w-full accent-accent">
+      <div class="flex justify-between text-[10px] text-dim mt-1"><span>Darker</span><span>Skin default</span><span>Lighter</span></div>
+    </div>
+
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Tint <span id="tint-val" class="font-mono text-main">\${tint}%</span></p>
+      <p class="text-xs text-dim mb-2">How far the accent hue bleeds into the greys. Text is re-fitted after, so this can never make the app harder to read.</p>
+      <input type="range" min="0" max="100" step="5" value="\${tint}"
+        oninput="previewTint(+this.value)" onchange="setColour({tint:+this.value/100})" class="w-full accent-accent">
+    </div>
+
+    <div>
+      <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Contrast</p>
+      <div id="colour-report" class="space-y-1"></div>
+      <button onclick="resetColour()" class="mt-3 px-3 py-2 rounded-lg border border-line text-xs">Reset colours</button>
+    </div>\`;
+
+  SKINS.forEach(s=>paintSkinStrip(s[0]));
+  renderColourReport();
+  if(window.lucide) lucide.createIcons();
+}
+
+/* Each palette card shows what it would actually look like. The values come
+   out of the stylesheet for that skin, so a skin can be retuned without the
+   preview drifting away from it.
+
+   They cannot be measured from a probe element: the skin blocks are written
+   as :root[data-skin="x"], which only <html> can match, so a probe just
+   inherits the skin that is already active. */
+let _skinTokens=null;
+const PREVIEW_TOKENS=['--bg','--surface-2','--accent','--accent-2'];
+function skinTokens(){
+  if(_skinTokens) return _skinTokens;
+  const map={};
+  for(const sheet of document.styleSheets){
+    let rules; try{ rules=sheet.cssRules; }catch(e){ continue; }   // cross-origin
+    for(const r of rules){
+      /* A CSSStyleRule reports an empty cssRules list in browsers that support
+         nesting, so recursing on it would skip every declaration. Match on the
+         selector instead, and only top-level rules: a descendant selector like
+         "[data-skin=x] .msg" is decoration, not the token contract. */
+      if(!r.selectorText || !r.style) continue;
+      const sel=r.selectorText.trim();
+      if(sel.indexOf(' ')>=0 || sel.indexOf(',')>=0) continue;
+      const m=/\\[data-skin="?([a-z0-9-]+)"?\\]/i.exec(sel);
+      if(!m || sel.indexOf(':root')<0) continue;
+      const key=m[1]+'|'+(sel.indexOf('.dark')>=0?'dark':'light');
+      const o=map[key]=map[key]||{};
+      for(const n of PREVIEW_TOKENS.concat(['--text'])){
+        const v=r.style.getPropertyValue(n).trim();
+        if(v) o[n]=v;
+      }
+    }
+  }
+  /* a dark block only carries what it changes, so it inherits the rest */
+  for(const k of Object.keys(map)){
+    if(!k.endsWith('|dark')) continue;
+    const light=map[k.replace('|dark','|light')];
+    if(light) for(const n in light) if(!(n in map[k])) map[k][n]=light[n];
+  }
+  return (_skinTokens=map);
+}
+function paintSkinStrip(id){
+  const box=document.querySelector('[data-skin-preview="'+id+'"]');
+  if(!box) return;
+  const t=skinTokens()[id+'|'+(document.documentElement.classList.contains('dark')?'dark':'light')]||{};
+  const under=CL.rgba(t['--bg']||'#FFFFFF');
+  box.innerHTML=PREVIEW_TOKENS.map(n=>
+    '<span style="background:'+CL.flat(t[n]||'#888888',under)+'"></span>').join('');
+}
+
+function renderColourReport(){
+  const box=$('colour-report'); if(!box) return;
+  if(!_colourReport){
+    box.innerHTML='<p class="text-xs text-dim">Using the palette&rsquo;s own colours, which are already checked.</p>';
+    return;
+  }
+  box.innerHTML=_colourReport.report.map(r=>\`
+    <div class="flex items-center justify-between text-xs">
+      <span class="text-dim">\${r.label}</span>
+      <span class="flex items-center gap-1.5">
+        <span class="font-mono \${r.pass?'text-main':'text-danger'}">\${r.got.toFixed(2)}:1</span>
+        <span class="text-[9px] uppercase tracking-wide px-1.5 py-0.5 rounded \${r.pass?'bg-success-soft text-success':'bg-danger-soft text-danger'}">\${r.pass?'pass':'low'}</span>
+      </span>
+    </div>\`).join('')
+    + (_colourReport.notes.length?\`<p class="text-[11px] text-dim pt-1 leading-snug">\${_colourReport.notes.join('. ')}.</p>\`:'');
+}
+
+/* A live preview writes the same state a commit would, but leaves the panel
+   alone: re-rendering mid-drag would tear the slider out from under the
+   pointer and drop the focus ring. */
+function previewColour(patch){
+  const u=UI.get(); u.colour=Object.assign({},u.colour||{},patch); UI.set(u);
+  const r=UI.raw(); r.colourCache={}; UI.save(r);
+  applyColour(); renderColourReport();
+}
+function previewTint(v){ const e=$('tint-val'); if(e) e.textContent=v+'%'; previewColour({tint:v/100}); }
+function previewAngle(v){
+  const e=$('grad-angle-val'); if(e) e.textContent=v+'\\u00B0';
+  const g=UI.get().colour.grad; previewColour({grad:Object.assign({},g,{angle:v})});
+}
+function typeAccent(s){
+  s=String(s).trim(); if(s && s[0]!=='#') s='#'+s;
+  if(!/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(s)){ toast('That is not a colour'); renderColourTab(); return; }
+  setColour({accent:s.toUpperCase(),grad:null});
+}
+function pickGradient(id){
+  const g=GRADS.find(x=>x.id===id); if(!g) return;
+  /* the gradient replaces the accent hue, so a secondary hue paired with an
+     earlier accent no longer belongs to anything */
+  setColour({grad:{id:g.id,stops:g.stops.slice(),angle:g.angle,ink:g.ink}, accent2Hue:null});
+}
+function rollSeed(seed){
+  if(!seed){ seed=Math.random().toString(36).slice(2,8); }
+  const p=CL.paletteFromSeed(seed);
+  setColour({accent:p.accent,accent2Hue:p.accent2Hue,tint:p.tint,seed:seed,seedLabel:p.label,grad:null});
+  toast('Seed: '+p.label);
+}
+function setMode(dark){
+  if(document.documentElement.classList.contains('dark')===dark) return;
+  toggleTheme();
+  renderColourTab();
+}
+
+/* boot: restore theme + its options before anything renders */
+applyThemePreset(localStorage.getItem('rp_layout') || 'studio');
+applyColour();
+applyBubble();
+watchHeaderHeight();
+/* the account's copy is pulled from applyBootstrap, once there is a session to
+   ask with - up here there is not one yet */
+
+
+/* ── TWO-FACTOR ─────────────────────────────────────────────────────────
+   The secret is drawn as a QR in the browser. The library is fetched only
+   when this panel is opened, and it renders locally - sending a shared secret
+   to somebody else's QR service would give away the very thing it protects. */
+let _qrLib=null;
+function loadQR(){
+  if(_qrLib) return _qrLib;
+  _qrLib=new Promise((ok,no)=>{
+    const s=document.createElement('script');
+    s.src='https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js';
+    s.onload=ok; s.onerror=no; document.head.appendChild(s);
+  });
+  return _qrLib;
+}
+async function drawQR(el, text){
+  try{
+    await loadQR();
+    const q=qrcode(0,'M'); q.addData(text); q.make();
+    el.innerHTML=q.createSvgTag({cellSize:4, margin:2, scalable:true});
+    const svg=el.querySelector('svg');
+    if(svg){ svg.style.width='148px'; svg.style.height='148px'; svg.style.background='#fff'; svg.style.padding='6px'; svg.style.borderRadius='8px'; svg.style.display='block'; }
+  }catch(e){
+    el.innerHTML='<p class="text-xs text-dim">Could not draw the code. Type the secret into your app instead.</p>';
+  }
+}
+
+let _mfaPending=null;
+async function renderMfa(){
+  const box=$('mfa-panel'); if(!box) return;
+  box.innerHTML='<p class="text-xs text-dim">Checking&hellip;</p>';
+  /* POST, not GET: api() only sends a body on POST, so an op sent the other
+     way arrives as undefined. */
+  const st=await api('mfa',{op:'status'});
+  if(!st || st.error){ box.innerHTML='<p class="text-xs text-danger">Could not read the current state.</p>'; return; }
+  if(st.enabled){
+    box.innerHTML=\`
+      <div class="flex items-start justify-between gap-3 flex-wrap">
+        <div>
+          <p class="text-sm font-medium text-success">On</p>
+          <p class="text-xs text-dim mt-0.5">\${st.recovery_left} recovery code\${st.recovery_left===1?'':'s'} left.</p>
+        </div>
+        <div class="flex gap-2">
+          <button onclick="mfaRegen()" class="px-3 py-1.5 rounded-lg border border-line text-xs">New recovery codes</button>
+          <button onclick="mfaDisable()" class="px-3 py-1.5 rounded-lg border border-line text-xs text-danger">Turn off</button>
+        </div>
+      </div>
+      <div id="mfa-codes" class="hf mt-3"></div>\`;
+    return;
+  }
+  box.innerHTML=\`
+    <p class="text-xs text-dim mb-2">Ask for a code from an authenticator app every time you sign in. Works with Google Authenticator, Aegis, 1Password and any other app that takes a QR code.</p>
+    <button onclick="mfaBegin()" class="px-3 py-2 rounded-lg bg-accent text-onaccent text-xs font-semibold">Set it up</button>\`;
+}
+
+async function mfaBegin(){
+  const box=$('mfa-panel');
+  const d=await api('mfa',{op:'begin'});
+  if(!d || d.error){ toast(d&&d.error||'Could not start'); return; }
+  _mfaPending=d;
+  box.innerHTML=\`
+    <div class="rounded-xl border border-line bg-surface-2 p-3 sm:p-4 space-y-4">
+      <div class="flex flex-col sm:flex-row gap-4 items-start">
+        <div id="mfa-qr" class="flex-shrink-0 mx-auto sm:mx-0"><p class="text-xs text-dim">Drawing&hellip;</p></div>
+        <div class="flex-1 min-w-0 w-full">
+          <p class="text-xs text-dim mb-1">1 &middot; Scan this in your authenticator app, or type the key in by hand:</p>
+          <p class="font-mono text-[11px] leading-relaxed bg-surface border border-line rounded-lg px-2 py-1.5"
+             style="word-break:break-all;overflow-wrap:anywhere">\${esc(d.secret)}</p>
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs text-dim mb-1.5" for="mfa-code">2 &middot; Then enter the six digits it shows</label>
+        <div class="flex flex-wrap gap-2">
+          <input id="mfa-code" type="text" inputmode="numeric" maxlength="6" placeholder="123456"
+            onkeydown="if(event.key==='Enter')mfaEnable()"
+            style="flex:0 0 8.5rem;width:8.5rem"
+            class="flex-shrink-0 bg-surface border border-line rounded-lg px-3 py-2 text-base font-mono tracking-[0.2em] outline-none focus:border-accent">
+          <button onclick="mfaEnable()" class="px-4 py-2 rounded-lg bg-accent text-onaccent text-xs font-semibold whitespace-nowrap">Turn on</button>
+          <button onclick="renderMfa()" class="px-4 py-2 rounded-lg border border-line text-xs whitespace-nowrap">Cancel</button>
+        </div>
+      </div>
+    </div>\`;
+  drawQR($('mfa-qr'), d.uri);
+}
+
+async function mfaEnable(){
+  const d=await api('mfa',{op:'enable', code:$('mfa-code').value});
+  if(!d || d.error){ toast(d&&d.error||'That did not work'); return; }
+  await renderMfa();
+  showRecovery(d.recovery, 'Two-factor is on.');
+}
+async function mfaRegen(){
+  const code=prompt('Enter a current code from your app to replace your recovery codes');
+  if(code==null) return;
+  const d=await api('mfa',{op:'regen', code});
+  if(!d || d.error){ toast(d&&d.error||'That did not work'); return; }
+  await renderMfa();
+  showRecovery(d.recovery, 'Your old recovery codes no longer work.');
+}
+async function mfaDisable(){
+  const password=prompt('Confirm your password to turn two-factor off');
+  if(password==null) return;
+  const code=prompt('And a current code from your app');
+  if(code==null) return;
+  const d=await api('mfa',{op:'disable', password, code});
+  if(!d || d.error){ toast(d&&d.error||'That did not work'); return; }
+  await renderMfa();
+  toast('Two-factor is off');
+}
+/* Shown once. There is no way to see them again, because only their hashes
+   are kept. */
+function showRecovery(codes, note){
+  const box=$('mfa-codes') || $('mfa-panel');
+  const html=\`
+    <div class="mt-3 p-3 rounded-lg border border-warn bg-warn-soft">
+      <p class="text-xs font-semibold mb-1">\${esc(note)} Save these recovery codes now.</p>
+      <p class="text-[11px] text-dim mb-2">Each one works once, if you lose your phone. They are not shown again.</p>
+      <div class="grid grid-cols-2 sm:grid-cols-5 gap-1.5 font-mono text-xs">
+        \${codes.map(c=>\`<span class="px-2 py-1 rounded bg-surface border border-line text-center">\${esc(c)}</span>\`).join('')}
+      </div>
+      <button onclick="navigator.clipboard.writeText('\${escJs(codes.join('\\n'))}');toast('Copied')" class="mt-2 px-3 py-1.5 rounded-lg border border-line text-xs">Copy all</button>
+    </div>\`;
+  box.classList.remove('hf');
+  box.innerHTML=html;
+}
+
+/* ── MODEL PICKER ───────────────────────────────────────────────────────
+   Asks the provider what this key can run rather than making you remember
+   an id. The request is proxied by the Worker, so the key never goes to a
+   third party from the browser and CORS never applies. */
+let _models = [];
+
+function providerNeedsUrl(p){ return p === 'custom' || p === 'cloudflare'; }
+
+function syncKeyForm(){
+  const p = $('key-provider').value;
+  const box = $('custom-url-container');
+  box.classList.toggle('hf', !providerNeedsUrl(p));
+  if (p === 'cloudflare'){
+    $('custom-url-label').textContent = 'Cloudflare Account ID';
+    $('key-custom-url').placeholder = 'e.g. f77b2782757a239b0c39d37e3adb4bd7';
+    $('custom-url-hint').textContent = 'Found in your Cloudflare dashboard URL.';
+  } else if (p === 'custom'){
+    $('custom-url-label').textContent = 'API endpoint';
+    $('key-custom-url').placeholder = 'https://your-host/v1/chat/completions';
+    $('custom-url-hint').textContent = 'Must be HTTPS and OpenAI-compatible.';
+  }
+  const hint = {
+    imgxh:'Free, OpenAI-compatible. Some models return their reasoning as well as an answer.',
+    groq:'Get a key at console.groq.com',
+    mistral:'Get a key at console.mistral.ai',
+    openrouter:'Get a key at openrouter.ai/keys',
+    gemini:'Get a key at aistudio.google.com/apikey',
+    cloudflare:'Use an API token with Workers AI access.',
+    custom:'Whatever your endpoint expects; leave blank for a local server.',
+  }[p] || '';
+  $('key-value-hint').textContent = hint;
+  $('model-picker').classList.add('hf');
+  _models = [];
+}
+
+async function openModelPicker(){
+  const box = $('model-picker');
+  if (!box.classList.contains('hf')){ box.classList.add('hf'); return; }
+  const btn = $('key-model-btn'); const label = btn.textContent;
+  btn.disabled = true; btn.textContent = '...';
+  try{
+    const r = await api('listModels', {
+      provider: $('key-provider').value,
+      api_key:  $('key-value').value.trim(),
+      custom_url: $('key-custom-url').value.trim(),
+      id: $('key-edit-id').value || null,
+    });
+    if (!r || r.error) throw new Error((r && r.error) || 'Could not read the model list');
+    _models = r.models || [];
+    if (!_models.length){ toast(r.note || 'That provider returned no models', 5000); return; }
+    box.classList.remove('hf');
+    $('model-search').value = '';
+    filterModels();
+    $('model-search').focus();
+  }catch(e){ toast(e.message, 6000); }
+  finally{ btn.disabled = false; btn.textContent = label; }
+}
+
+function filterModels(){
+  const q = $('model-search').value.trim().toLowerCase();
+  const hit = q ? _models.filter(m => m.toLowerCase().includes(q)) : _models;
+  $('model-list').innerHTML = hit.length
+    ? hit.slice(0, 300).map(m => \`<button type="button" onclick="chooseModel('\${m.replace(/'/g,"\\\\'")}')" class="w-full text-left px-3 py-2 text-sm hover:bg-surface-2 border-b border-line last:border-0 font-mono">\${esc(m)}</button>\`).join('')
+    : \`<p class="px-3 py-3 text-xs text-dim">Nothing matches "\${esc(q)}"</p>\`;
+}
+function chooseModel(id){
+  $('key-model').value = id;
+  $('model-picker').classList.add('hf');
+  toast('Model: ' + id);
+}
+
 async function changeVariation(msgId,dir){
     const isGreeting = (!S.hasMore && S.msgs[0] && S.msgs[0].id == msgId);
     if(isGreeting) return;
@@ -3195,12 +12364,12 @@ function updatePill(el,ai,total,msgId,ids){
     const isLast=ai===total-1;
     let pill=el.querySelector('.variant-pill');
     if(total<=1){pill?.remove();return;}
-    const html=\`<div class="variant-pill flex items-center space-x-1.5 mt-2.5 text-xs text-gray-500 bg-gray-50 dark:bg-[#1a1a1a] w-max px-2 py-1.5 rounded-md border border-gray-200 dark:border-gray-800">
-        <button onclick="changeVariation('\${msgId}',-1)"\${ai===0?' disabled':''}class="hover:text-black dark:hover:text-white disabled:opacity-30 p-0.5"><i data-lucide="chevron-left"class="w-3.5 h-3.5"></i></button>
+    const html=\`<div class="variant-pill flex items-center space-x-1.5 mt-2.5 text-xs text-dim bg-surface-2 w-max px-2 py-1.5 rounded-md border border-line">
+        <button onclick="changeVariation('\${msgId}',-1)"\${ai===0?' disabled':''}class="hover:text-main disabled:opacity-30 p-0.5"><i data-lucide="chevron-left"class="w-3.5 h-3.5"></i></button>
         <span class="min-w-[2.5rem] text-center">\${ai+1}/\${total}</span>
-        <button onclick="changeVariation('\${msgId}',1)"\${isLast?' disabled':''}class="hover:text-black dark:hover:text-white disabled:opacity-30 p-0.5"><i data-lucide="chevron-right"class="w-3.5 h-3.5"></i></button>
-        <div class="w-px h-3 bg-gray-300 dark:bg-gray-700 mx-1"></div>
-        <span class="text-[10px] px-1.5 py-0.5 rounded \${isLast?'text-green-600 dark:text-green-400 bg-green-100 dark:bg-green-900/30':'text-amber-600 dark:text-amber-400 bg-amber-100 dark:bg-amber-900/30'}">\${isLast?'Latest':'Older'}</span>
+        <button onclick="changeVariation('\${msgId}',1)"\${isLast?' disabled':''}class="hover:text-main disabled:opacity-30 p-0.5"><i data-lucide="chevron-right"class="w-3.5 h-3.5"></i></button>
+        <div class="w-px h-3 bg-gray-300 mx-1"></div>
+        <span class="text-[10px] px-1.5 py-0.5 rounded \${isLast?'text-green-600 bg-green-100 dark:bg-green-900/30':'text-amber-600 bg-amber-100 dark:bg-amber-900/30'}">\${isLast?'Latest':'Older'}</span>
     </div>\`;
     if(pill)pill.outerHTML=html;else el.insertAdjacentHTML('beforeend',html);
     lucide.createIcons();
@@ -3213,7 +12382,7 @@ async function regenVariant(msgId,groupId){
     S.generating=true;$('send-btn').disabled=true;
     const el=document.getElementById(\`bb-\${msgId}\`);
     const ci=el?.querySelector('.msg-content');
-    if(ci)ci.innerHTML='<span class="text-gray-400 text-xs flex items-center space-x-2"><svg class="animate-spin w-3 h-3"viewBox="0 0 24 24"fill="none"stroke="currentColor"stroke-width="2"><path d="M21 12a9 9 0 11-9-9"/></svg><span>Thinking about a better responses for you...</span></span>';
+    if(ci)ci.innerHTML='<span class="text-dim text-xs flex items-center space-x-2"><svg class="animate-spin w-3 h-3"viewBox="0 0 24 24"fill="none"stroke="currentColor"stroke-width="2"><path d="M21 12a9 9 0 11-9-9"/></svg><span>Thinking about a better responses for you...</span></span>';
     
     let fullText = "", fullReasoning = "";
     try {
@@ -3406,17 +12575,17 @@ function toggleDropdown(e,id,isBot){
     const isLatest = (latestBotMsg && latestBotMsg.id == id);
 
 drop.innerHTML=\`
-        <button onclick="copyMsg('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left"><i data-lucide="copy"class="w-4 h-4 mr-2"></i>Copy</button>
-        <button onclick="startEdit('\${id}',\${isBot})" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left"><i data-lucide="edit-2"class="w-4 h-4 mr-2"></i>Edit</button>
+        <button onclick="copyMsg('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-surface-2 w-full text-left"><i data-lucide="copy"class="w-4 h-4 mr-2"></i>Copy</button>
+        <button onclick="startEdit('\${id}',\${isBot})" class="flex items-center px-4 py-2 text-sm hover:bg-surface-2 w-full text-left"><i data-lucide="edit-2"class="w-4 h-4 mr-2"></i>Edit</button>
         
-        <button onclick="branchChat('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left text-purple-600 dark:text-purple-400"><i data-lucide="git-branch"class="w-4 h-4 mr-2"></i>New Chat From Here</button>
+        <button onclick="branchChat('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-surface-2 w-full text-left text-accent-2"><i data-lucide="git-branch"class="w-4 h-4 mr-2"></i>New Chat From Here</button>
         
-        \${isBot?\`<button onclick="pinMsg('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left"><i data-lucide="pin"class="w-4 h-4 mr-2"></i>Pin to Sketchboard</button>\`:''}
-        \${isBot&&vars.length>1&&!isGreeting?\`<button onclick="setMainDrop('\${id}','\${ids[ai]}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left text-blue-600 dark:text-blue-400"><i data-lucide="check-circle"class="w-4 h-4 mr-2"></i>Keep this version only</button>\`:''}
-        \${isBot&&!isGreeting&&isLatest?\`<button onclick="regenDrop('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left"><i data-lucide="refresh-cw"class="w-4 h-4 mr-2"></i>Regenerate</button>\`:''}
-        <div class="h-px bg-gray-200 dark:bg-gray-800 my-1"></div>
-        <button onclick="rewindHere('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left text-red-500"><i data-lucide="rotate-ccw"class="w-4 h-4 mr-2"></i>Rewind Here</button>
-        <button onclick="deleteMsg('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left text-red-500"><i data-lucide="trash-2"class="w-4 h-4 mr-2"></i>Delete</button>\`;
+        \${isBot?\`<button onclick="pinMsg('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-surface-2 w-full text-left"><i data-lucide="pin"class="w-4 h-4 mr-2"></i>Pin to Sketchboard</button>\`:''}
+        \${isBot&&vars.length>1&&!isGreeting?\`<button onclick="setMainDrop('\${id}','\${ids[ai]}')" class="flex items-center px-4 py-2 text-sm hover:bg-surface-2 w-full text-left text-info"><i data-lucide="check-circle"class="w-4 h-4 mr-2"></i>Keep this version only</button>\`:''}
+        \${isBot&&!isGreeting&&isLatest?\`<button onclick="regenDrop('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-surface-2 w-full text-left"><i data-lucide="refresh-cw"class="w-4 h-4 mr-2"></i>Regenerate</button>\`:''}
+        <div class="h-px bg-surface-3 my-1"></div>
+        <button onclick="rewindHere('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-surface-2 w-full text-left text-danger"><i data-lucide="rotate-ccw"class="w-4 h-4 mr-2"></i>Rewind Here</button>
+        <button onclick="deleteMsg('\${id}')" class="flex items-center px-4 py-2 text-sm hover:bg-surface-2 w-full text-left text-danger"><i data-lucide="trash-2"class="w-4 h-4 mr-2"></i>Delete</button>\`;
     lucide.createIcons();
     // A bot menu hangs off the left of its button, a user menu off the right.
     placeDropdown(drop, rect, isBot ? 'left' : 'right');
@@ -3428,11 +12597,11 @@ function togglePersonaDropdown(e) {
     const rect = e.currentTarget.getBoundingClientRect();
     
     drop.innerHTML = \`
-        <div class="px-3 py-2 text-[10px] font-bold text-gray-400 uppercase tracking-wider border-b border-gray-200 dark:border-gray-800">Switch Persona for Session</div>
+        <div class="px-3 py-2 text-[10px] font-bold text-dim uppercase tracking-wider border-b border-line">Switch Persona for Session</div>
         <div class="max-h-64 overflow-y-auto">
         \${S.personas.map(p => \`
-            <button onclick="changeSessionPersona('\${p.id}')" class="flex items-center px-4 py-2 text-sm hover:bg-gray-50 dark:hover:bg-gray-800 w-full text-left \${p.id == S.currentPersonaId ? 'text-blue-600 dark:text-blue-400 font-medium bg-gray-50 dark:bg-gray-800' : ''}">
-                <span class="w-5 h-5 rounded overflow-hidden mr-2 bg-gray-200 dark:bg-gray-700 flex items-center justify-center text-[10px] flex-shrink-0">\${p.avatar.startsWith('http') ? \`<img src="\${esc(p.avatar)}" class="w-full h-full object-cover">\` : esc(p.avatar.substring(0,2))}</span>
+            <button onclick="changeSessionPersona('\${p.id}')" class="flex items-center px-4 py-2 text-sm hover:bg-surface-2 w-full text-left \${p.id == S.currentPersonaId ? 'text-blue-600 font-medium bg-surface-2 dark:bg-gray-800' : ''}">
+                <span class="w-5 h-5 rounded overflow-hidden mr-2 bg-surface-3 flex items-center justify-center text-[10px] flex-shrink-0">\${p.avatar.startsWith('http') ? \`<img src="\${esc(p.avatar)}" class="w-full h-full object-cover">\` : esc(p.avatar.substring(0,2))}</span>
                 <span class="truncate">\${esc(p.name)}</span>
                 \${p.id == S.currentPersonaId ? '<i data-lucide="check" class="w-3.5 h-3.5 ml-auto"></i>' : ''}
             </button>
@@ -3444,6 +12613,11 @@ function togglePersonaDropdown(e) {
 }
 
 function closeAllDropdowns(){
+    /* The thinking picker is a sibling of the message menu now - it was moved
+       to <body> so its backdrop-filter would have a page behind it - so it
+       closes on the same gesture rather than relying on a click bubbling out of
+       the composer it no longer lives in. */
+    $('think-picker')?.classList.add('hf');
     const d=$('global-dropdown');
     d.classList.add('hf');
     // Drop the clamp placeDropdown may have applied, so the next open measures
@@ -3508,11 +12682,11 @@ function startEdit(id,isBot){
     const m=S.msgs.find(m=>m.id==id);if(!m)return;closeAllDropdowns();
     const wrap=document.querySelector(\`[data-msg-id="\${id}"]\`);if(!wrap)return;
     const txt=isBot?(m.variants?.[m.active_index||0]||''):(m.content||'');
-    wrap.innerHTML=\`<div class="w-full max-w-2xl \${isBot?'':'ml-auto'} bg-white dark:bg-[#111] border border-gray-200 dark:border-gray-800 rounded-xl p-3">
-        <textarea id="edit-ta-\${id}"class="w-full bg-transparent outline-none text-base md:text-sm min-h-[500px] max-h-[60vh] overflow-y-auto p-2 dark:text-white"autofocus></textarea>
+    wrap.innerHTML=\`<div class="w-full max-w-2xl \${isBot?'':'ml-auto'} bg-surface border border-line rounded-xl p-3">
+        <textarea id="edit-ta-\${id}"class="w-full bg-transparent outline-none text-base md:text-sm min-h-[500px] max-h-[60vh] overflow-y-auto p-2"autofocus></textarea>
         <div class="flex justify-end space-x-2 mt-2">
-            <button onclick="cancelEdit('\${id}')"class="text-xs px-3 py-1.5 rounded text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800">Cancel</button>
-            <button onclick="saveEdit('\${id}',\${isBot})"class="text-xs px-3 py-1.5 rounded bg-black dark:bg-white text-white dark:text-black">Save</button>
+            <button onclick="cancelEdit('\${id}')"class="text-xs px-3 py-1.5 rounded text-dim hover:bg-surface-2">Cancel</button>
+            <button onclick="saveEdit('\${id}',\${isBot})"class="text-xs px-3 py-1.5 rounded bg-accent text-onaccent">Save</button>
         </div></div>\`;
     const ta=document.getElementById(\`edit-ta-\${id}\`);ta.value=txt;ta.focus();
 }
@@ -3565,11 +12739,11 @@ function renderSketchboard(){
         const isActive = parseInt(pin.is_active) === 1;
         const li=document.createElement('li');
         li.className=\`p-3 rounded-lg border border-gray-200 dark:border-gray-800 bg-white dark:bg-[#111] text-sm relative group \${isActive?'':'opacity-50'}\`;
-        li.innerHTML=\`<div class="pr-20 text-sm text-gray-700 dark:text-gray-300 break-words \${isActive?'':'line-through'}">\${esc(pin.content)}</div>
-            <div class="absolute right-2 top-2 flex space-x-1 opacity-100 sm:opacity-0 group-hover:opacity-100 transition-opacity bg-white/80 dark:bg-[#111]/80 backdrop-blur-sm pl-1 rounded">
+        li.innerHTML=\`<div class="pr-20 text-sm text-body break-words \${isActive?'':'line-through'}">\${esc(pin.content)}</div>
+            <div class="absolute right-2 top-2 flex space-x-1 opacity-100 sm:opacity-0 group-hover:opacity-100 transition-opacity bg-surface/80 backdrop-blur-sm pl-1 rounded">
                 <button onclick="togglePin('\${pin.id}')" class="p-1.5 sm:p-1 \${isActive?'text-green-500 hover:text-gray-500':'text-gray-400 hover:text-green-500'}" title="Toggle Active"><i data-lucide="\${isActive?'toggle-right':'toggle-left'}"class="w-4 h-4 sm:w-3.5 sm:h-3.5"></i></button>
-                <button onclick="editPin('\${pin.id}')" class="p-1.5 sm:p-1 text-gray-400 hover:text-blue-500" title="Edit"><i data-lucide="edit-2"class="w-4 h-4 sm:w-3.5 sm:h-3.5"></i></button>
-                <button onclick="deletePin('\${pin.id}')" class="p-1.5 sm:p-1 text-gray-400 hover:text-red-500" title="Delete"><i data-lucide="trash-2"class="w-4 h-4 sm:w-3.5 sm:h-3.5"></i></button>
+                <button onclick="editPin('\${pin.id}')" class="p-1.5 sm:p-1 text-dim hover:text-info" title="Edit"><i data-lucide="edit-2"class="w-4 h-4 sm:w-3.5 sm:h-3.5"></i></button>
+                <button onclick="deletePin('\${pin.id}')" class="p-1.5 sm:p-1 text-dim hover:text-danger" title="Delete"><i data-lucide="trash-2"class="w-4 h-4 sm:w-3.5 sm:h-3.5"></i></button>
             </div>\`;
         list.appendChild(li);
     });
@@ -3603,23 +12777,54 @@ async function toggleGlobalSketchboard(){
     await api('manageSketchboard',{op:'toggleGlobal',active:S.sketchGlobal});
 }
 
+/* The column Rail and Trio are built around. Same data and the same actions as
+   Manage Sessions - this is a second view of one list, not a second list. */
+function renderSessionRail(){
+  const box=$('rail-list'); if(!box) return;
+  const q=(($('rail-filter')||{}).value||'').trim().toLowerCase();
+  const rows=(S.sessions||[]).filter(s=>!q || String(s.label||s.id).toLowerCase().includes(q));
+  if(!rows.length){
+    box.innerHTML='<p class="text-xs text-dim px-1 py-2">'+(q?'Nothing matches.':'No chats yet.')+'</p>';
+    return;
+  }
+  box.innerHTML=rows.map(s=>{
+    const cur=s.id===S.session;
+    return \`<div class="group relative rounded-lg \${cur?'bg-accent-soft':'hover:bg-surface-3'} transition-colors">
+      <button onclick="switchSession('\${esc(s.id)}')" style="padding-right:3.5rem"
+              class="w-full text-left px-2.5 py-2 rounded-lg">
+        <span class="block text-xs font-medium truncate \${cur?'text-main':'text-body'}">\${esc(s.label||s.id)}</span>
+      </button>
+      <span class="opacity-0 group-hover:opacity-100 transition-opacity"
+            style="position:absolute;top:50%;right:6px;transform:translateY(-50%);display:flex;gap:2px">
+        <button onclick="event.stopPropagation();renameSession('\${esc(s.id)}')" title="Rename"
+          class="p-1 text-dim hover:text-info"><i data-lucide="edit-2" class="w-3 h-3"></i></button>
+        \${cur?'':\`<button onclick="event.stopPropagation();deleteSession('\${esc(s.id)}')" title="Delete"
+          class="p-1 text-dim hover:text-danger"><i data-lucide="trash-2" class="w-3 h-3"></i></button>\`}
+      </span>
+    </div>\`;
+  }).join('');
+  if(window.lucide) lucide.createIcons();
+}
+
 function renderSessionsList(){
     const cont=$('sessions-list');if(!cont)return;
     cont.innerHTML='';
     S.sessions.forEach(sess=>{
         const cur=sess.id===S.session;
         const div=document.createElement('div');
-        div.className=\`border \${cur?'border-2 border-black dark:border-white bg-gray-50 dark:bg-[#111]':'border-gray-200 dark:border-gray-700 opacity-70 hover:opacity-100'} rounded-lg p-3 sm:p-4 relative cursor-pointer group hover:border-gray-400 dark:hover:border-gray-500 transition-all\`;
-        div.innerHTML=\`\${cur?'<span class="absolute top-2 right-2 bg-black dark:bg-white text-white dark:text-black text-[10px] px-1.5 py-0.5 rounded">Current</span>':''}
+        div.className=\`border \${cur?'border-2 border-black dark:border-white bg-gray-50 dark:bg-[#111]':'border-gray-200 dark:border-gray-700 opacity-70 hover:opacity-100'} rounded-lg p-3 sm:p-4 relative cursor-pointer group hover:border-gray-400 dark:hover:border-gray-500 transition-[background-color,border-color,color,box-shadow,scale]\`;
+        div.innerHTML=\`\${cur?'<span class="absolute top-2 right-2 bg-accent text-onaccent text-[10px] px-1.5 py-0.5 rounded">Current</span>':''}
             <h5 class="font-medium text-xs sm:text-sm mb-1 pr-12">\${esc(sess.label||sess.id)}</h5>
             \${!cur?\`<div class="absolute top-2 right-2 flex space-x-1 sm:space-x-2">
-                <button onclick="event.stopPropagation();renameSession('\${sess.id}')"class="p-1 text-gray-400 hover:text-blue-500"><i data-lucide="edit-2"class="w-3.5 h-3.5"></i></button>
-                <button onclick="event.stopPropagation();deleteSession('\${sess.id}')"class="p-1 text-gray-400 hover:text-red-500"><i data-lucide="trash-2"class="w-3.5 h-3.5"></i></button>
+                <button onclick="event.stopPropagation();renameSession('\${sess.id}')"class="p-1 text-dim hover:text-info"><i data-lucide="edit-2"class="w-3.5 h-3.5"></i></button>
+                <button onclick="event.stopPropagation();deleteSession('\${sess.id}')"class="p-1 text-dim hover:text-danger"><i data-lucide="trash-2"class="w-3.5 h-3.5"></i></button>
             </div>\`:\`\`}\`;
         if(!cur)div.onclick=()=>switchSession(sess.id);
         cont.appendChild(div);
     });
     lucide.createIcons();
+    /* one list, two views */
+    renderSessionRail();
 }
 async function switchSession(id){
     // Single round trip: bootstrap validates the session and returns its state,
@@ -3635,6 +12840,8 @@ async function switchSession(id){
     const s=S.sessions.find(s=>s.id===id);
     S.sessionLabel=s?.label||id;
     applyBootstrap(d);
+    applyLook();                 // this chat may dress differently
+    renderSessionRail();
     closeModals();
 }
 async function newSession(){
@@ -3686,19 +12893,19 @@ async function loadPersonas(){
         const div = document.createElement('div');
         div.className = \`flex items-center justify-between border \${isCurrent?'border-blue-500':'border-gray-200 dark:border-gray-700'} rounded-lg p-3 bg-white dark:bg-[#0a0a0a]\`;
         
-        const avHtml = p.avatar.startsWith('http') ? \`<img src="\${esc(p.avatar)}" class="w-full h-full object-cover">\` : \`<span class="text-xs font-bold text-gray-500">\${esc(p.avatar.substring(0,2))}</span>\`;
+        const avHtml = p.avatar.startsWith('http') ? \`<img src="\${esc(p.avatar)}" class="w-full h-full object-cover">\` : \`<span class="text-xs font-bold text-dim">\${esc(p.avatar.substring(0,2))}</span>\`;
         div.innerHTML = \`
             <div class="flex items-center space-x-3 min-w-0">
-                <div class="w-10 h-10 rounded-lg bg-gray-100 dark:bg-gray-800 flex items-center justify-center overflow-hidden flex-shrink-0">\${avHtml}</div>
+                <div class="w-10 h-10 rounded-lg bg-surface-2 flex items-center justify-center overflow-hidden flex-shrink-0">\${avHtml}</div>
                 <div class="min-w-0">
-                    <p class="text-sm font-semibold truncate">\${esc(p.name)}\${isCurrent?'<span class="ml-2 text-[10px] bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400 px-1.5 py-0.5 rounded">Active in Session</span>':''}</p>
-                    <p class="text-xs text-gray-500 truncate">\${esc(p.description || 'No description')}</p>
+                    <p class="text-sm font-semibold truncate">\${esc(p.name)}\${isCurrent?'<span class="ml-2 text-[10px] bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded">Active in Session</span>':''}</p>
+                    <p class="text-xs text-dim truncate">\${esc(p.description || 'No description')}</p>
                 </div>
             </div>
             <div class="flex items-center space-x-2 pl-3">
-                \${!isCurrent ? \`<button onclick="changeSessionPersona('\${p.id}')" class="text-[10px] px-2 py-1 rounded border border-gray-200 dark:border-gray-700 hover:border-blue-500 hover:text-blue-500 transition-colors whitespace-nowrap">Use Here</button>\` : ''}
-                <button onclick="showPersonaForm('\${p.id}')" class="p-1.5 text-gray-400 hover:text-blue-500"><i data-lucide="edit-2" class="w-4 h-4"></i></button>
-                <button onclick="deletePersona('\${p.id}')" class="p-1.5 text-gray-400 hover:text-red-500"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                \${!isCurrent ? \`<button onclick="changeSessionPersona('\${p.id}')" class="text-[10px] px-2 py-1 rounded border border-line hover:border-info hover:text-info transition-colors whitespace-nowrap">Use Here</button>\` : ''}
+                <button onclick="showPersonaForm('\${p.id}')" class="p-1.5 text-dim hover:text-info"><i data-lucide="edit-2" class="w-4 h-4"></i></button>
+                <button onclick="deletePersona('\${p.id}')" class="p-1.5 text-dim hover:text-danger"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
             </div>
         \`;
         cont.appendChild(div);
@@ -3725,6 +12932,11 @@ function showPersonaForm(editId){
         $('persona-desc').value = ''; $('persona-prompt').value = '';
         $('persona-user').value = ''; $('persona-first-msg').value = '';
     }
+    /* Only the persona actually in use can be styled from here: the Appearance
+       window previews on the live conversation, so styling a persona you are
+       not talking to would show you somebody else's look. */
+    $('persona-look').classList.toggle('hf', !editId || editId != S.currentPersonaId);
+    if(window.lucide) lucide.createIcons();
     updateAvatarPreview();
 }
 
@@ -3771,6 +12983,7 @@ async function changeSessionPersona(pid) {
     if(res.error) { toast(res.error); return; }
     S.currentPersonaId = pid;
     updateHeader();
+    applyLook();                 // this persona may dress differently
     if(!$('persona-modal').classList.contains('hf')) loadPersonas();
     toast('Persona switched for this session.');
 }
@@ -3781,12 +12994,12 @@ function updateHeader(){
     const label=S.sessions.find(s=>s.id===S.session)?.label||S.session;
     $('header-sess').textContent=label;
     const av=persona.avatar;
-    $('header-avatar').innerHTML=av.startsWith('http')?\`<img src="\${esc(av)}"class="w-full h-full object-cover">\`:\`<span class="text-xs font-bold text-gray-600 dark:text-gray-300">\${esc(av.substring(0,2))}</span>\`;
+    $('header-avatar').innerHTML=av.startsWith('http')?\`<img src="\${esc(av)}"class="w-full h-full object-cover">\`:\`<span class="text-xs font-bold text-body">\${esc(av.substring(0,2))}</span>\`;
 }
 
 function updateAvatarPreview(){
     const val=$('persona-avatar').value.trim();
-    $('persona-avatar-preview').innerHTML=val.startsWith('http')?\`<img src="\${esc(val)}"class="w-full h-full object-cover">\`:\`<span class="text-xl font-bold text-gray-400">\${esc(val.substring(0,2)||'AI')}</span>\`;
+    $('persona-avatar-preview').innerHTML=val.startsWith('http')?\`<img src="\${esc(val)}"class="w-full h-full object-cover">\`:\`<span class="text-xl font-bold text-dim">\${esc(val.substring(0,2)||'AI')}</span>\`;
 }
 
 function populateMemoryForm(){
@@ -3848,11 +13061,11 @@ function renderGenSettings(){
             const b=document.createElement('button');
             b.type='button';
             b.onclick=function(){selectGenPreset(p[0]);};
-            b.className='text-left rounded-lg p-3 transition-all '+(active
+            b.className='text-left rounded-lg p-3 transition-[background-color,border-color,color,box-shadow,scale] '+(active
                 ? 'border-2 border-black dark:border-white bg-gray-50 dark:bg-[#111]'
                 : 'border border-gray-200 dark:border-gray-700 opacity-70 hover:opacity-100 hover:border-gray-400 dark:hover:border-gray-500');
             b.innerHTML='<div class="text-sm font-medium mb-0.5">'+esc(p[1])+'</div>'
-                       +'<div class="text-[11px] text-gray-500 leading-snug">'+esc(p[2])+'</div>';
+                       +'<div class="text-[11px] text-dim leading-snug">'+esc(p[2])+'</div>';
             cont.appendChild(b);
         });
     }
@@ -3913,13 +13126,13 @@ async function loadApiKeys(){
     (Array.isArray(keys)?keys:[]).forEach(k=>{
         const div=document.createElement('div');
         div.className='flex flex-col sm:flex-row items-start sm:items-center justify-between border border-gray-200 dark:border-gray-700 rounded-lg p-3 sm:space-x-3 gap-2 sm:gap-0';
-        div.innerHTML=\`<div class="flex items-center space-x-3 w-full sm:w-auto"><i data-lucide="key"class="w-4 h-4 text-gray-400"></i><div class="flex-1">
-            <p class="text-sm font-medium">\${esc(k.provider)}<span class="text-[10px] \${k.is_primary?'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-100':'bg-gray-200 text-gray-800 dark:bg-gray-700 dark:text-gray-200'} px-1.5 py-0.5 rounded ml-1">\${k.is_primary?'Primary ':''}\${esc(k.key_mode)}</span></p>
-            <p class="text-xs text-gray-500 font-mono">\${esc(k.masked_key||(k.provider==='custom'?'No key needed':'sk-...'))} • \${esc(k.model)}\${k.name?' • '+esc(k.name):''}</p></div></div>
+        div.innerHTML=\`<div class="flex items-center space-x-3 w-full sm:w-auto"><i data-lucide="key"class="w-4 h-4 text-dim"></i><div class="flex-1">
+            <p class="text-sm font-medium">\${esc(k.provider)}<span class="text-[10px] \${k.is_primary?'bg-green-100 text-green-800 dark:text-green-100':'bg-gray-200 text-main dark:text-gray-200'} px-1.5 py-0.5 rounded ml-1">\${k.is_primary?'Primary ':''}\${esc(k.key_mode)}</span></p>
+            <p class="text-xs text-dim font-mono">\${esc(k.masked_key||(k.provider==='custom'?'No key needed':'sk-...'))} • \${esc(k.model)}\${k.name?' • '+esc(k.name):''}</p></div></div>
             <div class="flex items-center space-x-2 self-end sm:self-auto">
-                <button onclick="testKey('\${k.id}',this)" class="text-[10px] px-2 py-1 rounded border border-gray-200 dark:border-gray-700 text-gray-500 hover:border-green-500 hover:text-green-600 transition-colors" title="Test this endpoint">Test</button>
-                <button onclick="showKeyForm('\${k.id}')"class="p-1 sm:p-0 text-gray-400 hover:text-blue-500"><i data-lucide="edit-2"class="w-4 h-4"></i></button>
-                <button onclick="deleteKey('\${k.id}')"class="p-1 sm:p-0 text-gray-400 hover:text-red-500"><i data-lucide="trash-2"class="w-4 h-4"></i></button>
+                <button onclick="testKey('\${k.id}',this)" class="text-[10px] px-2 py-1 rounded border border-line text-dim hover:border-green-500 hover:text-success transition-colors" title="Test this endpoint">Test</button>
+                <button onclick="showKeyForm('\${k.id}')"class="p-1 sm:p-0 text-dim hover:text-info"><i data-lucide="edit-2"class="w-4 h-4"></i></button>
+                <button onclick="deleteKey('\${k.id}')"class="p-1 sm:p-0 text-dim hover:text-danger"><i data-lucide="trash-2"class="w-4 h-4"></i></button>
             </div>\`;
         cont.appendChild(div);
     });
@@ -3939,16 +13152,14 @@ async function showKeyForm(editId){
             $('key-custom-url').value=k.custom_url||'';
             $('key-mode').value=k.key_mode; $('key-value').value='';
             $('key-name').value=k.name||''; $('key-primary').checked=!!k.is_primary;
-            $('custom-url-container').classList.toggle('hf', k.provider !== 'custom' && k.provider !== 'cloudflare');
-            if(k.provider === 'custom') $('custom-url-label').textContent = 'Custom API URL';
-            if(k.provider === 'cloudflare') $('custom-url-label').textContent = 'Cloudflare Account ID';
+            syncKeyForm();
         }
     } else {
-        $('key-provider').value='groq'; $('key-model').value=''; 
+        $('key-provider').value='imgxh'; $('key-model').value=''; 
         $('key-custom-url').value='';
         $('key-mode').value='chat'; $('key-value').value=''; 
         $('key-name').value=''; $('key-primary').checked=false;
-        $('custom-url-container').classList.add('hf');
+        syncKeyForm();
     }
 }
 
@@ -4013,10 +13224,91 @@ async function nukeServer(){
     const pass=$('nuke-pass').value;if(!pass){errEl.textContent='Enter your password.';errEl.classList.remove('hf');return;}
     const res=await api('nukeServer',{password:pass});
     if(res.error){errEl.textContent=res.error;errEl.classList.remove('hf');return;}
-    document.body.innerHTML='<div class="h-screen w-full bg-black flex flex-col items-center justify-center text-white space-y-4"><h1 class="text-2xl font-mono">DATABASE WIPED</h1><button onclick="location.reload()"class="mt-4 px-4 py-2 border border-white hover:bg-white hover:text-black font-mono">REBOOT</button></div>';
+    document.body.innerHTML='<div class="h-screen w-full bg-accent flex flex-col items-center justify-center text-onaccent space-y-4"><h1 class="text-2xl font-mono">DATABASE WIPED</h1><button onclick="location.reload()"class="mt-4 px-4 py-2 border border-line hover:bg-surface hover:text-main font-mono">REBOOT</button></div>';
 }
 
+
+/* ── PANELS IN THE COLUMN, NOT OVER THE CONVERSATION ────────────────────
+   Rail and Trio have a column beside the chat, so a panel that covers the chat
+   is the wrong shape there. These move the real panel into the column and put
+   it back when it is done - the same node, so its buttons keep working and
+   there is no second copy to keep in step. */
+/* Declared with var rather than let, on purpose. railOnLayoutChange() is
+   reachable from applyThemePreset(), which runs at the top level long before
+   this line does; a let read that early throws, and a throw at the top level
+   abandons the rest of the script - silently, because function declarations are
+   hoisted and the page still comes up looking fine. var hoists as undefined,
+   which is falsy, which is the right answer to "is a panel docked" before one
+   ever has been. */
+var _dockedId = null, _dockHome = null;
+/* These two lists live inside the functions that read them, not beside them as
+   consts. applyThemePreset runs at the top level during boot and calls
+   railAvailable(); a const declared further down the file is still in its
+   temporal dead zone at that moment, so the boot call threw - and a throw at the
+   top level abandons the rest of the script, leaving every const after it
+   uninitialised while the hoisted functions carried on as if nothing had
+   happened. A function body cannot run before it is called, so there is no
+   ordering left to get wrong. */
+
+function railAvailable(){
+  /* every layout that reserves a column beside the conversation - Split does
+     the same thing Rail and Trio do, with 340px */
+  const L = document.documentElement.dataset.layout;
+  return ['rail','trio','split'].indexOf(L) >= 0 && innerWidth >= 1024;
+}
+
+function dockPanel(id){
+  const el = $(id);
+  if(!el) return false;
+  if(_dockedId === id){ document.documentElement.dataset.rail = 'panel'; return true; }
+  undockPanel(true);
+  _dockHome = el.parentElement;
+  _dockedId = id;
+  el.classList.remove('hf');
+  el.dataset.docked = '1';
+  $('rail-panel').appendChild(el);
+  $('rail-panel').classList.remove('hf');
+  $('rail-chats').classList.add('hf');
+  document.documentElement.dataset.rail = 'panel';
+  return true;
+}
+
+/* quiet=true when another panel is about to take its place, so the column does
+   not flick back to the chat list in between */
+function undockPanel(quiet){
+  if(_dockedId){
+    const el = $(_dockedId);
+    if(el){
+      el.classList.add('hf');
+      delete el.dataset.docked;
+      (_dockHome || document.body).appendChild(el);
+    }
+    _dockedId = null; _dockHome = null;
+  }
+  if(quiet) return;
+  const p = $('rail-panel'); if(p) p.classList.add('hf');
+  const c = $('rail-chats'); if(c) c.classList.remove('hf');
+  if(document.documentElement.dataset.rail === 'panel')
+    delete document.documentElement.dataset.rail;
+}
+
+/* Current Chat: the column goes away and the conversation takes the width. */
+function railShowChat(){
+  undockPanel(true);
+  const p = $('rail-panel'); if(p) p.classList.add('hf');
+  const c = $('rail-chats'); if(c) c.classList.remove('hf');
+  document.documentElement.dataset.rail = 'off';
+}
+/* Manage Sessions IS this column, so it shows the list rather than docking a
+   panel that says the same thing. */
+function railShowChats(){
+  undockPanel();
+  delete document.documentElement.dataset.rail;
+  renderSessionRail();
+}
 function openModal(id){
+    if(id==='appearance-modal') setTimeout(renderAppearance,0);
+    if(id==='account-modal') setTimeout(renderMfa,0);
     if(id==='keys-modal')loadApiKeys();
     if(id==='advanced-modal')renderGenSettings();
     if(id==='persona-modal')loadPersonas();
@@ -4025,6 +13317,18 @@ function openModal(id){
         api('getInitData',{},'GET').then(d=>{if(d&&!d.error&&d.memory){S.memory=d.memory;populateMemoryForm();}});
     }
     if(id==='account-modal'){$('acct-username').value=S.username;$('acct-error').classList.add('hf');$('acct-success').classList.add('hf');}
+    /* Where it opens depends on whether there is a column for it. Everything
+       above still runs either way - it is the same panel, only somewhere else.
+       Nuke Server is never docked: it wipes the database, and a confirmation
+       you can read out of the corner of your eye is not a confirmation. */
+    /* Appearance is never docked: it is six tabs deep and the widest thing in
+       the app, and a 460px column makes it worse rather than more convenient.
+       Nuke is never docked because a confirmation that wipes the database
+       should not be readable out of the corner of your eye. */
+    if(['appearance-modal','nuke-modal'].indexOf(id) < 0 && railAvailable() && dockPanel(id)){
+      if(window.__rsPatchSearch) window.__rsPatchSearch();
+      return;
+    }
     const bd=$('modal-backdrop');bd.classList.remove('hf');
     document.querySelectorAll('.modal-content').forEach(m=>m.classList.add('hf'));
     $(id).classList.remove('hf');
@@ -4034,6 +13338,9 @@ function openModal(id){
 }
 
 function closeModals(){
+    /* a docked panel is closed by going back to the chat list, not by fading a
+       backdrop that is not there */
+    if(_dockedId){ undockPanel(); hideKeyForm(); hidePersonaForm(); return; }
     const bd=$('modal-backdrop');bd.classList.add('opacity-0');
     setTimeout(()=>{bd.classList.add('hf');document.querySelectorAll('.modal-content').forEach(m=>m.classList.add('hf'));},200);
     hideKeyForm(); hidePersonaForm();
@@ -4044,7 +13351,26 @@ function closeModalsOnBackdrop(e){if(e.target.id==='modal-backdrop')closeModals(
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeModals();closeAllDropdowns();$('sketchboard-sidebar').classList.add('translate-x-full');$('sketchboard-overlay').classList.add('opacity-0');setTimeout(()=>$('sketchboard-overlay').classList.add('hf'),300);}});
 
 function applyTheme(dark){document.documentElement.classList.toggle('dark',dark);$('theme-icon')?.setAttribute('data-lucide',dark?'sun':'moon');lucide.createIcons();}
-function toggleTheme(){const d=document.documentElement.classList.toggle('dark');$('theme-icon')?.setAttribute('data-lucide',d?'sun':'moon');lucide.createIcons();document.cookie=\`aiphp_theme=\${d?'dark':'light'}; path=/; max-age=31536000\`;}
+/* A theme flip changes colour, background, border and shadow on ~41
+   transitioning elements at once, so every transition fires together and the
+   swap reads as a smear. Kill transitions, force a reflow so the new colours
+   commit while that still applies, then restore on the next frame. */
+function toggleTheme(){
+  const root=document.documentElement;
+  root.classList.add('rp-no-transition');
+  const d=root.classList.toggle('dark');
+  $('theme-icon')?.setAttribute('data-lucide',d?'sun':'moon');
+  lucide.createIcons();
+  _baseCache={}; _skinTokens=null;                 // both are per-mode
+  applyColour();                                   // tokens are per-mode
+  void document.body.offsetHeight;                 // flush the reflow
+  // rAF does not fire in a hidden tab, so a swap made just before switching
+  // away would leave transitions disabled for good. Timer as a backstop.
+  const restore=()=>root.classList.remove('rp-no-transition');
+  requestAnimationFrame(()=>requestAnimationFrame(restore));
+  setTimeout(restore,120);
+  document.cookie=\`aiphp_theme=\${d?'dark':'light'}; path=/; max-age=31536000\`;
+}
 </script>
 <script>
 (function() {
@@ -4143,6 +13469,14 @@ function toggleTheme(){const d=document.documentElement.classList.toggle('dark')
     tryPatch();
   }
 })();
+
+/* The last statement in the app's script. A throw at the top level abandons
+   everything after it, and because function declarations are hoisted the page
+   still looks alive - it just quietly loses every const and every statement
+   past the throw. That happened once and nothing caught it: the script parses
+   perfectly, it only fails when run. So the script says when it finished.
+   Anything that needs to know the client loaded whole can ask. */
+window.__bootComplete = true;
 </script>
 </body>
 </html>`;
