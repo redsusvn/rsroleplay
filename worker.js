@@ -223,7 +223,7 @@ function cacheDrop(prefix) {
 }
 
 // Bumped on every deploy so browsers revalidate the HTML shell cheaply.
-const APP_BUILD = '2026-09-13-row1';
+const APP_BUILD = '2026-09-13-pin1';
 const HTML_CACHE_CONTROL = 'private, max-age=0, must-revalidate';
 let _hasUsers = false, _appHTML = null, _setupHTML = null;
 
@@ -6965,6 +6965,7 @@ body{background-color:var(--bg);background-image:var(--bg-art);background-attach
 :root[data-glass="on"] #main-nav .dock-btn.bg-accent,
 :root[data-glass="on"] #nav-footer .dock-btn.bg-accent,
 :root[data-glass="on"] #sketchboard-sidebar button.bg-accent,
+:root[data-glass="on"] .modal-content button.bg-accent,
 :root[data-glass="on"] #send-btn,
 :root[data-glass="on"] #scroll-btn{
   background:color-mix(in oklab, var(--accent) 72%, transparent);
@@ -7257,8 +7258,12 @@ body{background-color:var(--bg);background-image:var(--bg-art);background-attach
   -webkit-backdrop-filter:blur(10px);
 }
 /* Any scroll container the panel brought with it stops being one: with the
-   panel itself scrolling, a nested scroller just traps the wheel halfway down. */
-#rail-panel > .modal-content .overflow-y-auto{
+   panel itself scrolling, a nested scroller just traps the wheel halfway down.
+   .rs-scroll-list is here because it sets overflow-y in its own class instead
+   of wearing the utility, so it used to slip past this rule and keep a 340px
+   cap inside a column nine hundred pixels tall. */
+#rail-panel > .modal-content .overflow-y-auto,
+#rail-panel > .modal-content .rs-scroll-list{
   overflow:visible; max-height:none;
 }
 /* The footer bar. In a modal it marks where the panel ends and the page
@@ -7266,6 +7271,27 @@ body{background-color:var(--bg);background-image:var(--bg-art);background-attach
    that already finished. The buttons keep their spacing, the bar does not. */
 #rail-panel > .modal-content > div:last-child{
   background:transparent; border-top:0;
+}
+
+
+/* ── THE PINNED FOOTER ──────────────────────────────────────────────────
+   Sticky rather than fixed: fixed would take it out of the panel and leave it
+   floating over the conversation when the panel is a column. Sticky pins it to
+   the bottom edge of whichever box is scrolling - the modal in one case, the
+   docked panel in the other - which is the same result in both without either
+   knowing about the other. */
+#keys-footer{
+  position:sticky; bottom:0; z-index:2;
+  background:color-mix(in oklab, var(--surface-2) 94%, transparent);
+  backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px);
+}
+/* The docked rule above strips the fill from a panel's last child, because a
+   footer bar under finished content is just a tinted strip. This one has rows
+   sliding underneath it, so it keeps its fill and its edge. Two ids, so it
+   outranks that rule without !important. */
+#rail-panel > .modal-content > #keys-footer{
+  background:color-mix(in oklab, var(--surface-2) 94%, transparent);
+  border-top:1px solid var(--border);
 }
 
 /* ── HOW SOLID THE DEFAULT BUBBLE IS ────────────────────────────────────
@@ -7836,13 +7862,16 @@ body::before{content:'';position:fixed;inset:0;z-index:-1;pointer-events:none;
   <div id="keys-modal" class="modal-content bg-surface w-[calc(100%-1rem)] max-w-3xl rounded-xl shadow-2xl border border-line hf flex flex-col max-h-[95vh]" onclick="event.stopPropagation()">
     <div class="px-4 sm:px-6 py-4 border-b border-line flex justify-between items-center bg-surface-2">
       <h3 class="font-semibold text-base sm:text-lg" id="keys-title">API Endpoints</h3>
-      <button onclick="closeModals()" class="text-dim hover:text-main"><i data-lucide="x" class="w-5 h-5"></i></button>
+      <div style="display:flex;align-items:center;gap:6px">
+        <button onclick="showKeyForm(null)" id="keys-add-top" title="Add endpoint" class="text-dim hover:text-accent"><i data-lucide="plus" class="w-5 h-5"></i></button>
+        <button onclick="closeModals()" class="text-dim hover:text-main"><i data-lucide="x" class="w-5 h-5"></i></button>
+      </div>
     </div>
     <div id="keys-list-view" class="p-4 sm:p-6 overflow-y-auto">
       <div id="keys-list-container" class="space-y-3"></div>
-      <div class="mt-4 pt-4 border-t border-line flex justify-end">
-        <button onclick="showKeyForm(null)" class="w-full sm:w-auto bg-accent text-onaccent px-4 py-2 rounded-md text-sm font-medium hover:opacity-80 flex justify-center items-center"><i data-lucide="plus" class="w-4 h-4 mr-1"></i>Add Endpoint</button>
-      </div>
+    </div>
+    <div id="keys-footer" class="px-4 sm:px-6 py-3 border-t border-line flex justify-end">
+      <button onclick="showKeyForm(null)" class="w-full sm:w-auto bg-accent text-onaccent px-4 py-2 rounded-md text-sm font-medium hover:opacity-80 flex justify-center items-center"><i data-lucide="plus" class="w-4 h-4 mr-1"></i>Add Endpoint</button>
     </div>
     <div id="keys-form-view" class="p-4 sm:p-6 hf overflow-y-auto">
       <div class="space-y-4 mb-4">
@@ -9540,6 +9569,10 @@ const LG = (function(){
              element, and a 34px pill has no interior left to bend. */
           + '#sketchboard-sidebar button.bg-accent,'
           + '#new-pin-input,.rs-search,'
+          /* an accent pill inside a panel refracts like the one in the
+             composer does; flat next to a refracting panel is what gives
+             the material away */
+          + '.modal-content button.bg-accent,'
           /* the things that sit on top of everything else, which is where glass
              is most obvious and where it was most conspicuously missing */
           + '#global-dropdown,#think-picker,#toast,.modal-content';
@@ -13144,7 +13177,7 @@ async function loadApiKeys(){
     const cont=$('keys-list-container');cont.innerHTML='';
     (Array.isArray(keys)?keys:[]).forEach(k=>{
         const div=document.createElement('div');
-        div.className='flex items-center justify-between border border-line rounded-lg p-3 gap-3';
+        div.className='flex items-center justify-between border border-line bg-surface-2 rounded-lg p-3 gap-3';
         div.innerHTML=\`<div class="flex items-center space-x-3 flex-1" style="min-width:0"><i data-lucide="key"class="w-4 h-4 text-dim flex-shrink-0"></i><div class="flex-1" style="min-width:0">
             <p class="text-sm font-medium truncate">\${esc(k.provider)}<span class="text-[10px] \${k.is_primary?'bg-accent-soft text-accent':'bg-surface-2 text-dim'} px-1.5 py-0.5 rounded ml-1">\${k.is_primary?'Primary ':''}\${esc(k.key_mode)}</span></p>
             <p class="text-xs text-dim font-mono truncate" title="\${esc(k.masked_key||(k.provider==='custom'?'No key needed':'sk-...'))} • \${esc(k.model)}\${k.name?' • '+esc(k.name):''}">\${esc(k.masked_key||(k.provider==='custom'?'No key needed':'sk-...'))} • \${esc(k.model)}\${k.name?' • '+esc(k.name):''}</p></div></div>
@@ -13162,6 +13195,7 @@ async function showKeyForm(editId){
     S.editingKeyId=editId;$('key-edit-id').value=editId||'';$('key-form-error').classList.add('hf');
     $('keys-title').textContent=editId?'Edit API Endpoint':'Add API Endpoint';
     $('keys-list-view').classList.add('hf');$('keys-form-view').classList.remove('hf');
+    $('keys-footer')?.classList.add('hf');$('keys-add-top')?.classList.add('hf');
     
     if(editId){
         const keys=await api('manageKeys',{op:'list'});
@@ -13182,7 +13216,9 @@ async function showKeyForm(editId){
     }
 }
 
-function hideKeyForm(){$('keys-form-view').classList.add('hf');$('keys-list-view').classList.remove('hf');$('keys-title').textContent='API Endpoints';}
+function hideKeyForm(){$('keys-form-view').classList.add('hf');$('keys-list-view').classList.remove('hf');
+  $('keys-footer')?.classList.remove('hf');$('keys-add-top')?.classList.remove('hf');
+  $('keys-title').textContent='API Endpoints';}
 
 async function saveKey(){
     const errEl=$('key-form-error'),editId=$('key-edit-id').value,kv=$('key-value').value.trim();
@@ -13398,14 +13434,17 @@ function toggleTheme(){
   'use strict';
 
   // ── CONFIG ──────────────────────────────────────────────────────────
-  const MODAL_LIST_MAX_H = '340px'; // max height for scrollable lists inside modals
+  // Max height for a scrollable list in a FLOATING modal. The modal itself is
+  // allowed 95vh, so a fixed 340px was leaving most of a tall screen unused.
+  // Docked panels ignore this entirely - the column scrolls as one piece.
+  const MODAL_LIST_MAX_H = 'min(60vh, 680px)';
 
   // ── INJECT CSS ───────────────────────────────────────────────────────
   const css = document.createElement('style');
   css.textContent = [
-    '.rs-search{width:100%;border:1px solid #e5e7eb;border-radius:8px;padding:8px 12px;font-size:13px;outline:none;background:transparent;margin-bottom:12px;box-sizing:border-box;transition:border-color .15s}',
-    '.dark .rs-search{border-color:#374151;color:#fff}',
-    '.rs-search:focus{border-color:#000}.dark .rs-search:focus{border-color:#fff}',
+    '.rs-search{width:100%;border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:13px;outline:none;background:var(--surface-2);color:var(--text);margin-bottom:12px;box-sizing:border-box;transition:border-color .15s}',
+    '.rs-search::placeholder{color:var(--text-dim)}',
+    '.rs-search:focus{border-color:var(--accent)}',
     '.rs-scroll-list{overflow-y:auto;max-height:' + MODAL_LIST_MAX_H + '}',
   ].join('');
   document.head.appendChild(css);
