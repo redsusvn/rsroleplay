@@ -223,7 +223,7 @@ function cacheDrop(prefix) {
 }
 
 // Bumped on every deploy so browsers revalidate the HTML shell cheaply.
-const APP_BUILD = '2026-09-13-tdz2';
+const APP_BUILD = '2026-09-13-emoji1';
 const HTML_CACHE_CONTROL = 'private, max-age=0, must-revalidate';
 let _hasUsers = false, _appHTML = null, _setupHTML = null;
 
@@ -10878,12 +10878,30 @@ function alphaVars(b, cfg){
   return out;
 }
 
+/* One reader for the emoji tint, so the slider and the stylesheet cannot drift
+   apart on how an old config is interpreted. */
+function emojiTintOf(cfg){
+  if(cfg.emojiTint != null) return cfg.emojiTint;
+  return (cfg.alpha != null && cfg.alpha < 1) ? cfg.alpha : 0.85;
+}
+
 /* The emoji wallpaper, generated the way the userscript generates it: one SVG
    pattern of the chosen emoji, tinted by the side's own fill. Scoped to the
    design AND the side, so a dual setup cannot cross-tint. */
 function emojiCSS(b, cfg, side){
   const list=(cfg.emoji&&cfg.emoji.length)?cfg.emoji:[b.emoji||'\\u2B50'];
-  const angle=cfg.angle||0, alpha=cfg.alpha==null?0.85:cfg.alpha;
+  const angle=cfg.angle||0;
+  /* How strongly the bubble's fill covers the emoji pattern behind it. This
+     used to be cfg.alpha, which the bubble-opacity slider later took over -
+     two controls writing one key and meaning different things by it, which is
+     what made the emoji disappear. Old configs are read through: a saved alpha
+     below 1 on an emoji design could only have come from the old slider. */
+  const tintA = cfg.emojiTint != null ? cfg.emojiTint
+              : (cfg.alpha != null && cfg.alpha < 1 ? cfg.alpha : 0.85);
+  /* and they compose - a bubble at 50% shows the wallpaper through its emoji
+     layer too, rather than the pattern staying sealed under an opaque tint */
+  const bubA = cfg.alpha == null ? 1 : cfg.alpha;
+  const alpha = +(tintA * bubA).toFixed(3);
   const w=50,h=46,fs=22,n=list.length,pw=Math.max(w*n,w),ph=h*2;
   let texts='';
   for(let i=-2;i<=n+1;i++){
@@ -11664,10 +11682,11 @@ function bubbleControls(b,cfg){
         <input type="range" min="0" max="350" step="10" value="\${cfg.angle||0}"
           oninput="$('bub-ang-val').textContent=this.value+'\\u00B0'" onchange="saveBubble({angle:+this.value})"
           class="w-full accent-accent"></label>
-      <label class="block text-xs text-dim">Fill opacity <span id="bub-alp-val" class="font-mono text-main">\${Math.round((cfg.alpha==null?0.85:cfg.alpha)*100)}%</span>
-        <input type="range" min="30" max="100" step="5" value="\${Math.round((cfg.alpha==null?0.85:cfg.alpha)*100)}"
-          oninput="$('bub-alp-val').textContent=this.value+'%'" onchange="saveBubble({alpha:+this.value/100})"
+      <label class="block text-xs text-dim">Fill over the pattern <span id="bub-alp-val" class="font-mono text-main">\${Math.round(emojiTintOf(cfg)*100)}%</span>
+        <input type="range" min="30" max="100" step="5" value="\${Math.round(emojiTintOf(cfg)*100)}"
+          oninput="$('bub-alp-val').textContent=this.value+'%'" onchange="saveBubble({emojiTint:+this.value/100});applyBubble()"
           class="w-full accent-accent"></label>
+      <p class="text-[11px] text-dim mt-1">How much of the bubble colour sits over the emoji. Lower shows more of the pattern. Separate from the bubble Opacity slider above, which decides how much of the wallpaper comes through the whole bubble.</p>
     </div>\`:''}
 
     <div>
