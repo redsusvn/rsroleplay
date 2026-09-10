@@ -11,6 +11,71 @@ const SECURITY_HEADERS = {
   'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net https://unpkg.com https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com https://cdn.jsdelivr.net; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' https: wss:;"
 };
 
+
+// ── APP ICONS ───────────────────────────────────────────
+// Base64 because a single-file Worker has nowhere to keep a binary. iOS will
+// not take an SVG for apple-touch-icon, which is why these exist at all.
+// The maskable one keeps its mark inside the middle 62%, so a launcher that
+// cuts icons to a circle does not cut the letters off with the corners.
+const ICON_192 = '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';
+const ICON_512 = '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';
+const ICON_MASK_512 = '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';
+
+// Workers have atob but no Buffer, and a Response wants bytes, not a string.
+function pngBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+// ── INSTALLING IT ───────────────────────────────────────────────
+// A manifest, and no service worker on purpose. Nothing this app serves is
+// safe to hold in a cache: the page is per-account and every API answer
+// carries chat history or keys, so a stale worker handing either back is a
+// worse bug than not being installable. Android still offers Add to Home
+// Screen from the browser menu; the automatic install banner is what a
+// manifest alone does not get, because that wants a fetch handler.
+//
+// start_url carries no query. It is the same URL the browser would open, so an
+// installed copy lands on the same session check as a tab does.
+function getManifest() {
+  return JSON.stringify({
+    name: 'RSROLEPLAY Engine',
+    short_name: 'RSROLEPLAY',
+    description: 'Private AI roleplay chat.',
+    start_url: '/',
+    scope: '/',
+    display: 'standalone',
+    orientation: 'any',
+    background_color: '#0a0a0a',
+    theme_color: '#0a0a0a',
+    icons: [
+      { src: '?action=asset&f=icon-192.png&v=' + APP_BUILD,
+        sizes: '192x192', type: 'image/png', purpose: 'any' },
+      { src: '?action=asset&f=icon-512.png&v=' + APP_BUILD,
+        sizes: '512x512', type: 'image/png', purpose: 'any' },
+      { src: '?action=asset&f=icon-maskable.png&v=' + APP_BUILD,
+        sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+      { src: '?action=asset&f=icon.svg&v=' + APP_BUILD,
+        sizes: 'any', type: 'image/svg+xml', purpose: 'any' },
+    ],
+  });
+}
+
+// Drawn rather than shipped as a PNG, so there is no binary in a file that is
+// already a megabyte of source. The safe zone for a maskable icon is the
+// middle 80%, so the mark stays well inside the circle a launcher may cut.
+function getAppIcon() {
+  return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">'
+       + '<rect width="512" height="512" fill="#0a0a0a"/>'
+       + '<rect x="96" y="96" width="320" height="320" rx="72" fill="#2A82BA"/>'
+       + '<text x="256" y="300" text-anchor="middle" fill="#ffffff"'
+       + ' font-family="Segoe UI, Roboto, Helvetica, Arial, sans-serif"'
+       + ' font-size="150" font-weight="700">AI</text>'
+       + '</svg>';
+}
+
 // ── UTILITIES ────────────────────────────────────────────────────────
 function generateId() {
   return Date.now().toString(36).padStart(11, '0') + '-' + crypto.randomUUID().replace(/-/g, '').substring(0, 8);
@@ -223,7 +288,7 @@ function cacheDrop(prefix) {
 }
 
 // Bumped on every deploy so browsers revalidate the HTML shell cheaply.
-const APP_BUILD = '2026-09-13-fill5';
+const APP_BUILD = '2026-09-13-icon1';
 const HTML_CACHE_CONTROL = 'private, max-age=0, must-revalidate';
 let _hasUsers = false, _appHTML = null, _setupHTML = null;
 
@@ -1664,6 +1729,11 @@ export default {
         'bubbles.css': ['text/css; charset=utf-8', getBubbleCSS],
         'bubbles.json':['application/json; charset=utf-8', () => BUBBLE_JSON],
         'tailwind.css':['text/css; charset=utf-8', getTailwindCSS],
+        'manifest.webmanifest':['application/manifest+json; charset=utf-8', getManifest],
+        'icon.svg':   ['image/svg+xml; charset=utf-8', getAppIcon],
+        'icon-192.png':        ['image/png', () => pngBytes(ICON_192)],
+        'icon-512.png':        ['image/png', () => pngBytes(ICON_512)],
+        'icon-maskable.png':   ['image/png', () => pngBytes(ICON_MASK_512)],
       };
       const entry = bodies[file];
       if (!entry) return errResponse('Unknown asset', 404);
@@ -6329,10 +6399,105 @@ body{background-color:var(--bg);background-image:var(--bg-art);background-attach
    desktop density the design was drawn at is untouched. .dock-btn sets its own
    size and is excluded. */
 @media (pointer:coarse){
-  #app button:not(.dock-btn), #modal-backdrop button, #login-screen button,
+  #app button:not(.dock-btn):not(.rp-switch),
+  #modal-backdrop button:not(.rp-switch),
+  #login-screen button,
   #app select, #modal-backdrop select{ min-height:44px }
+  /* A button pinned into a corner cannot answer a min-height by growing:
+     it is positioned from the top, so it grows downward out of the card it
+     belongs to. Measured: the pencil and the bin on a session card ran 7px
+     past the bottom of a 46px card, which is why they read as sitting
+     under the title rather than beside it. They keep their drawn size and
+     take the finger area from a pseudo-element instead. */
+  #app [class~="absolute"] button, #modal-backdrop [class~="absolute"] button{
+    min-height:0; position:relative;
+  }
+  #app [class~="absolute"] button::after,
+  #modal-backdrop [class~="absolute"] button::after{
+    content:''; position:absolute; inset:-10px;
+  }
+  /* same bargain for the switches: 44x24 as drawn, 44 tall to the finger */
+  .rp-switch{ position:relative }
+  .rp-switch::after{ content:''; position:absolute; inset:-10px }
   #modal-backdrop input:not([type=checkbox]):not([type=range]),
   #app input:not([type=checkbox]):not([type=range]){ min-height:44px }
+}
+
+
+/* ── A SWITCH IS A DRAWING, NOT A BUTTON ────────────────────────────────
+   Its size is the design: a 44x24 pill with a 20px knob inset 2px. Stated here
+   so a rule meant for tap targets cannot turn it into a 44x44 circle again,
+   which is exactly what happened. */
+.rp-switch{ width:2.75rem; height:1.5rem; flex:0 0 auto; padding:0; border:0 }
+
+/* ── GLASS OFF THE THINGS THAT MOVE ─────────────────────────────────────
+   A backdrop-filter re-samples what is behind it on every frame it moves. On a
+   phone the message list is the one surface that moves constantly, and eleven
+   filtered bubbles scrolling is the most expensive thing on the page. They keep
+   their fill, their rim and their design; what they give up is a blur of a
+   wallpaper that is sliding past anyway.
+
+   The chrome keeps its glass. The header, the sidebar and the composer do not
+   move, so their filter is composited once and reused. */
+@media (pointer:coarse) and (max-width:900px){
+  #chat-container .msg-content{
+    backdrop-filter:none!important; -webkit-backdrop-filter:none!important;
+  }
+  /* with no blur under it a translucent bubble is just a hole, so the fill
+     firms up by as much as the blur was doing */
+  :root[data-wallpaper] #chat-container .msg-row:not([data-bubble]) .msg-content{
+    background:color-mix(in oklab, var(--glass-base, var(--surface)) 88%, transparent);
+  }
+}
+
+
+/* ── MODALS ON A PHONE ──────────────────────────────────────────────────
+   vh is the large viewport - the page as it would be if the address bar and
+   the navigation bar were hidden. They are not hidden, so 95vh on a phone is
+   taller than the screen, and #modal-backdrop is fixed inset-0, which measures
+   the same large viewport and then centres the modal inside it. The overflow
+   comes out of both ends at once: the title and the close button above the top
+   edge, the save button cut off below the bottom.
+
+   svh, not dvh: dvh follows the bars as they slide away, which resizes a
+   dialog while the page moves behind it. svh is the small viewport - what is
+   visible with the bars shown - so a modal that fits with them showing fits at
+   every other moment as well. The vh line stays as the fallback.
+
+   Attribute selectors because the class names contain brackets: a class
+   selector would need them escaped, and a backslash in this file has to be
+   doubled to survive the template literal. */
+#modal-backdrop{ height:100vh; height:100dvh }
+/* Cap against the box, not against a guess at the box.
+   The backdrop is the visible area now, so a modal that may not exceed its own
+   parent needs no viewport unit at all - which also means it cannot be wrong
+   about one. The svh caps stay underneath as a floor for the same intent, and
+   because a percentage max-height needs the parent to have a definite height,
+   which is exactly what the line above gives it. */
+[class~="max-h-[95vh]"]{ max-height:95vh; max-height:95svh }
+[class~="max-h-[88vh]"]{ max-height:88vh; max-height:88svh }
+[class~="max-h-[60vh]"]{ max-height:60vh; max-height:60svh }
+#modal-backdrop > .modal-content{ max-height:100% }
+:root[data-layout="console"] #modal-backdrop{ padding-top:11vh; padding-top:11svh }
+
+/* A 500px floor is taller than the visible area of a small phone, and a floor
+   beats the cap above it, so the editor grew until it pushed its own buttons
+   off screen. */
+[class~="min-h-[500px]"]{ min-height:min(500px, 46svh) }
+
+/* Nothing lands under a home indicator or a rounded corner. max() so a device
+   without safe areas keeps exactly the padding the design already had. */
+#modal-backdrop{
+  padding-bottom:max(0.5rem, env(safe-area-inset-bottom, 0px));
+  padding-left:max(0.5rem, env(safe-area-inset-left, 0px));
+  padding-right:max(0.5rem, env(safe-area-inset-right, 0px));
+}
+@media (min-width:640px){
+  #modal-backdrop{
+    padding-bottom:max(1rem, env(safe-area-inset-bottom, 0px));
+    padding-left:max(1rem, env(safe-area-inset-left, 0px));
+    padding-right:max(1rem, env(safe-area-inset-right, 0px));
+  }
 }
 
 /* images carry a 1px outline for consistent depth - pure black/white at low
@@ -7527,6 +7692,18 @@ window.APP_V='${APP_BUILD}';
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
 <title>RSROLEPLAY Engine</title>
+<!-- Installable from the browser menu. theme-color is restated from the
+     live palette once the app boots; this value is the ground the app
+     paints before any preference has been read, so the status bar does
+     not flash a colour the app never uses. -->
+<link rel="manifest" href="?action=asset&f=manifest.webmanifest&v=${APP_BUILD}">
+<meta name="theme-color" content="#0a0a0a">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="RSROLEPLAY">
+<link rel="apple-touch-icon" sizes="192x192" href="?action=asset&f=icon-192.png&v=${APP_BUILD}">
+<link rel="icon" type="image/svg+xml" href="?action=asset&f=icon.svg&v=${APP_BUILD}">
 <link rel="stylesheet" href="?action=asset&f=tailwind.css&v=${APP_BUILD}">
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <!-- Icons are an inline sprite at the top of <body>; see createIcons(). -->
@@ -8125,7 +8302,7 @@ body::before{content:'';position:fixed;inset:0;z-index:-1;pointer-events:none;
       <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Liquid glass</p>
       <div class="flex items-center justify-between gap-3 mb-1">
         <p class="text-xs text-dim flex-1">Frosts the bubbles, the sidebar, the header bar, the buttons and the sketchboard so what is behind them shows through.</p>
-        <button id="glass-toggle" onclick="toggleGlass()" class="w-11 h-6 rounded-full relative flex-shrink-0 bg-surface-3">
+        <button id="glass-toggle" onclick="toggleGlass()" class="rp-switch w-11 h-6 rounded-full relative flex-shrink-0 bg-surface-3">
           <span class="absolute top-0.5 w-5 h-5 rounded-full bg-surface shadow transition-[left]" style="left:2px"></span>
         </button>
       </div>
@@ -9936,7 +10113,7 @@ function applyGlass(){
   }
   const t=$('glass-toggle');
   if(t){
-    t.className='w-11 h-6 rounded-full relative flex-shrink-0 '+(on?'bg-success':'bg-surface-3');
+    t.className='rp-switch w-11 h-6 rounded-full relative flex-shrink-0 '+(on?'bg-success':'bg-surface-3');
     const k=t.firstElementChild;
     /* left, not transform: a 20px knob in a 44px track sits at 2px or 22px,
        which is how every other switch in this app is positioned. The Tailwind
@@ -10784,7 +10961,7 @@ function renderStyleTab(){
     return \`
       <div class="flex items-center justify-between">
         <p class="text-sm font-medium">\${o.label}</p>
-        <button onclick="chooseStyle('\${o.id}', \${!on})" class="w-11 h-6 rounded-full relative transition-colors flex-shrink-0 \${on?'bg-success':'bg-surface-3'}">
+        <button onclick="chooseStyle('\${o.id}', \${!on})" class="rp-switch w-11 h-6 rounded-full relative transition-colors flex-shrink-0 \${on?'bg-success':'bg-surface-3'}">
           <span class="absolute top-0.5 w-5 h-5 rounded-full bg-surface shadow transition-[background-color,border-color,color,box-shadow,scale]" style="left:\${on?'22px':'2px'}"></span>
         </button>
       </div>\`;
@@ -11709,20 +11886,20 @@ function bubbleControls(b,cfg){
       </div>
       <label class="flex items-center justify-between text-sm mb-3">
         <span>Readable text <span class="text-dim text-xs">darkens the text when the design is too bright behind it</span></span>
-        <button onclick="toggleInk()" class="w-11 h-6 rounded-full relative flex-shrink-0 \${UI.get().bubbleInk===false?'bg-surface-3':'bg-success'}">
+        <button onclick="toggleInk()" class="rp-switch w-11 h-6 rounded-full relative flex-shrink-0 \${UI.get().bubbleInk===false?'bg-surface-3':'bg-success'}">
           <span class="absolute top-0.5 w-5 h-5 rounded-full bg-surface shadow" style="left:\${UI.get().bubbleInk===false?'2px':'22px'}"></span>
         </button>
       </label>
       <label class="flex items-center justify-between text-sm mb-3">
         <span>Outline behind text <span class="text-dim text-xs">helps on picture fills</span></span>
-        <button onclick="toggleHalo()" class="w-11 h-6 rounded-full relative flex-shrink-0 \${UI.get().bubbleHalo===false?'bg-surface-3':'bg-success'}">
+        <button onclick="toggleHalo()" class="rp-switch w-11 h-6 rounded-full relative flex-shrink-0 \${UI.get().bubbleHalo===false?'bg-surface-3':'bg-success'}">
           <span class="absolute top-0.5 w-5 h-5 rounded-full bg-surface shadow" style="left:\${UI.get().bubbleHalo===false?'2px':'22px'}"></span>
         </button>
       </label>
       \${b.font?\`<label class="flex items-center justify-between text-sm mb-3">
         <span>Use its font <span class="text-dim text-xs">(\${b.font})</span></span>
         <button onclick="saveBubble({useFont:\${cfg.useFont===false}});renderBubbleTabs()"
-          class="w-11 h-6 rounded-full relative flex-shrink-0 \${cfg.useFont===false?'bg-surface-3':'bg-success'}">
+          class="rp-switch w-11 h-6 rounded-full relative flex-shrink-0 \${cfg.useFont===false?'bg-surface-3':'bg-success'}">
           <span class="absolute top-0.5 w-5 h-5 rounded-full bg-surface shadow" style="left:\${cfg.useFont===false?'2px':'22px'}"></span>
         </button>
       </label>\`:''}
