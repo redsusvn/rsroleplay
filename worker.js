@@ -223,7 +223,7 @@ function cacheDrop(prefix) {
 }
 
 // Bumped on every deploy so browsers revalidate the HTML shell cheaply.
-const APP_BUILD = '2026-09-13-tok2';
+const APP_BUILD = '2026-09-13-row1';
 const HTML_CACHE_CONTROL = 'private, max-age=0, must-revalidate';
 let _hasUsers = false, _appHTML = null, _setupHTML = null;
 
@@ -7833,7 +7833,7 @@ body::before{content:'';position:fixed;inset:0;z-index:-1;pointer-events:none;
   </div>
 
   <!-- API Keys -->
-  <div id="keys-modal" class="modal-content bg-surface w-[calc(100%-1rem)] max-w-2xl rounded-xl shadow-2xl border border-line hf flex flex-col max-h-[95vh]" onclick="event.stopPropagation()">
+  <div id="keys-modal" class="modal-content bg-surface w-[calc(100%-1rem)] max-w-3xl rounded-xl shadow-2xl border border-line hf flex flex-col max-h-[95vh]" onclick="event.stopPropagation()">
     <div class="px-4 sm:px-6 py-4 border-b border-line flex justify-between items-center bg-surface-2">
       <h3 class="font-semibold text-base sm:text-lg" id="keys-title">API Endpoints</h3>
       <button onclick="closeModals()" class="text-dim hover:text-main"><i data-lucide="x" class="w-5 h-5"></i></button>
@@ -13144,11 +13144,11 @@ async function loadApiKeys(){
     const cont=$('keys-list-container');cont.innerHTML='';
     (Array.isArray(keys)?keys:[]).forEach(k=>{
         const div=document.createElement('div');
-        div.className='flex flex-col sm:flex-row items-start sm:items-center justify-between border border-line rounded-lg p-3 sm:space-x-3 gap-2 sm:gap-0';
-        div.innerHTML=\`<div class="flex items-center space-x-3 w-full sm:w-auto"><i data-lucide="key"class="w-4 h-4 text-dim"></i><div class="flex-1">
-            <p class="text-sm font-medium">\${esc(k.provider)}<span class="text-[10px] \${k.is_primary?'bg-accent-soft text-accent':'bg-surface-2 text-dim'} px-1.5 py-0.5 rounded ml-1">\${k.is_primary?'Primary ':''}\${esc(k.key_mode)}</span></p>
-            <p class="text-xs text-dim font-mono">\${esc(k.masked_key||(k.provider==='custom'?'No key needed':'sk-...'))} • \${esc(k.model)}\${k.name?' • '+esc(k.name):''}</p></div></div>
-            <div class="flex items-center space-x-2 self-end sm:self-auto">
+        div.className='flex items-center justify-between border border-line rounded-lg p-3 gap-3';
+        div.innerHTML=\`<div class="flex items-center space-x-3 flex-1" style="min-width:0"><i data-lucide="key"class="w-4 h-4 text-dim flex-shrink-0"></i><div class="flex-1" style="min-width:0">
+            <p class="text-sm font-medium truncate">\${esc(k.provider)}<span class="text-[10px] \${k.is_primary?'bg-accent-soft text-accent':'bg-surface-2 text-dim'} px-1.5 py-0.5 rounded ml-1">\${k.is_primary?'Primary ':''}\${esc(k.key_mode)}</span></p>
+            <p class="text-xs text-dim font-mono truncate" title="\${esc(k.masked_key||(k.provider==='custom'?'No key needed':'sk-...'))} • \${esc(k.model)}\${k.name?' • '+esc(k.name):''}">\${esc(k.masked_key||(k.provider==='custom'?'No key needed':'sk-...'))} • \${esc(k.model)}\${k.name?' • '+esc(k.name):''}</p></div></div>
+            <div class="flex items-center space-x-2 flex-shrink-0">
                 <button onclick="testKey('\${k.id}',this)" class="text-[10px] px-2 py-1 rounded border border-line text-dim hover:border-accent hover:text-accent transition-colors" title="Test this endpoint">Test</button>
                 <button onclick="showKeyForm('\${k.id}')"class="p-1 sm:p-0 text-dim hover:text-info"><i data-lucide="edit-2"class="w-4 h-4"></i></button>
                 <button onclick="deleteKey('\${k.id}')"class="p-1 sm:p-0 text-dim hover:text-danger"><i data-lucide="trash-2"class="w-4 h-4"></i></button>
