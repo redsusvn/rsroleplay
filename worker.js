@@ -288,7 +288,7 @@ function cacheDrop(prefix) {
 }
 
 // Bumped on every deploy so browsers revalidate the HTML shell cheaply.
-const APP_BUILD = '2026-09-13-ring3';
+const APP_BUILD = '2026-09-13-mfa1';
 const HTML_CACHE_CONTROL = 'private, max-age=0, must-revalidate';
 let _hasUsers = false, _appHTML = null, _setupHTML = null;
 
@@ -410,10 +410,17 @@ async function mfaFail(db, user) {
 
   const next = stage + 1;
   if (next > MFA_LOCK_STEPS.length) {
-    /* No wait left to impose. The account row and every session it owns are
-       removed; with the account gone there is nothing to sign in to. */
+    /* No wait left to impose. The account is made unusable rather than
+       deleted: an empty users table is what reopens first-time setup, so
+       deleting the row handed the whole instance - every chat, every key - to
+       whoever made the last wrong guess. Its name and password become random
+       noise instead. Nobody can sign in to it again, and because the row is
+       still there, setup stays closed. */
+    const noise = () => Array.from(crypto.getRandomValues(new Uint8Array(24)),
+                                   b => b.toString(16).padStart(2, '0')).join('');
     await db.run('DELETE FROM user_sessions WHERE user_id = ?', [user.id]);
-    await db.run('DELETE FROM users WHERE id = ?', [user.id]);
+    await db.run('UPDATE users SET username = ?, password_hash = ?, salt = ?, mfa_fails = 0, mfa_stage = 0, mfa_locked_until = 0 WHERE id = ?',
+                 [noise(), noise(), noise(), user.id]);
     return { deleted: true };
   }
   const until = Date.now() + MFA_LOCK_STEPS[next - 1];
