@@ -288,7 +288,7 @@ function cacheDrop(prefix) {
 }
 
 // Bumped on every deploy so browsers revalidate the HTML shell cheaply.
-const APP_BUILD = '2026-09-13-icon1';
+const APP_BUILD = '2026-09-13-ring3';
 const HTML_CACHE_CONTROL = 'private, max-age=0, must-revalidate';
 let _hasUsers = false, _appHTML = null, _setupHTML = null;
 
@@ -6443,11 +6443,11 @@ body{background-color:var(--bg);background-image:var(--bg-art);background-attach
   #chat-container .msg-content{
     backdrop-filter:none!important; -webkit-backdrop-filter:none!important;
   }
-  /* with no blur under it a translucent bubble is just a hole, so the fill
-     firms up by as much as the blur was doing */
-  :root[data-wallpaper] #chat-container .msg-row:not([data-bubble]) .msg-content{
-    background:color-mix(in oklab, var(--glass-base, var(--surface)) 88%, transparent);
-  }
+  /* There used to be a fill here too, firming plain bubbles to 88% to make up
+     for the blur. It carried #chat-container, which put it above the opacity
+     slider's rule - so on a phone the slider did nothing - and it painted both
+     sides in the surface colour, which took the accent off your own bubbles.
+     The fill is the slider's to decide; only the blur is dropped. */
 }
 
 
@@ -7536,6 +7536,24 @@ body{background-color:var(--bg);background-image:var(--bg-art);background-attach
   background:color-mix(in oklab, var(--accent) var(--bub-plain,100%), transparent);
 }
 
+/* ── NO RING ON THE CHAT BOX ────────────────────────────────────────────
+   The Void and Clay skins draw a focus ring on anything :focus-visible, and a
+   text box matches that even when it is clicked - so every tap on the chat bar
+   drew an accent rectangle around it. Where you are typing is already obvious:
+   the caret is blinking in it. The ring stays everywhere else, which is where
+   someone moving through the page with a keyboard actually needs it.
+
+   The ring is taken out by making it transparent rather than by clearing the
+   shadow: Clay gives this box a pressed-in shadow of its own, and clearing
+   box-shadow on focus made it pop out every time you started typing. The
+   skins' rules still run; what they draw is simply nothing. */
+#chat-input{ --ring:0 0 0 0 transparent }
+#chat-input:focus, #chat-input:focus-visible{ outline:none !important }
+/* Clay presses this box in, and its focus rule swaps that for a raised shadow -
+   the box popped out the moment you tapped it. It keeps one face now, typing
+   or not. */
+[data-skin=clay] #chat-input:focus-visible{ box-shadow:var(--shadow-in) }
+
 /* ── NO SHADOW ON A MESSAGE ─────────────────────────────────────────────
    126 of the 240 designs declare their own outer box-shadow. Removing it from
    the plain bubble and leaving the designs to theirs is why it kept coming
@@ -7866,7 +7884,7 @@ body::before{content:'';position:fixed;inset:0;z-index:-1;pointer-events:none;
       <i data-lucide="chevron-down" class="w-5 h-5"></i>
     </button>
     <div id="composer-shell" class="max-w-3xl mx-auto relative">
-      <div class="border border-line rounded-xl bg-surface shadow focus-within:border-black focus-within:ring-1 focus-within:ring-black dark:focus-within:ring-white transition-[background-color,border-color,color,box-shadow,scale]">
+      <div class="border border-line rounded-xl bg-surface shadow transition-[background-color,border-color,color,box-shadow,scale]">
         <textarea id="chat-input" rows="1" class="w-full bg-transparent p-3 sm:p-4 pr-12 resize-none outline-none text-base md:text-sm max-h-40 placeholder-dim" placeholder="Type here to chat. Ctrl + Enter to add a new line."></textarea>
         <!-- Toolbar row -->
         <div class="flex items-center justify-between px-2 pb-2">
@@ -9071,7 +9089,7 @@ function buildMsgEl(msg){
     
     const persona = S.personas.find(p => p.id == S.currentPersonaId) || S.personas[0] || {avatar: 'AI'};
     const av = persona.avatar || 'AI';
-    const avatarHtml=av.startsWith('http')?\`<img src="\${esc(av)}"class="w-full h-full object-cover">\`:\`<span class="text-xs font-bold text-body">\${esc(av.substring(0,2))}</span>\`;
+    const avatarHtml=avImg(av)?\`<img src="\${esc(av)}"class="w-full h-full object-cover">\`:\`<span class="text-xs font-bold text-body">\${esc(av.substring(0,2))}</span>\`;
     
     const pill=showPill&&!isGreeting?\`
       <div class="variant-pill flex items-center space-x-1.5 mt-2.5 text-xs text-dim bg-surface-2 w-max px-2 py-1.5 rounded-md border border-line">
@@ -11008,6 +11026,9 @@ function renderAppearance(){
    Per-design colour tokens ride on the same row, so --b1 on an AI row and --b1
    on a user row are two independent values rather than one collision. */
 let BUBBLES=null, _bubLoad=null, _bubPeek=null;
+/* var, not let: applyBubble() can be reached before this line has run, and a
+   let read that early throws and takes the rest of the script with it. */
+var _bubWaiting = false;
 const BUB_ALL='All';
 const SIDES=['ai','user'];
 
@@ -11358,6 +11379,19 @@ function applyBubble(){
     return;
   }
   bubbleSheet();
+  /* A design id is only a number until the catalogue says what it means - its
+     colours, its opacity, its corner marks, its emoji. The catalogue used to
+     load only when the Bubble tab was opened, so every row drawn before then
+     wore the design with none of that: fully opaque whatever the slider said,
+     and no emoji. A message sent after visiting the tab came out right, which
+     is why old messages ignored the opacity and new ones obeyed it. Load it
+     the first time a design is in use, and dress every row again when it
+     arrives. */
+  if(!BUBBLES && !_bubWaiting){
+    _bubWaiting = true;
+    loadBubbles().then(function(){ _bubWaiting = false; applyBubble(); },
+                       function(){ _bubWaiting = false; _bubLoad = null; });
+  }
   _halo={}; _ink={};
   for(const side of SIDES){
     const cfg=sideCfg(side);
@@ -12892,7 +12926,7 @@ function togglePersonaDropdown(e) {
         <div class="max-h-64 overflow-y-auto">
         \${S.personas.map(p => \`
             <button onclick="changeSessionPersona('\${p.id}')" class="flex items-center px-4 py-2 text-sm hover:bg-surface-2 w-full text-left \${p.id == S.currentPersonaId ? 'text-accent font-medium bg-surface-2' : ''}">
-                <span class="w-5 h-5 rounded overflow-hidden mr-2 bg-surface-3 flex items-center justify-center text-[10px] flex-shrink-0">\${p.avatar.startsWith('http') ? \`<img src="\${esc(p.avatar)}" class="w-full h-full object-cover">\` : esc(p.avatar.substring(0,2))}</span>
+                <span class="w-5 h-5 rounded overflow-hidden mr-2 bg-surface-3 flex items-center justify-center text-[10px] flex-shrink-0">\${avImg(p.avatar) ? \`<img src="\${esc(p.avatar)}" class="w-full h-full object-cover">\` : esc(p.avatar.substring(0,2))}</span>
                 <span class="truncate">\${esc(p.name)}</span>
                 \${p.id == S.currentPersonaId ? '<i data-lucide="check" class="w-3.5 h-3.5 ml-auto"></i>' : ''}
             </button>
@@ -13184,7 +13218,7 @@ async function loadPersonas(){
         const div = document.createElement('div');
         div.className = \`flex items-center justify-between border \${isCurrent?'border-accent':'border-line'} rounded-lg p-3 bg-surface\`;
         
-        const avHtml = p.avatar.startsWith('http') ? \`<img src="\${esc(p.avatar)}" class="w-full h-full object-cover">\` : \`<span class="text-xs font-bold text-dim">\${esc(p.avatar.substring(0,2))}</span>\`;
+        const avHtml = avImg(p.avatar) ? \`<img src="\${esc(p.avatar)}" class="w-full h-full object-cover">\` : \`<span class="text-xs font-bold text-dim">\${esc(p.avatar.substring(0,2))}</span>\`;
         div.innerHTML = \`
             <div class="flex items-center space-x-3 min-w-0">
                 <div class="w-10 h-10 rounded-lg bg-surface-2 flex items-center justify-center overflow-hidden flex-shrink-0">\${avHtml}</div>
@@ -13285,12 +13319,24 @@ function updateHeader(){
     const label=S.sessions.find(s=>s.id===S.session)?.label||S.session;
     $('header-sess').textContent=label;
     const av=persona.avatar;
-    $('header-avatar').innerHTML=av.startsWith('http')?\`<img src="\${esc(av)}"class="w-full h-full object-cover">\`:\`<span class="text-xs font-bold text-body">\${esc(av.substring(0,2))}</span>\`;
+    $('header-avatar').innerHTML=avImg(av)?\`<img src="\${esc(av)}"class="w-full h-full object-cover">\`:\`<span class="text-xs font-bold text-body">\${esc(av.substring(0,2))}</span>\`;
+}
+
+/* An avatar is drawn as a picture when it is a web address or an inline raster
+   image; anything else is shown as its first two characters. One reader, so the
+   five places that draw an avatar cannot disagree about which is which. Raster
+   types only - an SVG in an <img> cannot run script, but nothing here needs a
+   format that can carry markup. */
+function avImg(a){
+  a = String(a || '');
+  if(a.indexOf('http') === 0) return true;
+  return ['data:image/png;', 'data:image/jpeg;', 'data:image/webp;', 'data:image/gif;']
+    .some(function(p){ return a.indexOf(p) === 0; });
 }
 
 function updateAvatarPreview(){
     const val=$('persona-avatar').value.trim();
-    $('persona-avatar-preview').innerHTML=val.startsWith('http')?\`<img src="\${esc(val)}"class="w-full h-full object-cover">\`:\`<span class="text-xl font-bold text-dim">\${esc(val.substring(0,2)||'AI')}</span>\`;
+    $('persona-avatar-preview').innerHTML=avImg(val)?\`<img src="\${esc(val)}"class="w-full h-full object-cover">\`:\`<span class="text-xl font-bold text-dim">\${esc(val.substring(0,2)||'AI')}</span>\`;
 }
 
 function populateMemoryForm(){
