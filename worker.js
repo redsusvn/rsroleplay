@@ -8,7 +8,7 @@ const SECURITY_HEADERS = {
   'X-Content-Type-Options':  'nosniff',
   'X-Frame-Options':         'DENY',
   'Referrer-Policy':         'strict-origin-when-cross-origin',
-  'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net https://unpkg.com https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com https://cdn.jsdelivr.net; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' https: wss:;"
+  'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com https://cdn.jsdelivr.net; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' https: wss:;"
 };
 
 
@@ -288,7 +288,7 @@ function cacheDrop(prefix) {
 }
 
 // Bumped on every deploy so browsers revalidate the HTML shell cheaply.
-const APP_BUILD = '2026-09-13-mfa1';
+const APP_BUILD = '2026-09-13-perf2';
 const HTML_CACHE_CONTROL = 'private, max-age=0, must-revalidate';
 let _hasUsers = false, _appHTML = null, _setupHTML = null;
 
@@ -456,7 +456,7 @@ const AUTH_TTL_MS = 30_000;
 
 async function auth(req, db) {
   const cookie = req.headers.get('Cookie') ?? '';
-  const match  = cookie.match(/aiphp_sess=([A-Za-z0-9\-]+)/);
+  const match  = cookie.match(/(?:^|;\s*)rsroleplay_sess=([A-Za-z0-9\-]+)/);
   if (!match) return null;
   const token = match[1];
   if (!/^[0-9a-f-]{36}$/i.test(token)) return null;
@@ -752,6 +752,37 @@ function isThinking(model) {
   return ['gemma-4', 'qwen3', 'deepseek-r1', 'gpt-oss', ':thinking', '-think'].some(x => m.includes(x));
 }
 
+// ── WHERE A KEY'S CHAT REQUESTS GO ────────────────────────────────
+// One answer for the chat path and the Test button. The Test button used to
+// carry its own copy of this list; the copy had no branch for imgxh, so testing
+// an imgxh key fetched a null URL - and it skipped the custom-URL checks below.
+function chatTarget(key) {
+  const p = key.provider;
+  if (p === 'cloudflare') return { url: `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(key.custom_url)}/ai/v1/chat/completions`, headers: {} };
+  if (p === 'groq')       return { url: 'https://api.groq.com/openai/v1/chat/completions', headers: {} };
+  if (p === 'mistral')    return { url: 'https://api.mistral.ai/v1/chat/completions', headers: {} };
+  if (p === 'gemini')     return { url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', headers: {} };
+  if (p === 'imgxh')      return { url: 'https://imgxh.eu.org/v1/chat/completions', headers: {} };
+  if (p === 'openrouter') return { url: 'https://openrouter.ai/api/v1/chat/completions', headers: { 'X-Title': 'RSROLEPLAY Engine' } };
+  if (p === 'custom') {
+    if (!key.custom_url) throw new Error('Custom provider requires a URL');
+    try {
+      const u = new URL(key.custom_url);
+      if (u.protocol !== 'https:') throw new Error('Custom URLs must use HTTPS');
+      // Block internal and reserved IP addresses
+      const h = u.hostname;
+      if (h === 'localhost' || h === '127.0.0.1' || h.startsWith('10.') ||
+          h.startsWith('192.168.') || h.startsWith('169.254.')) {
+        throw new Error('Local or Internal network requests are strictly forbidden.');
+      }
+    } catch (e) {
+      throw new Error('Invalid custom URL: ' + e.message);
+    }
+    return { url: key.custom_url, headers: {} };
+  }
+  throw new Error('Unknown provider: ' + p);
+}
+
 async function executeLLM(apiKeys, messages, mode, thinkingEffort, stream, signal, gen = null) {
   const effort = THINKING_EFFORTS.has(thinkingEffort) ? thinkingEffort : 'none';
   const g = gen ?? resolveGen(null);
@@ -785,46 +816,10 @@ let keys = apiKeys.filter(k => k.key_mode === mode).sort((a, b) => b.is_primary 
         'User-Agent':    'rsroleplay-worker/1.0',
       };
       
-      let url;
-
-      // ── 1. URL LOGIC ──
-      if (provider === 'cloudflare') {
-        // FIXED: Using the v1 completions URL required for newer Gemma models
-        url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(key.custom_url)}/ai/v1/chat/completions`;
-      } else {
-        if      (provider === 'groq')       url = 'https://api.groq.com/openai/v1/chat/completions';
-        else if (provider === 'mistral')    url = 'https://api.mistral.ai/v1/chat/completions';
-        else if (provider === 'gemini')     url = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
-        else if (provider === 'imgxh')      url = 'https://imgxh.eu.org/v1/chat/completions';
-        else if (provider === 'openrouter') {
-          url = 'https://openrouter.ai/api/v1/chat/completions';
-          headers['HTTP-Referer'] = 'http://localhost';
-          headers['X-Title']      = 'AIPHP-Worker';
-} else if (provider === 'custom') {
-  if (!key.custom_url) throw new Error('Custom provider requires a URL');
-  try {
-    const parsedUrl = new URL(key.custom_url);
-    if (parsedUrl.protocol !== 'https:') throw new Error('Custom URLs must use HTTPS');
-    
-    // Block internal and reserved IP addresses
-    const hostname = parsedUrl.hostname;
-    if (
-      hostname === 'localhost' || 
-      hostname === '127.0.0.1' || 
-      hostname.startsWith('10.') || 
-      hostname.startsWith('192.168.') || 
-      hostname.startsWith('169.254.')
-    ) {
-      throw new Error('Local or Internal network requests are strictly forbidden.');
-    }
-  } catch (e) {
-    throw new Error('Invalid custom URL: ' + e.message);
-  }
-  url = key.custom_url;
-} else {
-          throw new Error('Unknown provider: ' + provider);
-        }
-      }
+      // ── 1. URL LOGIC ── (shared with the Test button, see chatTarget)
+      const target = chatTarget(key);
+      let url = target.url;
+      Object.assign(headers, target.headers);
 
       // ── 2. MODEL ID LOGIC ──
       const modelId = (provider === 'cloudflare' && !key.model.startsWith('@cf/')) 
@@ -974,10 +969,14 @@ async function fetchModelList(provider, apiKey, customUrl) {
   let j; try { j = JSON.parse(raw); } catch { throw new Error('That endpoint did not return JSON'); }
 
   // OpenAI shape: {data:[{id}]}. Gemini native: {models:[{name:"models/x"}]}.
-  const list = Array.isArray(j.data) ? j.data.map(m => m.id)
-             : Array.isArray(j.models) ? j.models.map(m => String(m.name || '').replace(/^models\//, ''))
+  const list = Array.isArray(j.data) ? j.data.map(m => m && m.id)
+             : Array.isArray(j.models) ? j.models.map(m => String((m && m.name) || '').replace(/^models\//, ''))
              : [];
-  return { models: [...new Set(list.filter(Boolean))].sort() };
+  /* An id is shown and clicked in the browser, so only plain text gets out:
+     a number is written out, anything else is dropped, and nothing is longer
+     than a real model id. */
+  const ids = list.map(x => (typeof x === 'string' || typeof x === 'number') ? String(x).trim().slice(0, 200) : '');
+  return { models: [...new Set(ids.filter(Boolean))].sort() };
 }
 
 // -- HISTORY PAGING ---------------------------------------------------
@@ -1051,7 +1050,9 @@ const STREAM_TOTAL_MS      = 240_000; // hard ceiling on one generation, resumes
 const RESUME_SCAN_CHARS    = 400;     // how much of a resumed reply we inspect for overlap
 const FLUSH_MS             = 150;     // outbound frames are coalesced to this cadence...
 const FLUSH_CHARS          = 2048;    // ...or sooner once this much text is waiting
-const CHECKPOINT_MS        = 2000;    // partial reply -> database cadence
+const CHECKPOINT_MS        = 2000;    // partial reply -> database: the shortest gap...
+const CHECKPOINT_MAX_MS    = 25_000;  // ...the longest, well inside STALL_AFTER_MS...
+const CHECKPOINT_BUDGET    = 16;      // ...and how many one reply may write, at most
 const STALL_AFTER_MS       = 45_000;  // a 'running' row not checkpointed for this long is dead
 
 // Some providers simply never send [DONE] or a finish_reason. Reconnecting
@@ -1151,17 +1152,24 @@ function createUnifiedStream({ openStream, onFinish, onProgress = null, initial 
   }
 
   // -- checkpointing ------------------------------------------------------
-  let lastCkAt = 0, lastCkLen = -1, ckPromise = null;
+  let lastCkAt = 0, lastCkLen = -1, ckPromise = null, ckStart = 0, ckCount = 0;
   const compose = (body) => reasoning ? '<think>\n' + reasoning + '\n</think>\n\n' + body : body;
   function maybeCheckpoint() {
-    if (!onProgress || ckPromise) return;
+    if (!onProgress || ckPromise || ckCount >= CHECKPOINT_BUDGET) return;
     const now = Date.now();
-    // Nobody is watching once the browser is gone, so checkpoint more often:
-    // it is the only thing standing between the reply and a kill.
-    if (now - lastCkAt < (clientGone ? CHECKPOINT_MS / 2 : CHECKPOINT_MS)) return;
+    /* Every checkpoint is two D1 statements, and the Free plan allows 50 per
+       request, the final save included. At a flat 2s (1s once the tab had
+       closed) a long reply used them all up part-way, and then the final save
+       failed too. The gap now widens as the reply goes on: 2s at first, then a
+       third of the time elapsed, at most 25s so a browser following along
+       still sees it alive (STALL_AFTER_MS). The longest reply allowed, four
+       minutes, comes to 16 checkpoints; CHECKPOINT_BUDGET holds it there. */
+    if (!ckStart) ckStart = now;
+    const gap = Math.min(CHECKPOINT_MAX_MS, Math.max(CHECKPOINT_MS, (now - ckStart) / 3));
+    if (now - lastCkAt < gap) return;
     const len = content.length + reasoning.length;
     if (len === lastCkLen || len === 0) return;
-    lastCkAt = now; lastCkLen = len;
+    lastCkAt = now; lastCkLen = len; ckCount++;
     // Not awaited: a database round trip must never stall the provider read.
     ckPromise = Promise.resolve().then(() => onProgress(compose(content))).catch(() => {}).then(() => { ckPromise = null; });
   }
@@ -1495,9 +1503,10 @@ async function reserveTurn(db, sid, content) {
   return { user_id: userId, bot_id: botId, group_id: groupId };
 }
 
-// Partial reply -> database. Runs every CHECKPOINT_MS while streaming, so a
-// Worker stopped mid-reply (CPU limit, eviction, the tab closing and waitUntil
-// running out) loses at most a couple of seconds of text.
+// Partial reply -> database, a handful of times while the reply streams (see
+// maybeCheckpoint for when), so a Worker stopped mid-reply (CPU limit,
+// eviction, the tab closing and waitUntil running out) loses only the text
+// written since the last one.
 function checkpointReply(db, botId, text) {
   return db.d1.batch([
     db.d1.prepare('UPDATE chat_history SET content = ? WHERE id = ?').bind(text, botId),
@@ -1866,7 +1875,7 @@ export default {
         expires_at: Date.now() + 30 * 24 * 60 * 60 * 1000, created_at: Date.now(),
       });
       return jsonResponse({ success: true, csrf_token, username: user.username }, 200, {
-        'Set-Cookie': `aiphp_sess=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${30 * 24 * 3600}`,
+        'Set-Cookie': `rsroleplay_sess=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${30 * 24 * 3600}`,
       });
     }
 
@@ -2011,7 +2020,7 @@ case 'logout': {
           await db.delete('user_sessions', { user_id: userId });
           cacheDrop('auth:');
           return jsonResponse({ success: true }, 200, {
-            'Set-Cookie': 'aiphpcase_sess=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0',
+            'Set-Cookie': 'rsroleplay_sess=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0',
           });
         }
 
@@ -2369,22 +2378,20 @@ case 'testKey': {
           const k = await db.findOne('api_keys', { id });
           if (!k) return errResponse('Key not found', 404);
 
-          let url;
-          if (k.provider === 'cloudflare') url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(k.custom_url)}/ai/v1/chat/completions`;
-          else if (k.provider === 'groq') url = 'https://api.groq.com/openai/v1/chat/completions';
-          else if (k.provider === 'mistral') url = 'https://api.mistral.ai/v1/chat/completions';
-          else if (k.provider === 'gemini') url = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
-          else if (k.provider === 'openrouter') url = 'https://openrouter.ai/api/v1/chat/completions';
-          else url = k.custom_url;
+          let target;
+          try { target = chatTarget(k); }
+          catch (e) { return jsonResponse({ ok: false, error: e.message.substring(0, 200) }); }
 
           const modelId = (k.provider === 'cloudflare' && !k.model.startsWith('@cf/')) ? `@cf/${k.model}` : k.model;
 
           try {
-            const res = await fetch(url, {
+            const res = await fetch(target.url, {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${k.api_key ?? ''}`,
+                'User-Agent':    'rsroleplay-worker/1.0',
+                ...target.headers,
                 
               },
               body: JSON.stringify({
@@ -2506,7 +2513,7 @@ case 'testKey': {
           
           // NEW: Clear the cookie so the current browser drops the session immediately
           return jsonResponse({ success: true }, 200, {
-             'Set-Cookie': 'aiphp_sess=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0',
+             'Set-Cookie': 'rsroleplay_sess=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0',
           });
         }
 
@@ -2588,11 +2595,13 @@ case 'testKey': {
             const sessionId = str(body.session_id, 100);
             if (!sessionId) return errResponse('Invalid session_id');
             if (sessionId === 'default') return errResponse('Cannot delete default session');
-            await Promise.all([
-              db.run('DELETE FROM chat_history WHERE session_id = ?',  [sessionId]),
-              db.run('DELETE FROM memory_state  WHERE session_id = ?', [sessionId]),
-              db.run('DELETE FROM sketchboard   WHERE session_id = ?', [sessionId]),
-              db.delete('chat_sessions', { id: sessionId }),
+            /* One batch is one transaction: a failure part-way used to leave messages
+               or pins behind for a chat that no longer existed. */
+            await db.d1.batch([
+              db.d1.prepare('DELETE FROM chat_history WHERE session_id = ?').bind(sessionId),
+              db.d1.prepare('DELETE FROM memory_state WHERE session_id = ?').bind(sessionId),
+              db.d1.prepare('DELETE FROM sketchboard WHERE session_id = ?').bind(sessionId),
+              db.d1.prepare('DELETE FROM chat_sessions WHERE id = ?').bind(sessionId),
             ]);
             cacheDrop('shape:' + sessionId);
             return jsonResponse({ success: true });
@@ -2611,19 +2620,43 @@ case 'testKey': {
         case 'importData': {
           if (typeof body.data !== 'string') return errResponse('Invalid data');
           if (body.data.length > 500_000)    return errResponse('Import too large', 413);
+          /* One D1 query per message used to hit the Free plan's 50-per-request
+             limit, so a long Character.AI export stopped part-way and left half a
+             chat behind. Rows now ride in as one JSON value per statement
+             (INSERT ... SELECT FROM json_each), and every statement goes in one
+             batch: 2-3 statements for the largest file accepted here, and a
+             batch is all-or-nothing. Ids are one random prefix plus a counter,
+             not a UUID per row - that is most of the CPU a big file used to cost. */
           const regex = /\{(user|bot)\}\s*([\s\S]*?)\s*\{\/(user|bot)\}/g;
-          let match, cnt = 0;
-          while ((match = regex.exec(body.data)) !== null && cnt < 2000) {
+          const rows = [];
+          const idBase = generateId(), t0 = Date.now();
+          let match;
+          while ((match = regex.exec(body.data)) !== null && rows.length < 2000) {
             if (match[1] !== match[3]) continue;
-            const content = match[2].trim().substring(0, 2000089769876987698769876);
+            const content = match[2].trim();
             if (!content) continue;
-            await db.insert('chat_history', {
-              id: generateId(), session_id: sid, group_id: 'g_' + generateId(),
-              is_main: 1, role: match[1], content, timestamp: Date.now() + cnt,
-            });
-            cnt++;
+            const n = rows.length.toString(36).padStart(4, '0');
+            rows.push([idBase + '-' + n, 'g_' + idBase + '-' + n, match[1], content, t0 + rows.length]);
           }
-          return jsonResponse({ success: true, imported: cnt });
+          if (!rows.length) return jsonResponse({ success: true, imported: 0 });
+          const ins = db.d1.prepare(
+            'INSERT INTO chat_history (id, session_id, group_id, is_main, role, content, timestamp) ' +
+            "SELECT json_extract(value, '$[0]'), ?, json_extract(value, '$[1]'), 1, " +
+            "json_extract(value, '$[2]'), json_extract(value, '$[3]'), json_extract(value, '$[4]') " +
+            'FROM json_each(?)');
+          // well under D1's 2 MB per value even if every character is 3 bytes
+          const stmts = [];
+          let chunk = [], size = 0;
+          for (const r of rows) {
+            if (chunk.length && size + r[3].length > 400_000) {
+              stmts.push(ins.bind(sid, JSON.stringify(chunk)));
+              chunk = []; size = 0;
+            }
+            chunk.push(r); size += r[3].length + 64;
+          }
+          stmts.push(ins.bind(sid, JSON.stringify(chunk)));
+          await db.d1.batch(stmts);
+          return jsonResponse({ success: true, imported: rows.length });
         }
 
         case 'nukeServer': {
@@ -2632,23 +2665,26 @@ case 'testKey': {
           if (!pass) return errResponse('Password required');
           if (!(await verifyPassword(pass, user.password_hash, user.salt))) return errResponse('Wrong password', 403);
 
-          await Promise.all([
-            db.run('DELETE FROM chat_history'),
-            db.run('DELETE FROM memory_state'),
-            db.run('DELETE FROM sketchboard'),
-            db.run('DELETE FROM personas'),
-            db.run('DELETE FROM api_keys'),
-            db.run('DELETE FROM ip_blocks'),
-            db.run('DELETE FROM chat_sessions'),
-            db.run('DELETE FROM user_sessions'),
+          /* One batch: one D1 call instead of eight, and all-or-nothing. The
+             DELETEs used to run side by side with no transaction, so one failing
+             part-way could leave the keys gone and the chats still there. The
+             account is scrambled in the same transaction. */
+          const { hash, salt } = await pbkdf2(crypto.randomUUID());
+          await db.d1.batch([
+            db.d1.prepare('DELETE FROM chat_history'),
+            db.d1.prepare('DELETE FROM memory_state'),
+            db.d1.prepare('DELETE FROM sketchboard'),
+            db.d1.prepare('DELETE FROM personas'),
+            db.d1.prepare('DELETE FROM api_keys'),
+            db.d1.prepare('DELETE FROM ip_blocks'),
+            db.d1.prepare('DELETE FROM chat_sessions'),
+            db.d1.prepare('DELETE FROM user_sessions'),
+            db.d1.prepare('UPDATE users SET username = ?, password_hash = ?, salt = ? WHERE id = ?')
+              .bind(crypto.randomUUID().substring(0, 8), hash, salt, userId),
           ]);
           _cache.clear();
-          const { hash, salt } = await pbkdf2(crypto.randomUUID());
-          await db.update('users', { id: userId }, {
-            username: crypto.randomUUID().substring(0, 8), password_hash: hash, salt,
-          });
           return jsonResponse({ success: true }, 200, {
-            'Set-Cookie': 'aiphp_sess=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0',
+            'Set-Cookie': 'rsroleplay_sess=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0',
           });
         }
 
@@ -7660,7 +7696,7 @@ window.APP_V='${APP_BUILD}';
     d.dataset.skin    = g('rp_skin','graphite');
     d.dataset.layout  = g('rp_layout','studio');
     d.dataset.density = g('rp_density','comfortable');
-    if(g('aiphp_theme','light')==='dark') d.classList.add('dark');
+    if(g('rsroleplay_theme','light')==='dark') d.classList.add('dark');
     var u=localStorage.getItem('rp_ui');
     if(u){ u=JSON.parse(u); var s=d.style;
       /* what was in effect last time, flattened by the app on every change */
@@ -8634,8 +8670,8 @@ async function pullPrefs(){
   if(p.layout)  { el.dataset.layout = p.layout;   setCookie('rp_layout', p.layout); }
   if(p.density) { el.dataset.density = p.density; setCookie('rp_density', p.density); }
   el.classList.toggle('dark', !!p.dark);
-  setCookie('aiphp_theme', p.dark ? 'dark' : 'light');
-  localStorage.setItem('aiphp_theme', p.dark ? 'dark' : 'light');
+  setCookie('rsroleplay_theme', p.dark ? 'dark' : 'light');
+  localStorage.setItem('rsroleplay_theme', p.dark ? 'dark' : 'light');
 
   _prefsAt = d.updated_at;
   localStorage.setItem('rp_ui_at', String(_prefsAt));
@@ -8772,6 +8808,14 @@ function cssUrl(u){
   }catch(e){ return ''; }
 }
 
+/* How long to wait between repaints of a reply that is still arriving. Every
+   repaint parses the whole message again - markdown, sanitiser, DOM - so its
+   cost grows with the reply. The server sends a frame every 150ms at most, so
+   up to about 6,000 characters every frame is still painted, as before; past
+   that the gap widens to at most 400ms, which keeps a phone responsive on a
+   very long reply. The final repaint is never delayed. */
+function renderGap(len){ return Math.min(400, 90 + len / 100); }
+
 function formatContent(rawText) {
     if (!rawText) return '';
     /* KaTeX is not loaded until a message needs it. When one does, fetch it and
@@ -8816,7 +8860,11 @@ function formatContent(rawText) {
     const preBlocks = tempDiv.querySelectorAll('pre');
     preBlocks.forEach((pre) => {
         const codeEl = pre.querySelector('code');
-        const lang = (codeEl && codeEl.className) ? codeEl.className.replace('language-', '') : 'code';
+        /* The language name is whatever the model wrote after the opening fence.
+           marked escapes it into the class attribute, but className reads it
+           back decoded - and it lands in innerHTML below, after the sanitiser
+           has already run. Escaped here, where it is used. */
+        const lang = esc(((codeEl && codeEl.className) ? codeEl.className.replace('language-', '') : 'code').slice(0, 40));
 
         const wrapper = document.createElement('div');
         wrapper.className = 'code-block-wrapper relative my-4 rounded-lg overflow-hidden border border-[rgba(127,127,127,0.12)] bg-[rgba(127,127,127,0.05)]';
@@ -8939,7 +8987,7 @@ function toggleSketchboard(){
 }
 
 document.addEventListener('DOMContentLoaded', async ()=>{
-    if(document.cookie.includes('aiphp_theme=dark'))applyTheme(true);
+    if(document.cookie.includes('rsroleplay_theme=dark'))applyTheme(true);
     lucide.createIcons();
     const ta=$('chat-input');
     // PERF FIX 5: coalesce the textarea auto-resize to at most once per animation frame
@@ -9313,7 +9361,7 @@ for await (const data of parseStream(resp)) {
             if (data.chunk) fullText += data.chunk;
 
             const _now = performance.now();
-            if (data.done || _now - lastRender > 90) {
+            if (data.done || _now - lastRender > renderGap(fullText.length + fullReasoning.length)) {
                 lastRender = _now;
                 if (fullText.trim()) {
                     // Answer text has started — render the real content (thought box stays collapsed)
@@ -11880,7 +11928,7 @@ function renderBubbleTab(){
         oninput="_bubQuery=this.value;renderBubbleGrid()"
         class="w-full bg-transparent border border-line rounded-lg px-3 py-2 text-sm outline-none focus:border-accent mb-2">
       <div class="flex gap-1.5 overflow-x-auto pb-1 mb-2" id="bub-cats">
-        \${cats.map(c=>\`<button onclick="_bubCat='\${c.replace(/'/g,"\\\\'")}';renderBubbleTabs()"
+        \${cats.map(c=>\`<button onclick="_bubCat='\${escJs(c)}';renderBubbleTabs()"
           class="chip \${c===_bubCat?'is-on':''}">\${c===BUB_ALL?c:c.replace(/^\\d+\\.\\s*/,'')}</button>\`).join('')}
       </div>
       <div id="bub-grid" onmouseleave="unpeekBubble()">\${cards}</div>
@@ -12651,7 +12699,7 @@ async function openModelPicker(){
       id: $('key-edit-id').value || null,
     });
     if (!r || r.error) throw new Error((r && r.error) || 'Could not read the model list');
-    _models = r.models || [];
+    _models = (Array.isArray(r.models) ? r.models : []).filter(m => typeof m === 'string' && m);
     if (!_models.length){ toast(r.note || 'That provider returned no models', 5000); return; }
     box.classList.remove('hf');
     $('model-search').value = '';
@@ -12665,7 +12713,7 @@ function filterModels(){
   const q = $('model-search').value.trim().toLowerCase();
   const hit = q ? _models.filter(m => m.toLowerCase().includes(q)) : _models;
   $('model-list').innerHTML = hit.length
-    ? hit.slice(0, 300).map(m => \`<button type="button" onclick="chooseModel('\${m.replace(/'/g,"\\\\'")}')" class="w-full text-left px-3 py-2 text-sm hover:bg-surface-2 border-b border-line last:border-0 font-mono">\${esc(m)}</button>\`).join('')
+    ? hit.slice(0, 300).map(m => \`<button type="button" data-model="\${esc(m)}" onclick="chooseModel(this.dataset.model)" class="w-full text-left px-3 py-2 text-sm hover:bg-surface-2 border-b border-line last:border-0 font-mono">\${esc(m)}</button>\`).join('')
     : \`<p class="px-3 py-3 text-xs text-dim">Nothing matches "\${esc(q)}"</p>\`;
 }
 function chooseModel(id){
@@ -12737,7 +12785,7 @@ async function regenVariant(msgId,groupId){
             display = fullText;
             if (fullReasoning) display = \`<think>\\n\${fullReasoning}\\n</think>\\n\\n\${fullText}\`;
             const _now = performance.now();
-            if(ci && (data.done || _now - lastRender > 90)){ lastRender = _now; ci.innerHTML = formatContent(display); }
+            if(ci && (data.done || _now - lastRender > renderGap(display.length))){ lastRender = _now; ci.innerHTML = formatContent(display); }
 
             if (data.done) {
                 if (data.partial) toast('The AI connection dropped — the part that arrived was saved.', 6000);
@@ -13718,7 +13766,7 @@ function toggleTheme(){
   const restore=()=>root.classList.remove('rp-no-transition');
   requestAnimationFrame(()=>requestAnimationFrame(restore));
   setTimeout(restore,120);
-  document.cookie=\`aiphp_theme=\${d?'dark':'light'}; path=/; max-age=31536000\`;
+  document.cookie=\`rsroleplay_theme=\${d?'dark':'light'}; path=/; max-age=31536000\`;
 }
 </script>
 <script>
