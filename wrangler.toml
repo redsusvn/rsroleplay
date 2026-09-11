@@ -1,0 +1,43 @@
+# RSROLEPLAY Engine — Cloudflare Workers (Free plan)
+#
+# Deploy with:   npx wrangler deploy
+# First time:    npx wrangler login
+#
+# Everything here is available on the Free plan. The one setting that matters
+# most is the Durable Object: the Worker itself gets 10 ms of CPU per request,
+# which a long streamed reply exceeds and gets killed for ("Worker exceeded
+# CPU time limit" in the logs). A SQLite-backed Durable Object gets 30 s, so
+# the generation runs inside one and the Worker only pipes the bytes through.
+# Without this binding the app still works - it streams from the Worker with
+# the 10 ms budget - but long replies can be cut off.
+
+name = "roleplay"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+
+# Run the Worker near D1 and the AI providers rather than near the phone: every
+# message is several round trips to both, and this takes the phone's latency
+# out of all of them.
+[placement]
+mode = "smart"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "sdfiugisdf"
+database_id = "eb72c272-1807-4ae6-8650-bc2f1e760f6d"
+
+# The streaming engine (see `export class ChatStreamer` in worker.js).
+[[durable_objects.bindings]]
+name = "STREAMER"
+class_name = "ChatStreamer"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ChatStreamer"]   # SQLite-backed = the kind the Free plan allows
+
+# Daily housekeeping: expired logins, finished generation markers, old IP blocks.
+[triggers]
+crons = ["0 4 * * *"]
+
+[observability]
+enabled = true
