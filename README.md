@@ -14,7 +14,7 @@ A lightning-fast, fully serverless AI roleplay platform powered by **Cloudflare 
 
 ### Replies you can rely on
 - **⚡ 100% Serverless:** Runs entirely on Cloudflare's Edge (Workers + D1 + Durable Objects). No VPS, no backend. Everything fits in the **Free** plan.
-- **🛡️ Replies that can't get lost:** Your message is saved *before* the AI is called, and the reply is written to the database every 2 seconds while it streams. Close the tab, lose signal, switch apps — when you come back the reply is there (or still growing, and the page follows it live).
+- **🛡️ Replies that can't get lost:** Your message is saved *before* the AI is called, and the reply is written to the database while it streams — every couple of seconds at first, then further apart (never more than 25 s), so even a four-minute reply stays inside the Free plan's database limit. Close the tab, lose signal, switch apps — when you come back the reply is there (or still growing, and the page follows it live).
 - **🔁 Auto-resume:** If the AI provider drops the connection mid-reply, the server reconnects and asks the model to continue from exactly where it stopped, stitching the halves together.
 - **🧠 Thinking models:** Native support for reasoning models (DeepSeek R1, Qwen3, Gemma/Gemini `<thought>` output) with an expandable **Thought Process** block.
 - **🔌 Multi-provider:** Groq, OpenRouter, Mistral, Cloudflare AI, Gemini, or any OpenAI-compatible endpoint. **Browse** lists a provider's models so you don't have to type IDs, and **Test** checks an endpoint before you rely on it.
