@@ -1,41 +1,52 @@
-# RSROLEPLAY Engine — Cloudflare Workers (Free plan)
+# RSROLEPLAY Engine — Cloudflare Workers (gói Free)
 #
-# Deploy with:   npx wrangler deploy
-# First time:    npx wrangler login
+# Cách nhanh nhất: bấm nút "Deploy to Cloudflare" trong README. Cloudflare đọc
+# đúng tệp này, tự tạo cơ sở dữ liệu D1 và Durable Object, rồi điền lại mã của
+# chúng vào đây trong bản sao repo của người bấm. Không phải điền gì thêm: cả
+# ứng dụng chỉ cần hai thứ đó, không có khoá bí mật nào.
 #
-# Everything here is available on the Free plan. The one setting that matters
-# most is the Durable Object: the Worker itself gets 10 ms of CPU per request,
-# which a long streamed reply exceeds and gets killed for ("Worker exceeded
-# CPU time limit" in the logs). A SQLite-backed Durable Object gets 30 s, so
-# the generation runs inside one and the Worker only pipes the bytes through.
-# Without this binding the app still works - it streams from the Worker with
-# the 10 ms budget - but long replies can be cut off.
+# Cách thủ công:
+#   npx wrangler login
+#   npx wrangler d1 create rsroleplay-db     # chép mã nhận được vào database_id
+#   npx wrangler deploy
+#
+# Bảng biểu trong D1 do chính ứng dụng tạo ở lần chạy đầu (xem SCHEMA_SQL trong
+# worker.js), nên không có bước migration nào phải chạy tay.
 
-name = "roleplay"
+name = "rsroleplay"
 main = "worker.js"
 compatibility_date = "2026-09-01"
 
-# Run the Worker near D1 and the AI providers rather than near the phone: every
-# message is several round trips to both, and this takes the phone's latency
-# out of all of them.
+# Chạy Worker gần D1 và gần nhà cung cấp AI, thay vì gần điện thoại: mỗi tin
+# nhắn là vài vòng đi về tới cả hai, và cách này bỏ được độ trễ của điện thoại
+# ra khỏi tất cả các vòng đó.
 [placement]
 mode = "smart"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "sdfiugisdf"
-database_id = "eb72c272-1807-4ae6-8650-bc2f1e760f6d"
+database_name = "rsroleplay-db"
+# Mã dưới đây chỉ là chỗ giữ chỗ. Nút Deploy sẽ thay bằng mã của cơ sở dữ liệu
+# mới tạo. Nếu cài thủ công thì thay bằng mã mà lệnh `wrangler d1 create` in ra.
+database_id = "00000000-0000-0000-0000-000000000000"
 
-# The streaming engine (see `export class ChatStreamer` in worker.js).
+# Bộ máy sinh nội dung (xem `export class ChatStreamer` trong worker.js).
+#
+# Đây là thứ đáng giá nhất trong tệp này. Worker chỉ được 10 mili giây CPU mỗi
+# request, một câu trả lời dài vượt qua mức đó và bị giết ("Worker exceeded CPU
+# time limit" trong log). Durable Object kiểu SQLite được 30 giây, nên phần sinh
+# nội dung chạy trong đó còn Worker chỉ làm ống dẫn. Thiếu ràng buộc này ứng
+# dụng vẫn chạy, nhưng câu trả lời dài có thể bị cắt.
 [[durable_objects.bindings]]
 name = "STREAMER"
 class_name = "ChatStreamer"
 
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["ChatStreamer"]   # SQLite-backed = the kind the Free plan allows
+new_sqlite_classes = ["ChatStreamer"]   # kiểu SQLite - loại mà gói Free cho phép
 
-# Daily housekeeping: expired logins, finished generation markers, old IP blocks.
+# Dọn dẹp hằng ngày: phiên đăng nhập hết hạn, dấu vết sinh nội dung đã xong,
+# các chặn IP cũ.
 [triggers]
 crons = ["0 4 * * *"]
 
