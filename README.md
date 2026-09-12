@@ -6,6 +6,11 @@ Nền tảng roleplay với AI, chạy hoàn toàn serverless trên **Cloudflare
 
 **Làm bởi / Built by [@redsus.vn](https://miku.us.kg) · TikTok: [@redsusvn](https://www.tiktok.com/@redsusvn)**
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/redsusvn/rsroleplay)
+
+Bấm nút trên là Cloudflare tự tạo Worker, cơ sở dữ liệu và Durable Object rồi cài đặt hết — không cần cài gì vào máy, không phải điền khoá nào.
+*One click. Cloudflare creates the Worker, the database and the Durable Object for you — nothing to install, nothing to fill in.*
+
 📖 [Tiếng Việt](#-tiếng-việt) · [English](#-english)
 
 ---
@@ -67,7 +72,7 @@ Nền tảng roleplay với AI, chạy hoàn toàn serverless trên **Cloudflare
 
 ## 🛠️ Hướng dẫn cài đặt
 
-Có hai cách. **Nên dùng Cách A** — đó là cách thẳng nhất để có Durable Object, thứ giúp câu trả lời dài chạy ổn trên gói Free. Cách B không cần cài gì vào máy, và phần còn thiếu thì có script Colab lo nốt.
+Có ba cách. **Nhanh nhất là bấm nút ngay dưới đây** — Cloudflare làm hết. Cách A dành cho ai muốn tự chủ hoàn toàn từ máy mình. Cách B dành cho ai không muốn cài gì vào máy và làm mọi thứ trên trang quản trị.
 
 ### Cần chuẩn bị
 - Một tài khoản [Cloudflare](https://dash.cloudflare.com) (gói Free là đủ).
@@ -76,7 +81,26 @@ Có hai cách. **Nên dùng Cách A** — đó là cách thẳng nhất để c�
 
 ---
 
-### Cách A — Khuyên dùng: deploy bằng `wrangler` (khoảng 10 phút)
+### ⚡ Cách nhanh nhất — bấm một nút (khoảng 2 phút)
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/redsusvn/rsroleplay)
+
+Bấm vào đó rồi đăng nhập Cloudflare. Cloudflare sẽ tự:
+
+1. sao chép mã nguồn về tài khoản GitHub của bạn,
+2. tạo một **cơ sở dữ liệu D1** mới,
+3. tạo **Durable Object** `ChatStreamer` (thứ giúp câu trả lời dài không bị cắt),
+4. deploy Worker và đưa bạn đường dẫn để mở.
+
+Không phải điền khoá bí mật nào — cả ứng dụng chỉ cần hai thứ ở trên. Mở đường dẫn vừa nhận được là tới ngay màn hình tạo tài khoản quản trị (xem [Lần đầu chạy](#lần-đầu-chạy--tài-khoản-quản-trị)).
+
+Về sau muốn cập nhật thì vào bản sao repo của mình trên GitHub, thay `worker.js` bằng bản mới rồi commit — Cloudflare tự deploy lại.
+
+> Bảng biểu trong cơ sở dữ liệu do chính ứng dụng tạo ở lần chạy đầu, nên không có bước migration nào phải chạy tay.
+
+---
+
+### Cách A — Tự deploy bằng `wrangler` (khoảng 10 phút)
 
 > **Vì sao quan trọng:** một Worker thường trên gói Free chỉ được **10 mili giây CPU mỗi request**, mà một câu trả lời dài thì vượt quá — Cloudflare cắt ngang giữa chừng. Nên engine này chạy mỗi câu trả lời bên trong một **Durable Object**, thứ được **30 giây CPU** và chạy tiếp cả sau khi bạn đóng trang. Durable Object chỉ sinh ra được bằng một *migration*, mà trang quản trị không chạy được — `wrangler` thì có.
 
@@ -374,7 +398,7 @@ Nếu bot bắt đầu đãng trí, vào **Quy tắc ghi nhớ**. Chỉnh ngư�
 
 ## 🛠️ Installation Guide
 
-There are two ways to install. **Method A is the one to use** — it is the only way to get the Durable Object that makes long replies reliable on the Free plan. Method B needs nothing installed but is limited (see the note at the end of it).
+There are three ways to install. **The fastest is the button below** — Cloudflare does everything. Method A is for doing it yourself from your own machine. Method B is for installing nothing locally and working entirely in the dashboard.
 
 ### Prerequisites
 - A [Cloudflare](https://dash.cloudflare.com) account (Free tier is perfect).
@@ -383,7 +407,26 @@ There are two ways to install. **Method A is the one to use** — it is the only
 
 ---
 
-### Method A — Recommended: deploy with `wrangler` (≈10 minutes)
+### ⚡ Fastest — one button (≈2 minutes)
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/redsusvn/rsroleplay)
+
+Click it and sign in to Cloudflare. Cloudflare then:
+
+1. copies the source into your own GitHub account,
+2. creates a fresh **D1 database**,
+3. creates the `ChatStreamer` **Durable Object** (what keeps long replies from being cut off),
+4. deploys the Worker and hands you the URL.
+
+There is no secret to fill in — the whole app needs only those two bindings. Open the URL and you land on the admin-account screen (see [First run](#first-time-setup--admin-account)).
+
+To update later, replace `worker.js` in your copy of the repository and commit — Cloudflare redeploys on its own.
+
+> The database tables are created by the app itself on first run, so there is no migration step to run by hand.
+
+---
+
+### Method A — Deploy it yourself with `wrangler` (≈10 minutes)
 
 > **Why this matters:** a plain Worker on the Free plan gets only **10 ms of CPU per request**, which a long streamed reply exceeds — Cloudflare then kills the request mid-reply. The engine therefore runs each reply inside a **Durable Object**, which gets **30 s of CPU** and keeps running after you close the page. A Durable Object can only be created by a *migration*, which the dashboard cannot do — `wrangler` can.
 
