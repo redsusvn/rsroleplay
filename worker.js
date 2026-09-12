@@ -288,7 +288,7 @@ function cacheDrop(prefix) {
 }
 
 // Bumped on every deploy so browsers revalidate the HTML shell cheaply.
-const APP_BUILD = '2026-09-13-i18n13';
+const APP_BUILD = '2026-09-13-geo3';
 const HTML_CACHE_CONTROL = 'private, max-age=0, must-revalidate';
 let _hasUsers = false, _appHTML = null, _setupHTML = null;
 
@@ -301,6 +301,12 @@ const SSE_HEADERS = {
 };
 
 // Sent when a dropped upstream stream is reconnected mid-reply.
+/* Worker và Durable Object đều nhận env ngay ở cửa vào. Giữ lại một tham chiếu
+   để những hàm gọi nhà cung cấp nằm sâu bên trong với tới được STREAMER, thay
+   vì xâu env qua mười tầng tham số. Trong cùng một isolate env là một và chỉ
+   một, không có chuyện lẫn của người này sang người kia. */
+let ENV = null;
+
 const CONTINUE_PROMPT = 'Your previous reply was cut off part-way through by a network error. Continue it from exactly where it stopped. Do not repeat any text you already wrote, do not restate, do not apologise, do not add a preamble - output only the remaining part of that reply.';
 
 // Bump this whenever SCHEMA_SQL changes; existing databases pick the change up
@@ -701,8 +707,69 @@ async function loadKeysAndGen(db) {
 // How long we wait for an upstream provider to send response HEADERS. Once the
 // body starts streaming the abort is cleared and the stream layer's own stall
 // watchdog takes over, so a slow generation is never cut short.
-const LLM_HEADER_TIMEOUT_MS = 30_000;
+/* Chờ header của nhà cung cấp. Gemini với ngữ cảnh dài hoặc model biết suy
+   luận thường mất 30-50 giây mới gửi byte đầu, nên mốc 30 giây cũ cắt ngang
+   những câu trả lời hoàn toàn bình thường. Vẫn để dưới STREAM_FIRST_BYTE_MS
+   (90s) để tầng stream mới là chỗ quyết định cuối cùng. */
+const LLM_HEADER_TIMEOUT_MS = 60_000;
 const LLM_TOTAL_TIMEOUT_MS  = 120_000; // non-streaming calls (summarize)
+
+/* Thử lại những lỗi đáng thử lại: hết giờ khi chưa nhận được byte nào, 429,
+   hoặc 5xx. Lỗi 4xx thì không - request sai thì gửi lại vẫn sai y hệt.
+
+   Ba lần, nghỉ 1.2 giây rồi 3 giây. Con số lấy từ đo đạc chứ không phải đoán:
+   một model gemini đang bận trả "high demand" chỉ sau khoảng hai giây, và
+   thường rảnh lại trong vài giây kế tiếp. Một lần thử lại là không đủ.
+
+   Ở đây chưa có chữ nào được stream về máy người dùng nên gửi lại là an toàn,
+   không thể nhân đôi nội dung. Thân của lần hỏng phải được huỷ, nếu không kết
+   nối đó vẫn bị giữ và tính vào giới hạn sáu kết nối đồng thời của Worker. */
+const LLM_RETRY_WAITS = [1200, 3000];
+
+/* Một lỗi 429 có hai loại rất khác nhau, và Google nói rõ loại nào trong thân
+   lỗi. Hết lượt trong PHÚT thì chờ vài giây là qua. Hết lượt trong NGÀY thì
+   thử lại không bao giờ thành công - mà lại tốn thêm lượt, trong khi gói miễn
+   phí chỉ cho hai mươi lượt một ngày trên vài model. Đo trực tiếp trên API:
+   quotaId "GenerateRequestsPerDayPerProjectPerModel-FreeTier", quotaValue 20. */
+function hetLuotCaNgay(text) {
+  return /PerDay|per day|daily limit|quota.{0,40}today/i.test(text || '');
+}
+
+async function fetchLLM(url, init, ms, signal) {
+  for (let lan = 0; ; lan++) {
+    const nghi = LLM_RETRY_WAITS[lan];
+    try {
+      const res = await fetchWithTimeout(url, init, ms, signal);
+      /* Bị chặn vì vị trí thì hỏi lại từ vùng khác, ngay trên đường mà mọi tin
+         nhắn đi qua. Chỉ lỗi này mới đi vòng: nhà cung cấp khác không bao giờ
+         trả lỗi này nên không ai phải chịu thêm chặng đường vô ích. Chưa có
+         chữ nào chảy về máy người dùng nên gửi lại là an toàn. */
+      if (!res.ok && (res.status === 400 || res.status === 403)) {
+        const raw = await readBodyWithTimeout(res, ERROR_BODY_TIMEOUT_MS).catch(() => '');
+        const vong = await thuLaiTuVungKhac(null, url, init, ms, raw);
+        return vong || new Response(raw, { status: res.status });
+      }
+      if (nghi !== undefined && (res.status === 429 || res.status >= 500)) {
+        if (res.status === 429) {
+          // Thân lỗi phải đọc mới biết nên chờ hay nên bỏ cuộc; đọc xong thì
+          // dựng lại Response để chỗ gọi vẫn lấy được nguyên văn của Google.
+          let text = '';
+          try { text = await readBodyWithTimeout(res, ERROR_BODY_TIMEOUT_MS); } catch {}
+          if (hetLuotCaNgay(text)) return new Response(text, { status: 429 });
+          await new Promise(r => setTimeout(r, nghi));
+          continue;
+        }
+        try { await res.body?.cancel(); } catch {}
+        await new Promise(r => setTimeout(r, nghi));
+        continue;
+      }
+      return res;
+    } catch (e) {
+      if (nghi === undefined || (signal && signal.aborted)) throw e;
+      await new Promise(r => setTimeout(r, nghi));
+    }
+  }
+}
 
 async function fetchWithTimeout(url, init, ms, extSignal) {
   const ac = new AbortController();
@@ -747,6 +814,51 @@ async function readBodyWithTimeout(res, ms) {
 // to stall the failover to the next key.
 const ERROR_BODY_TIMEOUT_MS = 10_000;
 
+/* Google từ chối Gemini API theo vị trí máy gửi request; Hong Kong nằm ngoài
+   danh sách được phép. Worker chạy tại colo mà trình duyệt vào, mà Cloudflare
+   đưa khách Việt Nam qua Hong Kong khoảng một nửa số lần - nên cùng một khoá
+   lúc dùng được lúc không, không theo quy luật nào nhìn thấy được. */
+function laLoiViTri(text) {
+  return /User location is not supported|FAILED_PRECONDITION/i.test(text || '');
+}
+
+/* Durable Object nằm ở nơi mình chọn được, khác với Worker. Ghim nó ở Bắc Mỹ:
+   vùng này luôn nằm trong danh sách Google cho phép, và mấy lệnh gọi đi qua đây
+   đều là loại bấm một lần (thử khoá, lấy danh sách model) nên thêm vài trăm
+   mili giây không ai thấy. Tin nhắn thật vẫn đi bằng Durable Object của phiên
+   chat, không đổi vị trí, không chậm thêm. */
+const PROBE_LOCATION = 'enam';
+
+async function fetchQuaStreamer(env, url, init, ms) {
+  const e = env || ENV;
+  if (!e || !e.STREAMER) return null;      // máy chủ chưa cài Durable Object
+  const stub = e.STREAMER.get(e.STREAMER.idFromName('probe'), { locationHint: PROBE_LOCATION });
+  const res = await stub.fetch('https://streamer/probe', {
+    method: 'POST',
+    body: JSON.stringify({ url, init, ms }),
+  });
+  if (res.status === 599) throw new Error(await res.text());
+  return res;
+}
+
+/* Một lệnh gọi vừa bị từ chối vì vị trí thì hỏi lại từ Durable Object đã ghim
+   vùng. Trả về null khi không đi vòng được, để chỗ gọi giữ nguyên lỗi gốc. */
+async function thuLaiTuVungKhac(env, url, init, ms, raw) {
+  if (!laLoiViTri(raw)) return null;
+  try { return await fetchQuaStreamer(env, url, init, ms); }
+  catch { return null; }                   // đường vòng cũng hỏng: giữ lỗi gốc
+}
+
+/* Gọi nhà cung cấp. Luôn trả về Response để chỗ gọi không phải biết đã đi
+   đường nào. Dùng cho nút Thử và danh sách model; tin nhắn thật đi qua
+   fetchLLM, chỗ đó có cùng đường vòng này. */
+async function providerCall(env, url, init, ms) {
+  const res = await fetchWithTimeout(url, init, ms, null);
+  if (res.ok) return res;
+  const body = await readBodyWithTimeout(res, ERROR_BODY_TIMEOUT_MS).catch(() => '');
+  return (await thuLaiTuVungKhac(env, url, init, ms, body)) || new Response(body, { status: res.status });
+}
+
 function isThinking(model) {
   const m = model.toLowerCase();
   return ['gemma-4', 'qwen3', 'deepseek-r1', 'gpt-oss', ':thinking', '-think'].some(x => m.includes(x));
@@ -789,14 +901,12 @@ async function executeLLM(apiKeys, messages, mode, thinkingEffort, stream, signa
 let keys = apiKeys.filter(k => k.key_mode === mode).sort((a, b) => b.is_primary - a.is_primary);
   if (keys.length === 0) throw new Error('No API keys configured for mode: ' + mode);
 
-  // GEMINI DEBUG: if a Gemini key is set as primary for chat, try ONLY Gemini so its
-  // error surfaces instead of silently rolling over to other providers.
-  if (mode === 'chat') {
-    const primary = keys[0];
-    if (primary && primary.provider === 'gemini') {
-      keys = keys.filter(k => k.provider === 'gemini');
-    }
-  }
+  /* Trước đây chỗ này khoá lại: khoá chính là Gemini thì CHỈ thử Gemini, để lỗi
+     của Gemini hiện ra thay vì lặng lẽ chuyển sang nhà cung cấp khác. Nó có ích
+     hồi đi tìm lỗi, nhưng nó cắt mất đường lùi - hết lượt trong ngày, model quá
+     tải, hay bị chặn vì vùng thì đoạn chat chết hẳn, dù trong máy còn khoá khác
+     dùng được. Lỗi Gemini bây giờ đã được gọi đúng tên nên không cần khoá nữa,
+     và khi mọi khoá đều hỏng thì lỗi vẫn hiện ra đầy đủ. */
 
   let lastErr = '';
   let geminiError = null;
@@ -875,7 +985,7 @@ if (isThinking(key.model) && provider !== 'gemini') {
         // NEVER send reasoning_effort or penalties during summarization for Groq
       }
 
-const res = await fetchWithTimeout(
+const res = await fetchLLM(
         url,
         { method: 'POST', headers, body: JSON.stringify(body) },
         stream ? LLM_HEADER_TIMEOUT_MS : LLM_TOTAL_TIMEOUT_MS,
@@ -886,9 +996,29 @@ const res = await fetchWithTimeout(
         try { errorBody = await readBodyWithTimeout(res, ERROR_BODY_TIMEOUT_MS); }
         catch (be) { errorBody = '(error body unreadable: ' + be.message + ')'; }
         lastErr = `${provider} HTTP ${res.status}: ${errorBody.substring(0, 150)}`;
+        /* 503 và 429 là hai lỗi hay gặp nhất, và cũng là hai lỗi người dùng tự
+           xử lý được - nhưng chỉ khi hiểu nó nói gì, mà nguyên khối JSON tiếng
+           Anh của Google thì không. Dòng đầu để nguyên văn cố định cho srvErr
+           dịch được; tên model xuống dòng dưới. */
+        if (laLoiViTri(errorBody)) lastErr = 'This provider does not serve the region this server is running in';
+        const busy = res.status === 503
+          ? 'This model is busy right now. Wait a moment, or pick another model.'
+          : res.status !== 429
+          ? null
+          : hetLuotCaNgay(errorBody)
+          ? 'This model has used up its free allowance for today. Pick another model, or come back tomorrow.'
+          : 'This model is over its rate limit. Wait a minute, or pick another model.';
+        if (busy) {
+          /* Google kèm luôn số lượt được phép. Nói ra thì người dùng biết ngay
+             model đang dùng rẻ hay đắt, thay vì đoán. */
+          const soLuot = /"quotaValue":\s*"?(\d+)/.exec(errorBody);
+          lastErr = `${busy}\n\nModel: ${modelId}` + (soLuot ? ` (${soLuot[1]}/day)` : '');
+        }
         // GEMINI DEBUG: keep the full, untruncated Google error so we can show it in chat
         if (provider === 'gemini') {
-          geminiError = `Gemini HTTP ${res.status}\n\nModel: ${key.model}\nEndpoint: ${url}\n\nGoogle response:\n${errorBody.substring(0, 1500)}`;
+          geminiError = busy
+            ? `${busy}\n\nModel: ${key.model}`
+            : `Gemini HTTP ${res.status}\n\nModel: ${key.model}\nEndpoint: ${url}\n\nGoogle response:\n${errorBody.substring(0, 1500)}`;
         }
         continue; 
       }
@@ -948,7 +1078,7 @@ function modelsEndpoint(provider, customUrl) {
   }
 }
 
-async function fetchModelList(provider, apiKey, customUrl) {
+async function fetchModelList(provider, apiKey, customUrl, env = null) {
   const url = modelsEndpoint(provider, customUrl);
   if (!url) return { models: [], note: provider === 'cloudflare'
     ? 'Cloudflare has no model list - use an @cf/... id from their catalogue.'
@@ -959,7 +1089,7 @@ async function fetchModelList(provider, apiKey, customUrl) {
   if (provider === 'gemini') target = url + '?key=' + encodeURIComponent(apiKey || '');
   else if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
 
-  const res = await fetchWithTimeout(target, { headers }, 15_000, null);
+  const res = await providerCall(env, target, { headers }, 15_000);
   if (!res.ok) {
     let body = '';
     try { body = await readBodyWithTimeout(res, 5_000); } catch {}
@@ -1134,6 +1264,10 @@ function createUnifiedStream({ openStream, onFinish, onProgress = null, initial 
   let skipChars = 0;       // resume: characters of a restarted reply still to drop
   let deadline = Infinity;
   let streamError = null;  // an {"error":...} line the provider sent instead of text
+  /* finish_reason:"length" nghĩa là hết hạn mức token giữa chừng, không phải
+     model đã nói xong. Gemini 2.5 trở lên tính cả token suy nghĩ vào max_tokens
+     nên một câu trả lời về code ăn hết 8192 token rồi đứt ngang giữa câu. */
+  let hitLimit = false;
 
   // -- outbound coalescing ----------------------------------------------
   let pendText = '', pendReasoning = '', flushTimer = null;
@@ -1216,7 +1350,10 @@ function createUnifiedStream({ openStream, onFinish, onProgress = null, initial 
     if (r === null) r = jsonStr(text, '"reasoning_content":"', s, e);
     if (r !== null) { got = true; if (r) { reasoning += r; queue(false, r); } }
     const f = text.indexOf('"finish_reason":"', s);          // a string, i.e. not null
-    if (f !== -1 && f < e) return true;
+    if (f !== -1 && f < e) {
+      if (text.startsWith('"finish_reason":"length"', f)) hitLimit = true;
+      return true;
+    }
     if (!got) {
       const er = text.indexOf('"error"', s);
       if (er !== -1 && er < e) streamError = text.slice(s, Math.min(e, s + 300));
@@ -1229,6 +1366,7 @@ function createUnifiedStream({ openStream, onFinish, onProgress = null, initial 
   async function pump(rawStream) {
     const reader = rawStream.getReader();
     const dec = new TextDecoder();
+    hitLimit = false;
     let tail = '', finished = false, sawBytes = false, stalled = false;
     let lastByteAt = Date.now();
     // One coarse watchdog instead of a fresh timer race per read (which cost
@@ -1303,11 +1441,17 @@ function createUnifiedStream({ openStream, onFinish, onProgress = null, initial 
         }
 
         try {
-          if (await pump(raw)) { clean = true; break; }
-          lastErr = new Error(streamError ? 'Upstream error: ' + streamError : 'Upstream closed the stream before finishing');
-          // No finish marker, but the text reads as complete: accept it rather
-          // than spending two more requests on a provider that never sends [DONE].
-          if (!looksTruncated(content)) { clean = true; break; }
+          if (await pump(raw)) {
+            // Hết hạn mức token thì nối tiếp bằng chính cơ chế resume ở trên,
+            // thay vì giao cho người dùng một đoạn code đứt giữa dòng.
+            if (!hitLimit) { clean = true; break; }
+            lastErr = new Error('The reply reached the token limit');
+          } else {
+            lastErr = new Error(streamError ? 'Upstream error: ' + streamError : 'Upstream closed the stream before finishing');
+            // No finish marker, but the text reads as complete: accept it rather
+            // than spending two more requests on a provider that never sends [DONE].
+            if (!looksTruncated(content)) { clean = true; break; }
+          }
         } catch (e) {
           lastErr = e;
         }
@@ -1657,9 +1801,31 @@ function dispatchGeneration(env, ctx, db, job) {
 // 30 seconds of CPU per request where the Worker gets 10 ms - the difference
 // between a long reply finishing and being killed part-way through.
 export class ChatStreamer {
-  constructor(state, env) { this.state = state; this.env = env; }
+  constructor(state, env) { this.state = state; this.env = env; ENV = env; }
 
   async fetch(request) {
+    /* Hỏi nhà cung cấp hộ Worker. Worker chạy tại colo mà trình duyệt vào, và
+       một số colo nằm ở nơi Google không phục vụ; Durable Object thì được ghim
+       vùng lúc tạo (xem PROBE_LOCATION), nên hỏi từ đây mới có câu trả lời ổn
+       định. Chỉ mã của chính Worker này gọi tới được, không mở ra ngoài. */
+    if (new URL(request.url).pathname === '/probe') {
+      const { url, init, ms } = await request.json();
+      try {
+        const res = await fetchWithTimeout(url, init, ms || 20_000, null);
+        /* Chuyển tiếp nguyên dòng dữ liệu, không đọc hết thành chữ: một câu trả
+           lời đang được viết dần phải chảy qua đây từng mẩu, đúng như khi Worker
+           tự gọi. Đọc hết rồi mới trả là mất cả cơ chế hiện chữ dần. */
+        return new Response(res.body, {
+          status: res.status,
+          headers: { 'content-type': res.headers.get('content-type') || 'application/json' },
+        });
+      } catch (e) {
+        // 599 không phải mã của nhà cung cấp, nên chỗ gọi phân biệt được đây là
+        // "không với tới được" chứ không phải "nhà cung cấp trả lời như vậy".
+        return new Response(e.message, { status: 599 });
+      }
+    }
+
     const job = await request.json();
     const db  = new DB(this.env.DB);
     // Watchdog: should this object be evicted mid-reply, the alarm still fires
@@ -1680,6 +1846,7 @@ export default {
   // Daily housekeeping, fired by the cron trigger in wrangler.toml (harmless
   // if it never fires). Small tables keep every lookup above fast.
   async scheduled(controller, env, ctx) {
+    ENV = env;
     if (!env.DB) return;
     const db = new DB(env.DB), now = Date.now();
     await db.d1.batch([
@@ -1690,6 +1857,7 @@ export default {
   },
 
   async fetch(request, env, ctx) {
+    ENV = env;
     if (!env.DB) {
       return new Response('D1 database binding "DB" not found. Check your Cloudflare settings.', { status: 500 });
     }
@@ -2365,8 +2533,14 @@ case 'logout': {
             const row = await db.get('SELECT api_key FROM api_keys WHERE id = ?', [str(body.id, 100)]);
             apiKey = row?.api_key || null;
           }
+          /* Google từ chối một key rỗng trong chưa đầy một phần mười giây, và
+             người dùng nhận lại lỗi 502 chẳng nói lên điều gì. Hỏi trước thì
+             hơn. (Provider custom có thể không cần key.) */
+          if (!apiKey && provider !== 'custom') {
+            return errResponse('Paste your API key first, then pick a model');
+          }
           try {
-            return jsonResponse(await fetchModelList(provider, apiKey, customUrl));
+            return jsonResponse(await fetchModelList(provider, apiKey, customUrl, env));
           } catch (e) {
             return errResponse(e.message, 502);
           }
@@ -2385,7 +2559,7 @@ case 'testKey': {
           const modelId = (k.provider === 'cloudflare' && !k.model.startsWith('@cf/')) ? `@cf/${k.model}` : k.model;
 
           try {
-            const res = await fetch(target.url, {
+            const res = await providerCall(env, target.url, {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
@@ -2400,9 +2574,19 @@ case 'testKey': {
                 max_tokens: 5,
                 stream: false
               })
-            });
+            }, 20_000);
 
-            if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+            if (!res.ok) {
+              const raw = await readBodyWithTimeout(res, ERROR_BODY_TIMEOUT_MS).catch(() => '');
+              /* Ba lỗi này người dùng sửa được, nên gọi đúng tên chúng thay vì
+                 ném ra mã HTTP kèm một khối JSON. */
+              if (laLoiViTri(raw))    throw new Error('This provider does not serve the region this server is running in');
+              if (res.status === 503) throw new Error('This model is busy right now. Wait a moment, or pick another model.');
+              if (res.status === 429) throw new Error(hetLuotCaNgay(raw)
+                ? 'This model has used up its free allowance for today. Pick another model, or come back tomorrow.'
+                : 'This model is over its rate limit. Wait a minute, or pick another model.');
+              throw new Error(`HTTP ${res.status}: ${raw}`);
+            }
             return jsonResponse({ ok: true, model: k.model, provider: k.provider });
           } catch (e) {
             return jsonResponse({ ok: false, error: e.message.substring(0, 200) });
@@ -8062,7 +8246,7 @@ body::before{content:'';position:fixed;inset:0;z-index:-1;pointer-events:none;
   <!-- Memory -->
   <div id="memory-modal" class="modal-content bg-surface w-[calc(100%-1rem)] max-w-2xl rounded-xl shadow-2xl border border-line hf flex flex-col max-h-[95vh]" onclick="event.stopPropagation()">
     <div class="px-4 sm:px-6 py-4 border-b border-line flex justify-between items-center bg-surface-2">
-      <div><h3 class="font-semibold text-base sm:text-lg">Memory & Summarization</h3><p id="mem-session-label" class="text-xs text-dim mt-0.5">Session: —</p></div>
+      <div><h3 class="font-semibold text-base sm:text-lg">Memory & Summarization</h3><p id="mem-session-label" class="text-xs text-dim mt-0.5">Chat: —</p></div>
       <button onclick="closeModals()" class="text-dim hover:text-main"><i data-lucide="x" class="w-5 h-5"></i></button>
     </div>
     <div class="p-4 sm:p-6 space-y-5 overflow-y-auto">
@@ -8864,6 +9048,14 @@ function cssUrl(u){
    streaming reply; sweeps happen when a screen opens, and nowhere else. */
 var LANG = 'en';
 var I18N = { vi: {
+  'This provider does not serve the region this server is running in': 'Nhà cung cấp này không phục vụ khu vực mà máy chủ đang chạy. Cloudflare đôi khi đưa máy chủ qua Hong Kong, nơi Google không mở API. Bấm thử lại, hoặc đặt nhà cung cấp khác làm chính.',
+  'Get a key at aistudio.google.com/apikey. On the free plan pick a Flash Lite model: 500 replies a day instead of 20.': 'Lấy khoá ở aistudio.google.com/apikey. Gói miễn phí thì chọn model Flash Lite: 500 lượt trả lời mỗi ngày thay vì 20.',
+  /* lỗi của nhà cung cấp AI, hiện ngay trong đoạn chat */
+  'This model is busy right now. Wait a moment, or pick another model.': 'Model này đang quá tải. Chờ một lát, hoặc chọn model khác.',
+  'This model has used up its free allowance for today. Pick another model, or come back tomorrow.': 'Model này đã dùng hết lượt miễn phí của hôm nay. Chọn model khác, hoặc quay lại vào ngày mai.',
+  'This model is over its rate limit. Wait a minute, or pick another model.': 'Model này đang bị chặn vì gửi quá nhanh. Chờ một phút, hoặc chọn model khác.',
+  'Paste your API key first, then pick a model': 'Dán khoá API vào đã, rồi mới chọn được model',
+  'The reply reached the token limit': 'Câu trả lời chạm trần số chữ cho phép',
   /* the sign-in page */
   'Username': 'Tên đăng nhập',
   'Password': 'Mật khẩu',
@@ -8873,11 +9065,11 @@ var I18N = { vi: {
   /* the sidebar */
   'Current Chat': 'Đoạn chat hiện tại',
   'Manage Sessions': 'Quản lý đoạn chat',
-  'Personas & Prompts': 'Nhân vật & Lời nhắc',
-  'Memory Rules': 'Quy tắc ghi nhớ',
+  'Personas & Prompts': 'Nhân vật AI',
+  'Memory Rules': 'Trí nhớ của AI',
   'API Endpoints': 'Kết nối API',
   'Advanced AI': 'AI nâng cao',
-  'Data Sync': 'Đồng bộ dữ liệu',
+  'Data Sync': 'Nhập & xuất dữ liệu',
   'Appearance': 'Giao diện',
   'Toggle Theme': 'Chuyển sáng/tối',
   'Account': 'Tài khoản',
@@ -8886,13 +9078,13 @@ var I18N = { vi: {
   'Chats': 'Đoạn chat',
   'All Sessions': 'Tất cả đoạn chat',
   'New Session': 'Đoạn chat mới',
-  'Your conversation history': 'Lịch sử trò chuyện của bạn',
+  'Your conversation history': 'Mọi đoạn chat của bạn',
   'Sketchboard': 'Bảng ghi nhớ',
   /* the chat itself */
   'Summarizing Memory...': 'Đang tóm tắt trí nhớ...',
   'Loading older messages...': 'Đang tải tin nhắn cũ hơn...',
   'Think: Off': 'Suy luận: Tắt',
-  'Thinking Effort': 'Mức suy luận',
+  'Thinking Effort': 'AI suy nghĩ kỹ tới đâu',
   'Off': 'Tắt',
   'Low': 'Thấp',
   'faster': 'nhanh hơn',
@@ -8905,60 +9097,61 @@ var I18N = { vi: {
   /* the language switcher itself */
   'Language': 'Ngôn ngữ',
   'The app follows this language. Your chats are never translated on their own.': 'Giao diện sẽ theo ngôn ngữ này. Nội dung chat không bao giờ tự động dịch.',
-  'Define custom AI behaviors': 'Tự định nghĩa cách AI cư xử',
+  'Define custom AI behaviors': 'Tạo nhân vật và đặt tính cách cho AI',
   'Create New Persona': 'Tạo nhân vật mới',
-  'Avatar': 'Ảnh đại diện',
+  'Avatar': 'Ảnh đại diện (dùng catbox.moe up file lấy link)',
   'Bot Name': 'Tên nhân vật',
-  'Description': 'Mô tả',
-  'Greeting Message': 'Lời chào mở đầu',
-  'System Prompt': 'Lời nhắc hệ thống',
-  'User Persona': 'Vai của bạn',
-  'This persona can have its own bubble, colours, font and wallpaper.': 'Nhân vật này có thể có bubble, màu, phông chữ và hình nền riêng.',
+  'Description': 'Note của nhân vật',
+  'Greeting Message': 'Tin nhắn mở đầu của AI',
+  'System Prompt': 'Tính cách và thông tin của AI',
+  'User Persona': 'Tính cách và thông tin của bạn',
+  'This persona can have its own bubble, colours, font and wallpaper.': 'Nhân vật này có thể để bubble, màu, phông chữ và hình nền riêng.',
   'Cancel': 'Huỷ',
   'Save Persona': 'Lưu nhân vật',
-  'Memory & Summarization': 'Trí nhớ & Tóm tắt',
-  'Session: —': 'Đoạn chat: —',
+  'Memory & Summarization': 'Trí nhớ của AI',
+  'Chat': 'Đoạn chat',
+  'Chat: —': 'Đoạn chat: —',
   'Summary': 'Bản tóm tắt',
   '(editable)': '(sửa được)',
   'Saved ✓': 'Đã lưu ✓',
   'Save Edit': 'Lưu chỉnh sửa',
   'Regenerate': 'Tạo lại',
-  'Summarize Threshold': 'Ngưỡng tóm tắt',
+  'Summarize Threshold': 'Bao nhiêu tin thì tóm tắt một lần',
   '(msgs)': '(tin nhắn)',
-  'Messages to Summarize': 'Số tin nhắn đem tóm tắt',
-  'Context Window': 'Cửa sổ ngữ cảnh',
-  '(last N for AI)': '(N tin gần nhất gửi cho AI)',
-  'History Display Fetch': 'Số tin tải lên màn hình',
-  'Include Previous Summary when re-summarizing': 'Dùng lại bản tóm tắt cũ khi tóm tắt lại',
-  'Apply Rules': 'Áp dụng quy tắc',
+  'Messages to Summarize': 'Mỗi lần tóm tắt bao nhiêu tin',
+  'Context Window': 'Số tin gửi kèm cho AI',
+  '(last N for AI)': '(tin gần nhất)',
+  'History Display Fetch': 'Số tin hiện lên màn hình',
+  'Include Previous Summary when re-summarizing': 'Tóm tắt lần sau có đọc lại bản tóm tắt cũ',
+  'Apply Rules': 'Lưu cài đặt trí nhớ',
   'Advanced AI Settings': 'Cài đặt AI nâng cao',
   'Global — applies to every API endpoint': 'Dùng chung cho mọi kết nối API',
   'Preset': 'Bộ cài sẵn',
-  'Parameters': 'Tham số',
+  'Parameters': 'Thông số chi tiết',
   'Choose Custom to edit these': 'Chọn Tuỳ chỉnh để sửa được các giá trị này',
   'Randomness. Low sticks to the prompt, high is more inventive.': 'Độ ngẫu nhiên. Thấp thì bám sát lời nhắc, cao thì bay bổng hơn.',
   'Nucleus sampling. Lower narrows the pool of candidate words.': 'Lấy mẫu theo xác suất dồn. Càng thấp thì càng ít từ được chọn.',
-  'Presence Penalty': 'Phạt lặp chủ đề',
+  'Presence Penalty': 'Tránh lặp chủ đề (presence penalty)',
   'Positive values push the model toward new topics.': 'Giá trị dương đẩy mô hình sang chủ đề mới.',
-  'Frequency Penalty': 'Phạt lặp từ',
+  'Frequency Penalty': 'Tránh lặp từ (frequency penalty)',
   'Positive values discourage reusing the same words.': 'Giá trị dương hạn chế dùng lại cùng một từ.',
-  'Repetition Penalty': 'Phạt lặp lại',
+  'Repetition Penalty': 'Tránh lặp lại (repetition penalty)',
   'OpenRouter and custom endpoints only. 0 = off (not sent).': 'Chỉ dùng với OpenRouter và endpoint tuỳ chỉnh. 0 = tắt (không gửi).',
   'Longest reply the model may produce in one turn.': 'Độ dài tối đa của một lượt trả lời.',
   'Summarization keeps its own fixed settings.': 'Phần tóm tắt dùng cài đặt riêng, cố định.',
   'Apply Globally': 'Áp dụng cho mọi kết nối',
   'Add Endpoint': 'Thêm kết nối',
-  'Name': 'Tên',
-  'Type': 'Loại',
+  'Name': 'Tên gợi nhớ',
+  'Type': 'Nhà cung cấp',
   'API endpoint': 'Địa chỉ API',
   'API key': 'Khoá API',
   'Paste the key, then pick a model below.': 'Dán khoá vào, rồi chọn mô hình bên dưới.',
   'Model': 'Mô hình',
-  'Browse': 'Chọn',
-  'Mode': 'Chế độ',
+  'Browse': 'Xem danh sách',
+  'Mode': 'Dùng để làm gì',
   'Chat (Main Bot)': 'Trò chuyện (bot chính)',
   'Summarize (Background)': 'Tóm tắt (chạy nền)',
-  'Set as Primary': 'Đặt làm mặc định',
+  'Set as Primary': 'Dùng làm kết nối chính',
   'Save Key': 'Lưu khoá',
   'Download TXT': 'Tải về TXT',
   'Exports as {user}/{bot} tags.': 'Xuất ra dạng thẻ {user}/{bot}.',
@@ -8975,14 +9168,14 @@ var I18N = { vi: {
   'Drops all data, scrambles your account, and logs you out. Irreversible.': 'Xoá sạch dữ liệu, xáo tên và mật khẩu tài khoản, rồi đăng xuất. Không khôi phục được.',
   'Nuke Server (Wipe DB)': 'Xoá sạch máy chủ (xoá database)',
   'Theme': 'Bố cục',
-  'Style': 'Tuỳ chọn',
+  'Style': 'Chi tiết bố cục',
   'Colour': 'Màu',
   'Bubble': 'Bubble',
   'Bubble setup': 'Tinh chỉnh bubble',
   'More': 'Khác',
   'A theme is a different interface, not a different colour. Most of these only change anything on a computer screen.': 'Chủ đề là một bố cục giao diện khác, không phải màu khác. Phần lớn chỉ thay đổi gì đó trên màn hình máy tính.',
-  'Options belonging to': 'Tuỳ chọn của',
-  'this theme': 'chủ đề này',
+  'Options belonging to': 'Tuỳ chọn riêng của',
+  'this theme': 'bố cục này',
   'Font': 'Phông chữ',
   'Apply': 'Áp dụng',
   'Reset': 'Đặt lại',
@@ -9004,7 +9197,7 @@ var I18N = { vi: {
   'Liquid glass': 'Kính mờ',
   'Frosts the bubbles, the sidebar, the header bar, the buttons and the sketchboard so what is behind them shows through.': 'Làm mờ kính cho bubble, thanh bên, thanh tiêu đề, các nút và bảng ghi nhớ để thấy được thứ phía sau.',
   'Liquid glass and Frost always apply everywhere, whichever scope is picked above.': 'Kính mờ và Độ mờ luôn áp dụng cho toàn bộ ứng dụng, bất kể chọn phạm vi nào ở trên.',
-  'Frost': 'Độ mờ',
+  'Frost': 'Độ nhoè kính',
   'How much the glass blurs what is behind it. The refraction that bends the edges stays whatever you set — but past two or three pixels there is little left behind the element to bend. Turns itself off where the system asks for reduced transparency.': 'Kính làm nhoè thứ phía sau đến mức nào. Phần khúc xạ bẻ cong viền vẫn giữ nguyên như bạn đặt — nhưng quá hai ba pixel thì phía sau gần như chẳng còn gì để bẻ. Tự tắt khi hệ thống yêu cầu giảm hiệu ứng trong suốt.',
   'Wallpaper': 'Hình nền',
   'A picture or a video. A link ending .mp4, .webm or .mov plays as video, muted and looping.': 'Một tấm ảnh hoặc một video. Link kết thúc bằng .mp4, .webm hay .mov sẽ phát như video, tắt tiếng và lặp lại.',
@@ -9024,8 +9217,8 @@ var I18N = { vi: {
   'New chat': 'Đoạn chat mới',
   'Filter…': 'Lọc…',
   'Change Persona for this session': 'Đổi nhân vật cho đoạn chat này',
-  'Enable thinking / reasoning': 'Bật chế độ suy luận',
-  'Toggle Sketchboard Context': 'Bật/tắt ngữ cảnh bảng ghi nhớ',
+  'Enable thinking / reasoning': 'Cho AI suy nghĩ trước khi trả lời',
+  'Toggle Sketchboard Context': 'Có gửi bảng ghi nhớ cho AI hay không',
   'Add custom pin...': 'Thêm ghi chú...',
   'URL or 2-letter initials': 'Link ảnh hoặc 2 chữ cái viết tắt',
   'No summary yet. Regenerate to create one.': 'Chưa có bản tóm tắt. Bấm Tạo lại để tạo.',
@@ -9355,7 +9548,10 @@ var I18N = { vi: {
   'Get a key at openrouter.ai/keys': 'Lấy khoá tại openrouter.ai/keys',
   'Get a key at aistudio.google.com/apikey': 'Lấy khoá tại aistudio.google.com/apikey',
   'Use an API token with Workers AI access.': 'Dùng API token có quyền Workers AI.',
-  'Whatever your endpoint expects; leave blank for a local server.': 'Tuỳ endpoint của bạn yêu cầu; để trống nếu là máy chủ chạy nội bộ.'
+  'Whatever your endpoint expects; leave blank for a local server.': 'Tuỳ endpoint của bạn yêu cầu; để trống nếu là máy chủ chạy nội bộ.',
+  'Create Persona': 'Tạo nhân vật mới',
+  'Edit Persona': 'Sửa nhân vật',
+  'Primary chat': 'Kết nối chính, dùng để trò chuyện'
 } };
 
 /* Everything a reader typed, or the AI wrote, lives inside one of these - and
@@ -9370,7 +9566,17 @@ var _i18nAttr = new WeakMap();   /* element   -> its English attributes */
 function t(s){ var d = I18N[LANG]; return (d && d[s]) || s; }
 /* The server speaks English to every client, so its messages are turned around
    here, on the way to the screen. Logs and the API stay in one language. */
-function srvErr(m){ return t(String(m == null ? '' : m)); }
+function srvErr(m){
+  var s = String(m == null ? '' : m);
+  var d = I18N[LANG];
+  if(!d) return s;
+  if(d[s]) return d[s];
+  /* Lỗi của máy chủ thường là một câu quen thuộc, rồi mới đến chi tiết riêng
+     của lần hỏng đó (tên model, phản hồi của nhà cung cấp). Dịch được câu đầu
+     vẫn hơn là để nguyên khối tiếng Anh. */
+  var i = s.indexOf('\\n');
+  return (i > 0 && d[s.slice(0, i)]) ? d[s.slice(0, i)] + s.slice(i) : s;
+}
 
 function translateTree(root){
   root = root || document.body;
@@ -13676,7 +13882,7 @@ function syncKeyForm(){
     groq:'Get a key at console.groq.com',
     mistral:'Get a key at console.mistral.ai',
     openrouter:'Get a key at openrouter.ai/keys',
-    gemini:'Get a key at aistudio.google.com/apikey',
+    gemini:'Get a key at aistudio.google.com/apikey. On the free plan pick a Flash Lite model: 500 replies a day instead of 20.',
     cloudflare:'Use an API token with Workers AI access.',
     custom:'Whatever your endpoint expects; leave blank for a local server.',
   }[p] || '';
@@ -14405,7 +14611,7 @@ function populateMemoryForm(){
     $('mem-include-old').checked=!!m.include_old_summary;
     $('memory-summary-ta').value=m.current_summary||'';
     const label=S.sessions.find(s=>s.id===S.session)?.label||S.session;
-    $('mem-session-label').textContent='Session: '+label;
+    $('mem-session-label').textContent=t('Chat')+': '+label;
 }
 
 async function saveMemorySettings(){
