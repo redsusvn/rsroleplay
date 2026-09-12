@@ -1,0 +1,24 @@
+# Repo này là công khai - nút "Deploy to Cloudflare" chỉ chạy với repo công khai.
+# Những gì liệt kê dưới đây không bao giờ được đẩy lên.
+
+# Bản sao lưu cơ sở dữ liệu. backups/local-d1-before-demo.sql là một bản dump D1
+# thật, bên trong có khoá API thật. Đây là thứ nguy hiểm nhất trong thư mục này.
+backups/
+
+# Trạng thái của wrangler dev: chứa cả cơ sở dữ liệu local, tức chat và khoá.
+.wrangler/
+
+# Các bản worker.js cũ giữ lại khi sửa (worker.js.bak, worker.js.pre-mfa, ...).
+worker.js.*
+
+# Cấu hình riêng: mang mã tài nguyên của tài khoản Cloudflare cá nhân.
+wrangler.prod.toml
+wrangler.demo.toml
+.dev.vars
+
+# Linh tinh
+imgxh.json
+__pycache__/
+*.pyc
+node_modules/
+.DS_Store
