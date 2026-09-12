@@ -19,13 +19,15 @@ Bấm nút trên là Cloudflare tự tạo Worker, cơ sở dữ liệu và Dura
 
 ### Hướng dẫn cài đặt / Installation guide
 
-> *Link video hướng dẫn cài đặt sẽ đặt ở đây. / The installation walkthrough goes here.*
+[![Hướng dẫn cách cài source RSROLEPLAY Chat Bot AI không giới hạn](https://img.youtube.com/vi/6k_mkhUTu0k/maxresdefault.jpg)](https://www.youtube.com/watch?v=6k_mkhUTu0k)
+
+▶️ [Xem trên YouTube / Watch on YouTube](https://www.youtube.com/watch?v=6k_mkhUTu0k)
 
 ### Giới thiệu / Showcase
 
-[Xem video giới thiệu / Watch the showcase video](https://storecloud.eu.org/0911.mp4)
+[![Giới thiệu Website Roleplay Selfhost thế hệ mới - RSRoleplay](https://img.youtube.com/vi/-shmKdaQkTI/maxresdefault.jpg)](https://www.youtube.com/watch?v=-shmKdaQkTI)
 
-<video src="https://storecloud.eu.org/0911.mp4" controls muted playsinline width="100%"></video>
+▶️ [Xem trên YouTube / Watch on YouTube](https://www.youtube.com/watch?v=-shmKdaQkTI)
 
 ---
 
