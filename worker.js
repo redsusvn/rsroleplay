@@ -288,7 +288,7 @@ function cacheDrop(prefix) {
 }
 
 // Bumped on every deploy so browsers revalidate the HTML shell cheaply.
-const APP_BUILD = '2026-09-13-geo3';
+const APP_BUILD = '2026-10-26-upersona4';
 const HTML_CACHE_CONTROL = 'private, max-age=0, must-revalidate';
 let _hasUsers = false, _appHTML = null, _setupHTML = null;
 
@@ -311,7 +311,7 @@ const CONTINUE_PROMPT = 'Your previous reply was cut off part-way through by a n
 
 // Bump this whenever SCHEMA_SQL changes; existing databases pick the change up
 // on the next cold start instead of needing a manual migration.
-const SCHEMA_VERSION = '8';
+const SCHEMA_VERSION = '9';
 
 // NOTE: d1.exec() requires exactly one statement per line.
 const SCHEMA_SQL = [
@@ -320,6 +320,9 @@ const SCHEMA_SQL = [
   `CREATE TABLE IF NOT EXISTS ip_blocks (id TEXT PRIMARY KEY, failed_attempts INTEGER DEFAULT 0, locked_until INTEGER);`,
   `CREATE TABLE IF NOT EXISTS personas (id TEXT PRIMARY KEY, name TEXT NOT NULL, avatar TEXT, description TEXT, system_prompt TEXT, user_persona TEXT, greeting_message TEXT);`,
   `CREATE TABLE IF NOT EXISTS chat_sessions (id TEXT PRIMARY KEY, label TEXT, persona_id TEXT, created_at INTEGER);`,
+  // Who the USER is in a chat. Only a prompt, a name and a picture: a user
+  // persona never speaks first, so it has no greeting.
+  `CREATE TABLE IF NOT EXISTS user_personas (id TEXT PRIMARY KEY, name TEXT NOT NULL, avatar TEXT, description TEXT, prompt TEXT, created_at INTEGER);`,
   `CREATE TABLE IF NOT EXISTS chat_history (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, group_id TEXT NOT NULL, is_main INTEGER DEFAULT 1, role TEXT NOT NULL, content TEXT NOT NULL, timestamp INTEGER);`,
   `CREATE TABLE IF NOT EXISTS memory_state (id TEXT PRIMARY KEY, session_id TEXT UNIQUE NOT NULL, summarize_threshold INTEGER DEFAULT 50, summarize_count INTEGER DEFAULT 30, context_count INTEGER DEFAULT 20, history_fetch_count INTEGER DEFAULT 50, include_old_summary INTEGER DEFAULT 1, last_summarized_timestamp INTEGER DEFAULT 0, sketchboard_active INTEGER DEFAULT 1, current_summary TEXT);`,
   `CREATE TABLE IF NOT EXISTS sketchboard (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, content TEXT NOT NULL, is_active INTEGER DEFAULT 1, created_at INTEGER);`,
@@ -361,6 +364,10 @@ const MIGRATIONS = [
   `ALTER TABLE users ADD COLUMN mfa_stage INTEGER DEFAULT 0`,
   `ALTER TABLE users ADD COLUMN mfa_locked_until INTEGER DEFAULT 0`,
   `CREATE TABLE IF NOT EXISTS user_prefs (user_id TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at INTEGER)`,
+  // NULL = the bot's own "About the user" text; otherwise a user_personas id.
+  `ALTER TABLE personas ADD COLUMN user_persona_id TEXT`,
+  // NULL = whatever the bot is set to; otherwise this chat's own pick.
+  `ALTER TABLE chat_sessions ADD COLUMN user_persona_id TEXT`,
 ];
 
 function ensureSchema(db) {
@@ -571,15 +578,35 @@ function histStmt(db, sid, beforeTs, ctxCount) {
 // so once that shape is cached the whole context loads in a single round trip.
 // A cold isolate still takes two, and the memory row itself is always read
 // fresh so a newly written summary is never missed.
+const UPERSONAS_SQL = 'SELECT * FROM user_personas ORDER BY created_at, id';
+/* The endpoint a chat reply goes to first - executeLLM tries chat keys primary
+   first. Never selects the key itself: this row is sent to the browser. */
+const CHAT_KEY_SQL = "SELECT id, name, provider, model FROM api_keys WHERE key_mode = 'chat' ORDER BY is_primary DESC, created_at, id LIMIT 1";
+
+/* Who the user is in this chat: the chat's own pick first, then the preset the
+   bot points at. Null means the bot's own "About the user" text applies. An id
+   that has since been deleted falls through rather than leaving the user blank. */
+function pickUserPersona(bot, sessionUpId, upersonas) {
+  const find = id => (id && upersonas.find(u => u.id === id)) || null;
+  return find(sessionUpId) ?? find(bot?.user_persona_id) ?? null;
+}
+
+function userPrompt(bot, up) {
+  if (!up) return bot?.user_persona || '';
+  return [up.name ? 'Name: ' + up.name : '', up.prompt || ''].filter(Boolean).join('\n');
+}
+
 async function buildCtx(sid, userMsg, db, beforeTs = null, ctx = null) {
   let shape    = cacheGet('shape:' + sid);
   let personas = cacheGet('personas');
+  let upersonas = cacheGet('upersonas');
 
   const stmts = [];
   const at    = {};
   at.mem = stmts.push(db.d1.prepare(MEM_PAIR_SQL).bind(sid)) - 1;
-  if (!shape)    at.sess     = stmts.push(db.d1.prepare('SELECT persona_id FROM chat_sessions WHERE id = ? LIMIT 1').bind(sid)) - 1;
+  if (!shape)    at.sess     = stmts.push(db.d1.prepare('SELECT persona_id, user_persona_id FROM chat_sessions WHERE id = ? LIMIT 1').bind(sid)) - 1;
   if (!personas) at.personas = stmts.push(db.d1.prepare('SELECT * FROM personas ORDER BY id')) - 1;
+  if (!upersonas) at.upersonas = stmts.push(db.d1.prepare(UPERSONAS_SQL)) - 1;
   if (shape) {
     if (shape.wantPins) at.pins = stmts.push(pinStmt(db, sid)) - 1;
     at.hist = stmts.push(histStmt(db, sid, beforeTs, shape.ctxCount)) - 1;
@@ -587,6 +614,7 @@ async function buildCtx(sid, userMsg, db, beforeTs = null, ctx = null) {
   const res = await db.d1.batch(stmts);
 
   if (!personas) personas = cacheSet('personas', res[at.personas].results ?? []);
+  if (!upersonas) upersonas = cacheSet('upersonas', res[at.upersonas].results ?? []);
 
   const memRows = res[at.mem].results;
   let mem = pickMem(memRows, sid);
@@ -602,6 +630,7 @@ async function buildCtx(sid, userMsg, db, beforeTs = null, ctx = null) {
   } else {
     shape = cacheSet('shape:' + sid, {
       personaId:  res[at.sess].results?.[0]?.persona_id ?? null,
+      userPersonaId: res[at.sess].results?.[0]?.user_persona_id ?? null,
       ctxCount:   clampCtx(mem.context_count),
       fetchCount: clampFetch(mem.history_fetch_count),
       wantPins:   mem.sketchboard_active === 1,
@@ -620,7 +649,8 @@ async function buildCtx(sid, userMsg, db, beforeTs = null, ctx = null) {
 
   const sysParts = [];
   if (bot?.system_prompt) sysParts.push(bot.system_prompt);
-  if (bot?.user_persona)  sysParts.push('About the user: ' + bot.user_persona);
+  const aboutUser = userPrompt(bot, pickUserPersona(bot, shape.userPersonaId, upersonas));
+  if (aboutUser) sysParts.push('About the user: ' + aboutUser);
   if (pins.length > 0) {
     sysParts.push('Additional important infomation. Use this important infomation to continue the story:\n- ' + pins.map(p => p.content).join('\n- '));
   }
@@ -2151,7 +2181,7 @@ case 'branchChat': {
           const curSess = await db.findOne('chat_sessions', { id: sid });
           
           // 1. Create the new session
-          await db.insert('chat_sessions', { id: newSessionId, label: newLabel, persona_id: curSess?.persona_id ?? null, created_at: Date.now() });
+          await db.insert('chat_sessions', { id: newSessionId, label: newLabel, persona_id: curSess?.persona_id ?? null, user_persona_id: curSess?.user_persona_id ?? null, created_at: Date.now() });
 
           // 2. Clone memory state rules (but reset the current summary)
           const mem = await getMem(sid, db, ctx);
@@ -2199,10 +2229,13 @@ case 'logout': {
           // being queried a second time, and personas come from the isolate
           // cache whenever it is warm.
           let personas = cacheGet('personas');
+          let upersonas = cacheGet('upersonas');
           const stmts  = [];
           const at     = {};
           at.mem      = stmts.push(db.d1.prepare(MEM_PAIR_SQL).bind(sid)) - 1;
-          at.sessions = stmts.push(db.d1.prepare('SELECT id, label, persona_id, created_at FROM chat_sessions ORDER BY created_at')) - 1;
+          at.sessions = stmts.push(db.d1.prepare('SELECT id, label, persona_id, user_persona_id, created_at FROM chat_sessions ORDER BY created_at')) - 1;
+          at.key      = stmts.push(db.d1.prepare(CHAT_KEY_SQL)) - 1;
+          if (!upersonas) at.upersonas = stmts.push(db.d1.prepare(UPERSONAS_SQL)) - 1;
           at.user     = stmts.push(db.d1.prepare('SELECT username FROM users WHERE id = ? LIMIT 1').bind(userId)) - 1;
           at.pins     = stmts.push(db.d1.prepare('SELECT * FROM sketchboard WHERE session_id = ? ORDER BY created_at DESC').bind(sid)) - 1;
           at.gen      = stmts.push(db.d1.prepare('SELECT * FROM gen_settings WHERE id = ? LIMIT 1').bind('global')) - 1;
@@ -2210,6 +2243,7 @@ case 'logout': {
 
           const res = await db.d1.batch(stmts);
           if (!personas) personas = cacheSet('personas', res[at.personas].results ?? []);
+          if (!upersonas) upersonas = cacheSet('upersonas', res[at.upersonas].results ?? []);
 
           const memRows = res[at.mem].results;
           let mem = pickMem(memRows, sid);
@@ -2225,6 +2259,7 @@ case 'logout': {
           // Everything the next sendMessage needs to skip its settings queries.
           cacheSet('shape:' + sid, {
             personaId:  curSess?.persona_id ?? null,
+            userPersonaId: curSess?.user_persona_id ?? null,
             ctxCount:   clampCtx(mem.context_count),
             fetchCount: clampFetch(mem.history_fetch_count),
             wantPins:   mem.sketchboard_active === 1,
@@ -2235,6 +2270,9 @@ case 'logout': {
           return jsonResponse({
             personas,
             current_persona_id: curSess?.persona_id ?? (personas[0]?.id ?? null),
+            user_personas:      upersonas,
+            current_user_persona_id: curSess?.user_persona_id ?? null,
+            chat_model:         res[at.key].results?.[0] ?? null,
             memory:             mem,
             csrf_token:         sessionDoc.csrf_token,
             session_id:         sid,
@@ -2606,6 +2644,8 @@ case 'testKey': {
               system_prompt:    str(body.system_prompt,    100000987098709870987) ?? '',
               user_persona:     str(body.user_persona,     5000987098709870987987)  ?? '',
               greeting_message: str(body.greeting_message, 2000987098709870987)  ?? '',
+              // NULL keeps the bot on its own user_persona text above
+              user_persona_id:  str(body.user_persona_id,  100) ?? null,
             };
             if (op === 'add') {
               await db.insert('personas', { id: generateId(), ...payload });
@@ -2634,7 +2674,95 @@ case 'testKey': {
           const personaId = typeof body.persona_id === 'string' && body.persona_id.trim() ? body.persona_id.trim() : null;
           await db.update('chat_sessions', { id: sessionId }, { persona_id: personaId });
           cacheDrop('shape:' + sessionId);
+
+          /* A chat is opened with the greeting of whoever was picked when it was
+             created, so picking somebody else straight after left the first
+             bot's greeting in place. Until the user has said anything, the
+             opening belongs to the bot now in the chat; after that, nothing in
+             the history is touched. */
+          const [said, bot] = await Promise.all([
+            db.get("SELECT 1 AS x FROM chat_history WHERE session_id = ? AND role = 'user' LIMIT 1", [sessionId]),
+            personaId ? db.findOne('personas', { id: personaId })
+                      : db.get('SELECT * FROM personas ORDER BY id LIMIT 1'),
+          ]);
+          if (said) return jsonResponse({ success: true, greeting_replaced: false });
+          const stmts = [db.d1.prepare('DELETE FROM chat_history WHERE session_id = ?').bind(sessionId)];
+          if (bot?.greeting_message) {
+            stmts.push(db.d1.prepare('INSERT INTO chat_history (id, session_id, group_id, is_main, role, content, timestamp) VALUES (?, ?, ?, 1, ?, ?, ?)')
+              .bind(generateId(), sessionId, 'g_' + generateId(), 'bot', bot.greeting_message, Date.now()));
+          }
+          await db.d1.batch(stmts);
+          return jsonResponse({ success: true, greeting_replaced: true });
+        }
+
+        case 'setSessionUserPersona': {
+          const sessionId = str(body.session_id, 100) ?? sid;
+          // empty = follow whatever the bot is set to
+          await db.update('chat_sessions', { id: sessionId }, { user_persona_id: str(body.user_persona_id, 100) });
+          cacheDrop('shape:' + sessionId);
           return jsonResponse({ success: true });
+        }
+
+        case 'manageUserPersonas': {
+          const op = str(body.op, 20);
+          if (op === 'list') return jsonResponse(await db.all(UPERSONAS_SQL));
+          if (op === 'add' || op === 'edit') {
+            const name = str(body.name, 100);
+            if (!name) return errResponse('Name required');
+            const payload = {
+              name,
+              avatar:      str(body.avatar,      509887987698769876)    ?? '',
+              description: str(body.description, 5000987098709870987)   ?? '',
+              prompt:      str(body.prompt,      100000987098709870987) ?? '',
+            };
+            if (op === 'add') {
+              await db.insert('user_personas', { id: generateId(), ...payload, created_at: Date.now() });
+            } else {
+              const id = str(body.id, 100);
+              if (!id) return errResponse('Missing id');
+              await db.update('user_personas', { id }, payload);
+            }
+            cacheDrop('upersonas');
+            return jsonResponse({ success: true });
+          }
+          if (op === 'delete') {
+            const id = str(body.id, 100);
+            if (!id) return errResponse('Invalid id');
+            await db.d1.batch([
+              db.d1.prepare('DELETE FROM user_personas WHERE id = ?').bind(id),
+              db.d1.prepare('UPDATE personas SET user_persona_id = NULL WHERE user_persona_id = ?').bind(id),
+              db.d1.prepare('UPDATE chat_sessions SET user_persona_id = NULL WHERE user_persona_id = ?').bind(id),
+            ]);
+            cacheDrop('upersonas');
+            cacheDrop('personas');
+            cacheDrop('shape:');
+            return jsonResponse({ success: true });
+          }
+          return errResponse('Unknown op');
+        }
+
+        // The header's model switcher: reads and changes the model of the
+        // endpoint chat replies go to first, nothing else about it.
+        case 'quickModel': {
+          const op  = str(body.op, 20);
+          const key = await db.get("SELECT id, name, provider, model, api_key, custom_url FROM api_keys WHERE key_mode = 'chat' ORDER BY is_primary DESC, created_at, id LIMIT 1");
+          if (!key) return errResponse('No chat endpoint yet. Add one in API Endpoints first.');
+          const info = { id: key.id, name: key.name, provider: key.provider, model: key.model };
+          if (op === 'get') return jsonResponse(info);
+          if (op === 'list') {
+            try { return jsonResponse({ ...info, ...(await fetchModelList(key.provider, key.api_key, key.custom_url, env)) }); }
+            catch (e) { return errResponse(e.message, 502); }
+          }
+          if (op === 'set') {
+            const model = str(body.model, 200);
+            if (!model) return errResponse('Pick a model');
+            // a list opened before the primary endpoint changed must not rewrite a different one
+            if (str(body.id, 100) !== key.id) return errResponse('The active endpoint changed. Open the list again.', 409);
+            await db.update('api_keys', { id: key.id }, { model });
+            cacheDrop('cfg');
+            return jsonResponse({ ...info, model });
+          }
+          return errResponse('Unknown op');
         }
 
         case 'updateGenSettings': {
@@ -2760,7 +2888,7 @@ case 'testKey': {
             await db.insert('chat_sessions', { id, label, persona_id: personaId, created_at: Date.now() });
             const bot = personaId
               ? await db.findOne('personas', { id: personaId })
-              : (await db.all('SELECT * FROM personas LIMIT 1'))[0] ?? null;
+              : (await db.all('SELECT * FROM personas ORDER BY id LIMIT 1'))[0] ?? null;
             if (bot?.greeting_message) {
               await db.insert('chat_history', {
                 id: generateId(), session_id: id, group_id: 'g_' + generateId(),
@@ -2859,6 +2987,7 @@ case 'testKey': {
             db.d1.prepare('DELETE FROM memory_state'),
             db.d1.prepare('DELETE FROM sketchboard'),
             db.d1.prepare('DELETE FROM personas'),
+            db.d1.prepare('DELETE FROM user_personas'),
             db.d1.prepare('DELETE FROM api_keys'),
             db.d1.prepare('DELETE FROM ip_blocks'),
             db.d1.prepare('DELETE FROM chat_sessions'),
@@ -7401,7 +7530,8 @@ body{background-color:var(--bg);background-image:var(--bg-art);background-attach
    Sketchboard pill were left sitting on the wallpaper. The text gets a chip;
    the bar stays open. */
 :root[data-wallpaper] #header-persona-btn,
-:root[data-wallpaper] #chat-header>button:last-of-type{
+:root[data-wallpaper] #chat-header>button:last-of-type,
+:root[data-wallpaper] #chat-header .hdr-tools>button{
   /* No backdrop-filter on a chip this size. It samples a strip a few pixels
      wide, which is not glass by any useful definition, and each one is another
      composited layer whose edges can show. A slightly heavier fill says the
@@ -7438,6 +7568,7 @@ body{background-color:var(--bg);background-image:var(--bg-art);background-attach
    are where glass reads strongest - and they were the ones still painting
    flat. */
 :root[data-glass="on"] #global-dropdown,
+:root[data-glass="on"] #qm-menu,
 :root[data-glass="on"] #think-picker,
 :root[data-glass="on"] .modal-content,
 :root[data-glass="on"] #toast{
@@ -7456,11 +7587,13 @@ body{background-color:var(--bg);background-image:var(--bg-art);background-attach
    commands cannot. So this keeps the fill the bubbles use, and the header and
    the sidebar stay thin. */
 :root[data-glass="on"] #global-dropdown,
+:root[data-glass="on"] #qm-menu,
 :root[data-glass="on"] #think-picker{
   background:var(--glass-read);
 }
 /* a row you are pointing at should still separate from the rest */
-:root[data-glass="on"] #global-dropdown button:hover,
+:root[data-glass="on"] #global-dropdown button:not(.seg-btn):hover,
+:root[data-glass="on"] #qm-menu button:hover,
 :root[data-glass="on"] #think-picker button:hover{
   background:color-mix(in oklab, var(--text) 14%, transparent);
 }
@@ -7836,6 +7969,7 @@ body{background-color:var(--bg);background-image:var(--bg-art);background-attach
 /* A menu is a list you read off, so it keeps more than the chrome does - but
    not so much that the wallpaper stops existing behind it. */
 :root[data-wallpaper]:not([data-glass="on"]) #global-dropdown,
+:root[data-wallpaper]:not([data-glass="on"]) #qm-menu,
 :root[data-wallpaper]:not([data-glass="on"]) #think-picker{
   background:color-mix(in oklab, var(--glass-base, var(--surface)) 94%, transparent);
 }
@@ -7862,6 +7996,110 @@ html{ font-size:calc(16px * var(--ui-scale)) }
 @media (max-width:767px){
   /* keep the composer at a real 16px no matter how far the user zooms out */
   #chat-input,#new-pin-input{ font-size:max(16px, 1rem) }
+}
+
+/* ── HEADER: room for the persona to shrink, tools on the right ─────────── */
+#chat-header > div:first-child{ min-width:0; flex:1 1 auto }
+#header-persona-btn{ min-width:0 }
+#header-persona-btn > div:last-child{ min-width:0 }
+#header-name{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:42vw }
+.hdr-tools{ display:flex; align-items:center; gap:.5rem; flex-shrink:0; margin-left:.5rem }
+
+/* session - user persona: one line, scrolls slowly only when it overflows */
+.mq{ display:block; overflow:hidden; white-space:nowrap; min-width:0; max-width:120px }
+@media (min-width:640px){ .mq{ max-width:220px } }
+.mq-track{ display:inline-flex; will-change:transform }
+.mq-item{ flex:0 0 auto }
+.mq.is-running .mq-item{ padding-right:2.5em }
+.mq.is-running{
+  -webkit-mask-image:linear-gradient(90deg,transparent,#000 6px,#000 calc(100% - 14px),transparent);
+          mask-image:linear-gradient(90deg,transparent,#000 6px,#000 calc(100% - 14px),transparent) }
+.mq.is-running .mq-track{ animation:mq-scroll var(--mq-dur,12s) linear infinite }
+@keyframes mq-scroll{ 0%,15%{ transform:translateX(0) } 100%{ transform:translateX(var(--mq-dist,0)) } }
+@media (prefers-reduced-motion:reduce){
+  .mq.is-running .mq-track{ animation:none }
+  .mq.is-running{ text-overflow:ellipsis }
+}
+
+/* ── Bot | User switch ───────────────────────────────────────────────────
+   A small segmented control. In the persona window it sits in the title bar,
+   in the header menu along the bottom. The picked half is the app's accent
+   pill; the track is barely there, so it reads as one control, not two
+   buttons. */
+.modal-head-tools{ display:flex; align-items:center; gap:.75rem; flex-shrink:0; margin-left:.75rem }
+.seg{ display:inline-flex; gap:2px; padding:2px; border-radius:var(--radius-pill,9999px);
+  background:color-mix(in oklab, var(--text) 7%, transparent);
+  box-shadow:inset 0 0 0 1px color-mix(in oklab, var(--border) 80%, transparent) }
+.seg-btn{ flex:1 1 0; display:inline-flex; align-items:center; justify-content:center; gap:5px;
+  height:26px; padding:0 11px; border-radius:var(--radius-pill,9999px);
+  font-size:12px; font-weight:600; line-height:1; white-space:nowrap;
+  color:var(--text-dim); background:transparent; border:0; cursor:pointer;
+  transition:background-color .15s, color .15s }
+.seg-btn svg{ width:13px; height:13px; flex-shrink:0 }
+.seg-btn:hover{ color:var(--text) }
+.seg-btn.is-on{ background:var(--accent); color:var(--accent-text);
+  box-shadow:0 1px 2px rgba(0,0,0,.18) }
+.seg-btn:focus-visible{ outline:none; box-shadow:var(--ring) }
+/* a 26px target is fine for a mouse; a finger gets a taller one */
+@media (pointer:coarse){
+  #modal-backdrop .seg .seg-btn, #global-dropdown .seg .seg-btn{ min-height:0; height:32px }
+}
+.qs-foot{ padding:6px; display:flex }
+.qs-foot .seg{ flex:1 }
+/* the menu rounds its first and last button to its own corners; these two are
+   halves of a pill and keep the pill's */
+#global-dropdown .seg .seg-btn{ border-radius:var(--radius-pill,9999px) }
+
+/* under liquid glass: the track is a thin tint with the rim every other glass
+   control has, and the picked half is the thinned accent the modal's own
+   accent buttons use, with the ink fitted for it */
+:root[data-glass="on"] .seg{
+  background:color-mix(in oklab, var(--surface) 22%, transparent);
+  box-shadow:inset 0 1px 0 var(--glass-rim), inset 0 0 0 1px var(--glass-hair) }
+:root[data-glass="on"] .seg-btn.is-on{
+  background:color-mix(in oklab, var(--accent) 72%, transparent);
+  color:var(--glass-accent-ink, var(--accent-text));
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.45), inset 0 0 0 1px rgba(255,255,255,.28) }
+:root[data-glass="on"] .seg-btn:not(.is-on):hover{ background:color-mix(in oklab, var(--text) 10%, transparent) }
+:root[data-glass="on"] #qm-menu .qm-search{
+  background:color-mix(in oklab, var(--surface) 84%, transparent); border-color:var(--border) }
+/* the labels up here are 10-11px and sit over whatever the wallpaper is doing,
+   so this strip is the thicker glass, like the sketchboard title bar */
+:root[data-glass="on"] #qm-menu .qm-head,
+:root[data-wallpaper] #qm-menu .qm-head{
+  background:color-mix(in oklab, var(--glass-base, var(--surface)) 86%, transparent);
+  border-bottom-color:var(--glass-hair, var(--border)) }
+:root[data-glass="on"] #qm-menu .qm-title,
+:root[data-glass="on"] #qm-menu .qm-key{ color:color-mix(in oklab, var(--text) 78%, transparent) }
+:root[data-glass="on"] .qm-item:hover{ background:color-mix(in oklab, var(--text) 14%, transparent) }
+:root[data-glass="on"] .qm-item.is-on{ background:color-mix(in oklab, var(--accent) 16%, transparent) }
+#qm-menu{ border-radius:calc(var(--radius) * 1.2); overflow:hidden }
+
+/* ── quick model switch ───────────────────────────────────────────────── */
+.qm-label{ display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:11rem }
+.qm-menu{ width:min(320px, calc(100vw - 16px)) }
+/* spacing in plain CSS: the compiled Tailwind only carries the utilities the
+   markup already used, and pt-2.5 / px-2.5 were not among them */
+.qm-head{ padding:12px 12px 10px }
+.qm-title{ font-size:10px; line-height:14px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--text-dim) }
+.qm-key{ margin-top:2px; font-size:11px; line-height:15px; color:var(--text-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+.qm-search{ margin-top:8px; padding:6px 10px }
+.qm-list{ max-height:min(50vh, 340px); overflow-y:auto; overscroll-behavior:contain }
+.qm-item{ display:flex; align-items:center; gap:8px; width:100%; text-align:left; padding:8px 12px;
+  font-size:13px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  color:var(--text); background:transparent; border:0; cursor:pointer }
+.qm-item:hover{ background:var(--surface-2) }
+.qm-item.is-on{ color:var(--accent); font-weight:600 }
+.qm-name{ flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+@media (max-width:639px){
+  .hdr-tools{ gap:.375rem }
+  .qm-label{ max-width:5.5rem }
+  .qm-chev{ display:none }
+  #header-name{ max-width:34vw }
+}
+@media (max-width:380px){
+  .qm-label{ max-width:4rem }
+  .mq{ max-width:96px }
 }
 `;
 }
@@ -8007,6 +8245,16 @@ body::before{content:'';position:fixed;inset:0;z-index:-1;pointer-events:none;
 <body class="bg-surface text-main font-sans h-[100dvh] flex overflow-hidden transition-colors duration-300" onclick="closeAllDropdowns()">
 
 <div id="global-dropdown" class="fixed w-52 bg-surface border border-line rounded-lg shadow-xl hf py-1 z-[9999]"></div>
+<!-- The header's model switcher. Its own element rather than the shared menu:
+     it needs a search box and is wider than the 208px that menu is built for. -->
+<div id="qm-menu" class="qm-menu fixed bg-surface border border-line rounded-lg shadow-xl hf z-[9999]" onclick="event.stopPropagation()">
+  <div class="qm-head border-b border-line">
+    <p class="qm-title">Switch model</p>
+    <p id="qm-key" class="qm-key"></p>
+    <input id="qm-search" type="text" placeholder="Search models&hellip;" oninput="renderModelMenu()" class="qm-search w-full bg-surface-2 border border-line rounded-md text-base md:text-sm outline-none focus:border-accent">
+  </div>
+  <div id="qm-list" class="qm-list py-1"></div>
+</div>
 <div id="toast" class="fixed bottom-32 md:bottom-24 left-1/2 -translate-x-1/2 bg-accent text-onaccent px-4 py-2 rounded-full text-xs shadow-lg z-[9999] hf pointer-events-none animate-slide-up whitespace-nowrap"></div>
 
 <!-- LOGIN -->
@@ -8032,7 +8280,7 @@ body::before{content:'';position:fixed;inset:0;z-index:-1;pointer-events:none;
      The 37 icons this app draws, inlined. Chrome does not resolve <use> across
      files, so an external sprite would need a fetch-and-inject dance; at 8KB
      inlining is both smaller and simpler than the 81KB library it replaces. -->
-<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" aria-hidden="true" style="position:absolute"><symbol id="i-alert-triangle" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></symbol><symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/><path d="M17.599 6.5a3 3 0 0 0 .399-1.375"/><path d="M6.003 5.125A3 3 0 0 0 6.401 6.5"/><path d="M3.477 10.896a4 4 0 0 1 .585-.396"/><path d="M19.938 10.5a4 4 0 0 1 .585.396"/><path d="M6 18a4 4 0 0 1-1.967-.516"/><path d="M19.967 17.484A4 4 0 0 1 18 18"/></symbol><symbol id="i-brain-circuit" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M9 13a4.5 4.5 0 0 0 3-4"/><path d="M6.003 5.125A3 3 0 0 0 6.401 6.5"/><path d="M3.477 10.896a4 4 0 0 1 .585-.396"/><path d="M6 18a4 4 0 0 1-1.967-.516"/><path d="M12 13h4"/><path d="M12 18h6a2 2 0 0 1 2 2v1"/><path d="M12 8h8"/><path d="M16 8V5a2 2 0 0 1 2-2"/><circle cx="16" cy="13" r=".5"/><circle cx="18" cy="3" r=".5"/><circle cx="20" cy="21" r=".5"/><circle cx="20" cy="8" r=".5"/></symbol><symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol><symbol id="i-check-circle" viewBox="0 0 24 24"><path d="M21.801 10A10 10 0 1 1 17 3.335"/><path d="m9 11 3 3L22 4"/></symbol><symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol><symbol id="i-chevron-left" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol><symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol><symbol id="i-copy" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></symbol><symbol id="i-corner-down-left" viewBox="0 0 24 24"><polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></symbol><symbol id="i-dices" viewBox="0 0 24 24"><rect width="12" height="12" x="2" y="10" rx="2" ry="2"/><path d="m17.92 14 3.5-3.5a2.24 2.24 0 0 0 0-3l-5-4.92a2.24 2.24 0 0 0-3 0L10 6"/><path d="M6 18h.01"/><path d="M10 14h.01"/><path d="M15 6h.01"/><path d="M18 9h.01"/></symbol><symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></symbol><symbol id="i-edit-2" viewBox="0 0 24 24"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/></symbol><symbol id="i-folder-open" viewBox="0 0 24 24"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></symbol><symbol id="i-git-branch" viewBox="0 0 24 24"><line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol><symbol id="i-key" viewBox="0 0 24 24"><path d="m15.5 7.5 2.3 2.3a1 1 0 0 0 1.4 0l2.1-2.1a1 1 0 0 0 0-1.4L19 4"/><path d="m21 2-9.6 9.6"/><circle cx="7.5" cy="15.5" r="5.5"/></symbol><symbol id="i-languages" viewBox="0 0 24 24"><path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/></symbol><symbol id="i-loader" viewBox="0 0 24 24"><path d="M12 2v4"/><path d="m16.2 7.8 2.9-2.9"/><path d="M18 12h4"/><path d="m16.2 16.2 2.9 2.9"/><path d="M12 18v4"/><path d="m4.9 19.1 2.9-2.9"/><path d="M2 12h4"/><path d="m4.9 4.9 2.9 2.9"/></symbol><symbol id="i-log-out" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/></symbol><symbol id="i-menu" viewBox="0 0 24 24"><line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="18" y2="18"/></symbol><symbol id="i-message-square" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol><symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol><symbol id="i-more-vertical" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/></symbol><symbol id="i-palette" viewBox="0 0 24 24"><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/></symbol><symbol id="i-pin" viewBox="0 0 24 24"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></symbol><symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M12 5v14"/></symbol><symbol id="i-refresh-cw" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></symbol><symbol id="i-rotate-ccw" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></symbol><symbol id="i-settings" viewBox="0 0 24 24"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></symbol><symbol id="i-slash" viewBox="0 0 24 24"><path d="M22 2 2 22"/></symbol><symbol id="i-sliders-horizontal" viewBox="0 0 24 24"><line x1="21" x2="14" y1="4" y2="4"/><line x1="10" x2="3" y1="4" y2="4"/><line x1="21" x2="12" y1="12" y2="12"/><line x1="8" x2="3" y1="12" y2="12"/><line x1="21" x2="16" y1="20" y2="20"/><line x1="12" x2="3" y1="20" y2="20"/><line x1="14" x2="14" y1="2" y2="6"/><line x1="8" x2="8" y1="10" y2="14"/><line x1="16" x2="16" y1="18" y2="22"/></symbol><symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></symbol><symbol id="i-toggle-right" viewBox="0 0 24 24"><rect width="20" height="12" x="2" y="6" rx="6" ry="6"/><circle cx="16" cy="12" r="2"/></symbol><symbol id="i-trash-2" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></symbol><symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></symbol><symbol id="i-user-cog" viewBox="0 0 24 24"><circle cx="18" cy="15" r="3"/><circle cx="9" cy="7" r="4"/><path d="M10 15H6a4 4 0 0 0-4 4v2"/><path d="m21.7 16.4-.9-.3"/><path d="m15.2 13.9-.9-.3"/><path d="m16.6 18.7.3-.9"/><path d="m19.1 12.2.3-.9"/><path d="m19.6 18.7-.4-1"/><path d="m16.8 12.3-.4-1"/><path d="m14.3 16.6 1-.4"/><path d="m20.7 13.8 1-.4"/></symbol><symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol><symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol></svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" aria-hidden="true" style="position:absolute"><symbol id="i-alert-triangle" viewBox="0 0 24 24"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></symbol><symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/><path d="M17.599 6.5a3 3 0 0 0 .399-1.375"/><path d="M6.003 5.125A3 3 0 0 0 6.401 6.5"/><path d="M3.477 10.896a4 4 0 0 1 .585-.396"/><path d="M19.938 10.5a4 4 0 0 1 .585.396"/><path d="M6 18a4 4 0 0 1-1.967-.516"/><path d="M19.967 17.484A4 4 0 0 1 18 18"/></symbol><symbol id="i-brain-circuit" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M9 13a4.5 4.5 0 0 0 3-4"/><path d="M6.003 5.125A3 3 0 0 0 6.401 6.5"/><path d="M3.477 10.896a4 4 0 0 1 .585-.396"/><path d="M6 18a4 4 0 0 1-1.967-.516"/><path d="M12 13h4"/><path d="M12 18h6a2 2 0 0 1 2 2v1"/><path d="M12 8h8"/><path d="M16 8V5a2 2 0 0 1 2-2"/><circle cx="16" cy="13" r=".5"/><circle cx="18" cy="3" r=".5"/><circle cx="20" cy="21" r=".5"/><circle cx="20" cy="8" r=".5"/></symbol><symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol><symbol id="i-check-circle" viewBox="0 0 24 24"><path d="M21.801 10A10 10 0 1 1 17 3.335"/><path d="m9 11 3 3L22 4"/></symbol><symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol><symbol id="i-chevron-left" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol><symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol><symbol id="i-copy" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></symbol><symbol id="i-corner-down-left" viewBox="0 0 24 24"><polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></symbol><symbol id="i-dices" viewBox="0 0 24 24"><rect width="12" height="12" x="2" y="10" rx="2" ry="2"/><path d="m17.92 14 3.5-3.5a2.24 2.24 0 0 0 0-3l-5-4.92a2.24 2.24 0 0 0-3 0L10 6"/><path d="M6 18h.01"/><path d="M10 14h.01"/><path d="M15 6h.01"/><path d="M18 9h.01"/></symbol><symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></symbol><symbol id="i-edit-2" viewBox="0 0 24 24"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/></symbol><symbol id="i-folder-open" viewBox="0 0 24 24"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></symbol><symbol id="i-git-branch" viewBox="0 0 24 24"><line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol><symbol id="i-key" viewBox="0 0 24 24"><path d="m15.5 7.5 2.3 2.3a1 1 0 0 0 1.4 0l2.1-2.1a1 1 0 0 0 0-1.4L19 4"/><path d="m21 2-9.6 9.6"/><circle cx="7.5" cy="15.5" r="5.5"/></symbol><symbol id="i-languages" viewBox="0 0 24 24"><path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/></symbol><symbol id="i-loader" viewBox="0 0 24 24"><path d="M12 2v4"/><path d="m16.2 7.8 2.9-2.9"/><path d="M18 12h4"/><path d="m16.2 16.2 2.9 2.9"/><path d="M12 18v4"/><path d="m4.9 19.1 2.9-2.9"/><path d="M2 12h4"/><path d="m4.9 4.9 2.9 2.9"/></symbol><symbol id="i-log-out" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/></symbol><symbol id="i-menu" viewBox="0 0 24 24"><line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="18" y2="18"/></symbol><symbol id="i-message-square" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol><symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol><symbol id="i-more-vertical" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/></symbol><symbol id="i-palette" viewBox="0 0 24 24"><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/></symbol><symbol id="i-pin" viewBox="0 0 24 24"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></symbol><symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M12 5v14"/></symbol><symbol id="i-refresh-cw" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></symbol><symbol id="i-rotate-ccw" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></symbol><symbol id="i-settings" viewBox="0 0 24 24"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></symbol><symbol id="i-slash" viewBox="0 0 24 24"><path d="M22 2 2 22"/></symbol><symbol id="i-sliders-horizontal" viewBox="0 0 24 24"><line x1="21" x2="14" y1="4" y2="4"/><line x1="10" x2="3" y1="4" y2="4"/><line x1="21" x2="12" y1="12" y2="12"/><line x1="8" x2="3" y1="12" y2="12"/><line x1="21" x2="16" y1="20" y2="20"/><line x1="12" x2="3" y1="20" y2="20"/><line x1="14" x2="14" y1="2" y2="6"/><line x1="8" x2="8" y1="10" y2="14"/><line x1="16" x2="16" y1="18" y2="22"/></symbol><symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></symbol><symbol id="i-toggle-right" viewBox="0 0 24 24"><rect width="20" height="12" x="2" y="6" rx="6" ry="6"/><circle cx="16" cy="12" r="2"/></symbol><symbol id="i-trash-2" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></symbol><symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></symbol><symbol id="i-user-cog" viewBox="0 0 24 24"><circle cx="18" cy="15" r="3"/><circle cx="9" cy="7" r="4"/><path d="M10 15H6a4 4 0 0 0-4 4v2"/><path d="m21.7 16.4-.9-.3"/><path d="m15.2 13.9-.9-.3"/><path d="m16.6 18.7.3-.9"/><path d="m19.1 12.2.3-.9"/><path d="m19.6 18.7-.4-1"/><path d="m16.8 12.3-.4-1"/><path d="m14.3 16.6 1-.4"/><path d="m20.7 13.8 1-.4"/></symbol><symbol id="i-bot" viewBox="0 0 24 24"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></symbol><symbol id="i-user" viewBox="0 0 24 24"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol><symbol id="i-cpu" viewBox="0 0 24 24"><rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></symbol><symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol><symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol></svg>
 <div id="app" class="hf flex w-full h-full relative">
 
 <!-- Sidebar Overlay (Mobile) -->
@@ -8101,15 +8349,20 @@ body::before{content:'';position:fixed;inset:0;z-index:-1;pointer-events:none;
         <div class="w-8 h-8 rounded-full bg-surface-3 flex items-center justify-center border border-line-2 overflow-hidden flex-shrink-0" id="header-avatar"><span class="text-xs font-bold text-body">AI</span></div>
         <div>
             <h2 class="text-[13px] sm:text-sm font-semibold flex items-center space-x-1"><span id="header-name">System Assistant</span><i data-lucide="chevron-down" class="w-3.5 h-3.5 text-dim"></i></h2>
-            <div class="flex items-center text-[10px] sm:text-xs text-dim"><span class="w-2 h-2 rounded-full bg-success animate-pulse-slow mr-1.5"></span><span id="header-sess" class="truncate max-w-[120px] sm:max-w-[200px]">default</span></div>
+            <div class="flex items-center text-[10px] sm:text-xs text-dim"><span class="w-2 h-2 rounded-full bg-success animate-pulse-slow mr-1.5 flex-shrink-0"></span><span id="header-sess" class="mq">default</span></div>
         </div>
       </button>
 
     </div>
+    <div class="hdr-tools">
+    <button id="qm-btn" onclick="toggleModelMenu(event)" title="Switch model" class="hf qm-btn flex items-center space-x-1.5 px-2.5 sm:px-3 py-1.5 border border-line rounded-full hover:bg-surface-2 transition-colors text-xs font-medium">
+      <i data-lucide="cpu" class="w-3.5 h-3.5 flex-shrink-0"></i><span id="qm-label" class="qm-label">&hellip;</span><i data-lucide="chevron-down" class="qm-chev w-3 h-3 text-dim flex-shrink-0"></i>
+    </button>
     <button onclick="toggleSketchboard();event.stopPropagation();" class="flex items-center space-x-1.5 sm:space-x-2 px-2.5 sm:px-3 py-1.5 border border-line rounded-full hover:bg-surface-2 transition-colors text-xs font-medium">
       <span id="sketch-led" class="w-2 h-2 rounded-full bg-dim flex-shrink-0 transition-colors"></span><i data-lucide="pin" class="w-3.5 h-3.5 sm:hidden"></i><span class="hidden sm:inline">Sketchboard</span>
       <span id="sketch-count" class="bg-surface-2 px-1.5 py-0.5 rounded text-body">0</span>
     </button>
+    </div>
   </header>
   <div id="summarize-banner" class="absolute top-16 left-0 right-0 bg-accent text-onaccent text-xs py-2 flex items-center justify-center space-x-2 hf z-20">
     <i data-lucide="loader" class="w-3 h-3 animate-spin"></i><span>Summarizing Memory...</span>
@@ -8201,14 +8454,42 @@ body::before{content:'';position:fixed;inset:0;z-index:-1;pointer-events:none;
   <!-- Personas -->
   <div id="persona-modal" class="modal-content bg-surface w-[calc(100%-1rem)] max-w-4xl rounded-xl shadow-2xl border border-line hf flex flex-col max-h-[95vh] overflow-hidden" onclick="event.stopPropagation()">
     <div class="px-4 sm:px-6 py-4 border-b border-line flex justify-between items-center bg-surface-2">
-      <div><h3 class="font-bold text-lg" id="personas-title">Personas & Prompts</h3><p class="text-xs text-dim mt-0.5">Define custom AI behaviors</p></div>
-      <button onclick="closeModals()" class="text-dim hover:text-main"><i data-lucide="x" class="w-5 h-5"></i></button>
+      <div class="min-w-0"><h3 class="font-bold text-lg" id="personas-title">Personas & Prompts</h3><p id="personas-sub" class="text-xs text-dim mt-0.5">Define custom AI behaviors</p></div>
+      <div class="modal-head-tools">
+        <div id="persona-tabs" class="seg" role="tablist"></div>
+        <button onclick="closeModals()" class="text-dim hover:text-main"><i data-lucide="x" class="w-5 h-5"></i></button>
+      </div>
     </div>
-    
+
     <div id="personas-list-view" class="p-4 sm:p-6 overflow-y-auto flex-1">
       <div id="personas-list-container" class="space-y-3"></div>
       <div class="mt-4 pt-4 border-t border-line flex justify-end">
-        <button onclick="showPersonaForm(null)" class="w-full sm:w-auto bg-accent text-onaccent px-4 py-2 rounded-md text-sm font-medium hover:opacity-80 flex justify-center items-center"><i data-lucide="plus" class="w-4 h-4 mr-1"></i>Create New Persona</button>
+        <button id="persona-create-btn" onclick="createOfPersonaTab()" class="w-full sm:w-auto bg-accent text-onaccent px-4 py-2 rounded-md text-sm font-medium hover:opacity-80 flex justify-center items-center"><i data-lucide="plus" class="w-4 h-4 mr-1"></i><span id="persona-create-label">Create New Persona</span></button>
+      </div>
+    </div>
+
+    <div id="upersona-form-view" class="p-4 sm:p-6 flex-1 overflow-y-auto hf">
+      <div class="flex flex-col md:flex-row gap-4 md:gap-8">
+        <div class="w-full md:w-1/2 space-y-4">
+          <div>
+            <label class="block text-[10px] font-bold text-dim uppercase tracking-wider mb-2">Avatar</label>
+            <div class="flex space-x-3 items-center">
+              <div id="upersona-avatar-preview" class="w-14 h-14 rounded-xl bg-surface-2 border border-line flex items-center justify-center overflow-hidden flex-shrink-0"><span class="text-xl font-bold text-dim">U</span></div>
+              <input type="text" id="upersona-avatar" oninput="updateUserAvatarPreview()" placeholder="URL or 2-letter initials" class="w-full border border-line bg-transparent rounded-lg p-3 text-base md:text-sm outline-none focus:border-info transition-colors">
+            </div>
+          </div>
+          <div><label class="block text-[10px] font-bold text-dim uppercase tracking-wider mb-1">Your name in the story</label><input type="text" id="upersona-name" oninput="updateUserAvatarPreview()" class="w-full border border-line bg-transparent rounded-lg p-3 text-base md:text-sm outline-none focus:border-info"></div>
+          <div><label class="block text-[10px] font-bold text-dim uppercase tracking-wider mb-1">Description</label><textarea id="upersona-desc" rows="2" class="w-full border border-line bg-transparent rounded-lg p-3 text-base md:text-sm outline-none focus:border-info resize-none"></textarea></div>
+        </div>
+        <div class="w-full md:w-1/2 flex flex-col gap-4">
+          <div class="flex-1 flex flex-col"><label class="block text-[10px] font-bold text-dim uppercase tracking-wider mb-1">User Prompt</label><textarea id="upersona-prompt" placeholder="Who you are: looks, personality, background, how the AI should treat you&hellip;" class="flex-1 w-full border border-line bg-transparent rounded-lg p-3 sm:p-4 text-base md:text-sm outline-none focus:border-info resize-none min-h-[140px]"></textarea></div>
+        </div>
+      </div>
+      <input type="hidden" id="upersona-edit-id">
+      <p class="text-[11px] text-dim mt-3">A user persona only tells the AI who you are. It has no greeting: the bot still opens the chat.</p>
+      <div class="mt-6 pt-4 border-t border-line flex justify-end space-x-3">
+        <button onclick="hidePersonaForm()" class="px-4 py-2 text-sm text-dim hover:bg-surface-2 rounded-md">Cancel</button>
+        <button onclick="saveUserPersona()" class="w-full sm:w-auto bg-accent text-onaccent px-6 py-2 rounded-lg text-sm font-medium hover:opacity-80">Save User Persona</button>
       </div>
     </div>
 
@@ -8228,7 +8509,11 @@ body::before{content:'';position:fixed;inset:0;z-index:-1;pointer-events:none;
         </div>
         <div class="w-full md:w-1/2 flex flex-col gap-4">
           <div class="flex-1 flex flex-col"><label class="block text-[10px] font-bold text-dim uppercase tracking-wider mb-1">System Prompt</label><textarea id="persona-prompt" class="flex-1 w-full border border-line bg-transparent rounded-lg p-3 sm:p-4 text-base md:text-sm outline-none focus:border-info resize-none min-h-[140px]"></textarea></div>
-          <div class="flex-1 flex flex-col"><label class="block text-[10px] font-bold text-dim uppercase tracking-wider mb-1">User Persona</label><textarea id="persona-user" class="flex-1 w-full border border-line bg-transparent rounded-lg p-3 sm:p-4 text-base md:text-sm outline-none focus:border-info resize-none min-h-[80px]"></textarea></div>
+          <div class="flex-1 flex flex-col"><label class="block text-[10px] font-bold text-dim uppercase tracking-wider mb-1">User Persona</label>
+            <select id="persona-user-src" onchange="syncUserSrc()" class="w-full border border-line bg-surface rounded-md p-2 mb-2 text-base md:text-sm outline-none focus:border-info"></select>
+            <textarea id="persona-user" class="flex-1 w-full border border-line bg-transparent rounded-lg p-3 sm:p-4 text-base md:text-sm outline-none focus:border-info resize-none min-h-[80px]"></textarea>
+            <p id="persona-user-hint" class="hf text-[11px] text-dim mt-1">Read-only preview of the saved user persona. Edit it from the User tab; your own prompt is kept and comes back if you switch to it.</p>
+          </div>
         </div>
       </div>
       <input type="hidden" id="persona-edit-id">
@@ -8523,6 +8808,15 @@ body::before{content:'';position:fixed;inset:0;z-index:-1;pointer-events:none;
         <p class="text-[11px] text-dim mt-1.5">The app follows this language. Your chats are never translated on their own.</p>
       </div>
       <div>
+        <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Quick model switch</p>
+        <div class="flex items-center justify-between gap-3">
+          <p class="text-xs text-dim flex-1">Shows the model in the top bar, next to the Sketchboard. Tap it to pick another model from the endpoint you chat with.</p>
+          <button id="qm-toggle" onclick="toggleQuickModel()" class="rp-switch w-11 h-6 rounded-full relative flex-shrink-0 bg-surface-3">
+            <span class="absolute top-0.5 w-5 h-5 rounded-full bg-surface shadow transition-[left]" style="left:2px"></span>
+          </button>
+        </div>
+      </div>
+      <div>
       <p class="text-[10px] font-bold uppercase tracking-wider text-dim mb-2">Font</p>
       <div class="flex gap-2">
         <input id="font-input" type="text" placeholder="Any Google Font, e.g. Nunito" class="flex-1 min-w-0 bg-transparent border border-line rounded-lg px-3 py-2 text-sm outline-none focus:border-accent">
@@ -8756,6 +9050,9 @@ const S={
     csrf:'',username:'',session:'default',sessionLabel:'default',
     generating:false,
     personas:[], currentPersonaId:null,
+    userPersonas:[], currentUserPersonaId:null,   // the chat's own pick; null = the bot's setting
+    personaTab:'bot', quickTab:'bot',             // Bot | User, in the modal and in the header menu
+    chatModel:null,                               // {id,name,provider,model} of the first chat endpoint
     memory:{},sessions:[],
     msgs:[],hasMore:false,loadingOlder:false,
     userScrolled:false,
@@ -9551,7 +9848,51 @@ var I18N = { vi: {
   'Whatever your endpoint expects; leave blank for a local server.': 'Tuỳ endpoint của bạn yêu cầu; để trống nếu là máy chủ chạy nội bộ.',
   'Create Persona': 'Tạo nhân vật mới',
   'Edit Persona': 'Sửa nhân vật',
-  'Primary chat': 'Kết nối chính, dùng để trò chuyện'
+  'Primary chat': 'Kết nối chính, dùng để trò chuyện',
+  /* user personas: who YOU are in a chat */
+  'User': 'User',
+  'Who you are in the story': 'Bạn là ai trong câu chuyện',
+  'Who you are in this chat': 'Bạn là ai trong đoạn chat này',
+  'Create User Persona': 'Tạo persona của bạn',
+  'Edit User Persona': 'Sửa persona của bạn',
+  'Save User Persona': 'Lưu persona',
+  'No user personas yet. Make one and reuse it with any bot, in any chat.': 'Chưa có persona nào. Tạo một cái để dùng lại với bot nào, đoạn chat nào cũng được.',
+  'No personas yet.': 'Chưa có nhân vật nào.',
+  'Active via the bot': 'Đang dùng qua nhân vật',
+  'Stop using': 'Bỏ dùng',
+  'Your name in the story': 'Tên của bạn trong truyện',
+  'User Prompt': 'Prompt của bạn',
+  'Who you are: looks, personality, background, how the AI should treat you…': 'Bạn là ai: ngoại hình, tính cách, hoàn cảnh, muốn AI đối xử với bạn thế nào…',
+  'A user persona only tells the AI who you are. It has no greeting: the bot still opens the chat.': 'Persona của bạn chỉ cho AI biết bạn là ai. Nó không có tin nhắn mở đầu: nhân vật AI vẫn là người mở lời.',
+  'Own prompt (written below)': 'Prompt gốc (viết ở dưới)',
+  'User persona': 'Persona tạo sẵn',
+  'Read-only preview of the saved user persona. Edit it from the User tab; your own prompt is kept and comes back if you switch to it.': 'Đang xem trước persona tạo sẵn (chỉ đọc). Sửa nó ở tab User; prompt gốc của bạn vẫn được giữ và quay lại khi chọn lại.',
+  'Delete this user persona? Bots and chats using it go back to their own prompt.': 'Xoá persona này? Nhân vật và đoạn chat đang dùng nó sẽ quay về prompt gốc.',
+  'User persona saved!': 'Đã lưu persona!',
+  'User persona deleted.': 'Đã xoá persona.',
+  'You are now': 'Bạn đang là',
+  "Using the bot's own user prompt": 'Đang dùng prompt gốc của nhân vật',
+  'Follow the bot': 'Theo nhân vật',
+  'its own user prompt': 'prompt gốc của nhân vật',
+  'Manage user personas': 'Quản lý persona của bạn',
+  'Create a user persona': 'Tạo persona của bạn',
+  'Persona switched. The chat now opens with its greeting.': 'Đã đổi nhân vật. Đoạn chat giờ mở đầu bằng lời chào của nhân vật này.',
+  /* quick model switch */
+  'Quick model switch': 'Đổi model nhanh',
+  'Shows the model in the top bar, next to the Sketchboard. Tap it to pick another model from the endpoint you chat with.': 'Hiện model ở thanh trên cùng, cạnh Bảng ghi nhớ. Bấm vào để chọn model khác của kết nối API đang dùng để chat.',
+  'Quick model switch on': 'Đã bật đổi model nhanh',
+  'Quick model switch off': 'Đã tắt đổi model nhanh',
+  'Switch model': 'Đổi model',
+  'Search models…': 'Tìm model…',
+  'Loading models...': 'Đang tải danh sách model...',
+  'No model': 'Chưa có model',
+  'Nothing matches': 'Không có kết quả cho',
+  'Could not change the model': 'Không đổi được model',
+  'Could not read the model list': 'Không đọc được danh sách model',
+  'That provider returned no models': 'Nhà cung cấp này không trả về model nào',
+  'No chat endpoint yet. Add one in API Endpoints first.': 'Chưa có kết nối API để chat. Thêm một cái ở mục Kết nối API trước.',
+  'The active endpoint changed. Open the list again.': 'Kết nối đang dùng vừa thay đổi. Mở lại danh sách nhé.',
+  'Pick a model': 'Chọn một model'
 } };
 
 /* Everything a reader typed, or the AI wrote, lives inside one of these - and
@@ -9872,6 +10213,9 @@ function applyBootstrap(d){
     syncPrefsOnStart();
     S.personas=d.personas||[];
     S.currentPersonaId = d.current_persona_id || (S.personas[0]?S.personas[0].id:null);
+    S.userPersonas = Array.isArray(d.user_personas) ? d.user_personas : [];
+    S.currentUserPersonaId = d.current_user_persona_id || null;
+    S.chatModel = d.chat_model || null;
     S.memory=d.memory||{}; S.sessions=d.sessions||[];
     S.msgs=d.messages||[]; S.hasMore=!!d.has_more;
     S.pins=Array.isArray(d.pins)?d.pins:[];
@@ -10209,10 +10553,12 @@ function buildMsgEl(msg){
         </div>
       </div>\`;
   }else{
+    const uav=userAvatarHTML();   // who you are in this chat, when it is somebody
     wrap.innerHTML=\`
       <div class="flex w-full md:max-w-[80%] max-w-[95%] items-start justify-end space-x-2 ml-auto">
         <div class="flex-shrink-0 pt-2"><button onclick="toggleDropdown(event,'\${msg.id}',false)" class="msg-more p-1 text-dim hover:text-main rounded-full opacity-0 group-hover:opacity-100 transition-opacity"><i data-lucide="more-vertical"class="w-4 h-4"></i></button></div>
         <div data-side="user" class="msg-content bg-accent text-onaccent text-sm rounded-2xl rounded-tr-sm px-4 py-2.5 shadow-sm break-words w-fit max-w-full">\${msgHTML(msg.id, msg.content||'')}</div>
+        <div class="msg-uav w-8 h-8 rounded-full bg-surface-2 border border-line flex items-center justify-center flex-shrink-0 overflow-hidden\${uav?'':' hf'}">\${uav}</div>
       </div>\`;
   }
   /* dressed before it is inserted, so a streamed reply never flashes the
@@ -10918,7 +11264,10 @@ const LG = (function(){
           + '.modal-content button.bg-accent,'
           /* the things that sit on top of everything else, which is where glass
              is most obvious and where it was most conspicuously missing */
-          + '#global-dropdown,#think-picker,#toast,.modal-content';
+          + '#global-dropdown,#think-picker,#toast,.modal-content,'
+          /* the model menu is the same kind of floating list, and the picked
+             half of the Bot | User switch is an accent pill like the others */
+          + '#qm-menu,.seg-btn.is-on';
   const cache=new Map();
   /* what currently wears a filter, so it can be taken back off. Without this a
      nav item you have moved away from keeps its chip: the element stops
@@ -11423,6 +11772,7 @@ function applyLook(){
   } else { s.removeProperty('--cursor'); s.removeProperty('--cursor-pointer'); }
   document.getElementById('bg-video')?.remove();
   applyGlass();
+  applyQuickModel();
   applyPlainBubbleAlpha();
   if(isLocalBg(u)){
     /* the blob is read asynchronously; everything else here can carry on */
@@ -14177,25 +14527,61 @@ drop.innerHTML=\`
     placeDropdown(drop, rect, isBot ? 'left' : 'right');
 }
 
+/* The header's persona menu. Bot lists who the AI plays in this chat, User
+   lists who you play; the switch at the bottom flips between them without
+   closing the menu. */
+let _qsRect = null;
 function togglePersonaDropdown(e) {
     e.stopPropagation();
     const drop = $('global-dropdown');
-    const rect = e.currentTarget.getBoundingClientRect();
-    
-    drop.innerHTML = \`
-        <div class="px-3 py-2 text-[10px] font-bold text-dim uppercase tracking-wider border-b border-line">\${t('Switch Persona for Session')}</div>
-        <div class="max-h-64 overflow-y-auto">
-        \${S.personas.map(p => \`
-            <button onclick="changeSessionPersona('\${p.id}')" class="flex items-center px-4 py-2 text-sm hover:bg-surface-2 w-full text-left \${p.id == S.currentPersonaId ? 'text-accent font-medium bg-surface-2' : ''}">
-                <span class="w-5 h-5 rounded overflow-hidden mr-2 bg-surface-3 flex items-center justify-center text-[10px] flex-shrink-0">\${avImg(p.avatar) ? \`<img src="\${esc(p.avatar)}" class="w-full h-full object-cover">\` : esc(p.avatar.substring(0,2))}</span>
-                <span class="truncate">\${esc(p.name)}</span>
-                \${p.id == S.currentPersonaId ? '<i data-lucide="check" class="w-3.5 h-3.5 ml-auto"></i>' : ''}
-            </button>
-        \`).join('')}
-        </div>
-    \`;
+    if(!drop.classList.contains('hf') && drop.dataset.menu === 'persona'){ closeAllDropdowns(); return; }
+    _qsRect = e.currentTarget.getBoundingClientRect();
+    renderPersonaDropdown();
+}
+function setQuickTab(k){ S.quickTab = k === 'user' ? 'user' : 'bot'; renderPersonaDropdown(); }
+
+function qsRow(fn, id, avHtml, name, sub, on){
+    return '<button data-id="' + esc(id) + '" onclick="' + fn + '(this.dataset.id)" class="flex items-center px-4 py-2 text-sm hover:bg-surface-2 w-full text-left ' + (on ? 'text-accent font-medium bg-surface-2' : '') + '">'
+        + '<span class="w-5 h-5 rounded overflow-hidden mr-2 bg-surface-3 flex items-center justify-center text-[10px] flex-shrink-0">' + avHtml + '</span>'
+        + '<span class="min-w-0"><span class="block truncate">' + esc(name) + '</span>'
+        + (sub ? '<span class="block truncate text-[10px] text-dim font-normal">' + esc(sub) + '</span>' : '') + '</span>'
+        + (on ? '<i data-lucide="check" class="w-3.5 h-3.5 ml-auto flex-shrink-0"></i>' : '')
+        + '</button>';
+}
+function tinyAv(a, name){
+    a = String(a || '');
+    return avImg(a) ? '<img src="' + esc(a) + '" class="w-full h-full object-cover">' : esc((a || name || '?').substring(0,2));
+}
+
+function renderPersonaDropdown(){
+    const drop = $('global-dropdown');
+    const user = S.quickTab === 'user';
+    let rows;
+    if(!user){
+        rows = S.personas.map(p => qsRow('changeSessionPersona', p.id, tinyAv(p.avatar, p.name), p.name, '', p.id == S.currentPersonaId));
+    } else {
+        const bot = currentBot();
+        const viaBot = userPersonaById(bot && bot.user_persona_id);
+        rows = [qsRow('changeSessionUserPersona', '', '<i data-lucide="bot" class="w-3 h-3"></i>', t('Follow the bot'),
+                      viaBot ? viaBot.name : t('its own user prompt'), !S.currentUserPersonaId)]
+            .concat(S.userPersonas.map(u => qsRow('changeSessionUserPersona', u.id, tinyAv(u.avatar, u.name), u.name, '', u.id == S.currentUserPersonaId)));
+        rows.push('<button onclick="openUserPersonas()" class="flex items-center px-4 py-2 text-xs text-dim hover:bg-surface-2 hover:text-main w-full text-left"><i data-lucide="plus" class="w-3.5 h-3.5 mr-2"></i>' + t(S.userPersonas.length ? 'Manage user personas' : 'Create a user persona') + '</button>');
+    }
+    drop.dataset.menu = 'persona';
+    drop.innerHTML =
+        '<div class="px-3 py-2 text-[10px] font-bold text-dim uppercase tracking-wider border-b border-line">' + t(user ? 'Who you are in this chat' : 'Switch Persona for Session') + '</div>'
+        + '<div class="max-h-64 overflow-y-auto">' + rows.join('') + '</div>'
+        + '<div class="qs-foot border-t border-line"><div class="seg" role="tablist">' + segHTML(S.quickTab, 'setQuickTab') + '</div></div>';
     lucide.createIcons();
-    placeDropdown(drop, rect, 'left');
+    placeDropdown(drop, _qsRect, 'left');
+    if(typeof LG !== 'undefined') LG.refresh();   // new pills and menus join the glass
+}
+
+function openUserPersonas(){
+    closeAllDropdowns();
+    S.personaTab = 'user';
+    hidePersonaForm();
+    openModal('persona-modal');
 }
 
 function closeAllDropdowns(){
@@ -14204,8 +14590,11 @@ function closeAllDropdowns(){
        closes on the same gesture rather than relying on a click bubbling out of
        the composer it no longer lives in. */
     $('think-picker')?.classList.add('hf');
+    const qm=$('qm-menu');
+    if(qm){ qm.classList.add('hf'); qm.style.maxHeight=''; qm.style.overflowY=''; qm.style.maxWidth=''; }
     const d=$('global-dropdown');
     d.classList.add('hf');
+    delete d.dataset.menu;
     // Drop the clamp placeDropdown may have applied, so the next open measures
     // the menu at its natural size again.
     d.style.maxHeight=''; d.style.overflowY=''; d.style.maxWidth='';
@@ -14438,10 +14827,13 @@ async function newSession(){
     const label=prompt('Session name:','New Session '+new Date().toLocaleTimeString());if(!label)return;
     const res=await api('manageSessions',{op:'new',label,persona_id:S.currentPersonaId});
     if(res.success){
-        S.sessions.push({id:res.session_id,label:res.label});
+        S.sessions.push({id:res.session_id,label:res.label,persona_id:S.currentPersonaId,user_persona_id:null});
         S.session=res.session_id;S.sessionLabel=res.label;
+        S.currentUserPersonaId=null;          // a new chat follows the bot's setting
         S.msgs=[];S.hasMore=false;S.memory={};S.pins=[];
-        $('chat-container').innerHTML='';
+        /* the server has already written the greeting; show it instead of an
+           empty page that only fills in after a reload */
+        await loadChatHistory();
         renderSketchboard();
         await loadSketchboard();
         updateHeader();
@@ -14470,58 +14862,154 @@ async function deleteSession(id){
     renderSessionsList();
 }
 
+/* ── PERSONAS: BOT | USER ───────────────────────────────────────────────
+   A bot persona is who the AI plays. A user persona is who YOU play: a name,
+   a picture and a prompt, nothing else - it never speaks first.
+
+   Which user persona applies, most specific first:
+     1. the one picked for this chat (header menu -> User, or "Use Here")
+     2. the one the bot is set to use (bot form -> User Persona)
+     3. none: the bot's own "About the user" text */
+function currentBot(){
+    return S.personas.find(p => p.id == S.currentPersonaId) || S.personas[0] || null;
+}
+function userPersonaById(id){
+    return id ? (S.userPersonas.find(u => u.id == id) || null) : null;
+}
+function activeUserPersona(){
+    const bot = currentBot();
+    return userPersonaById(S.currentUserPersonaId) || userPersonaById(bot && bot.user_persona_id);
+}
+/* The inside of an avatar circle: the picture, or the first two characters. */
+function avatarInner(a, name, cls){
+    a = String(a || '');
+    if(avImg(a)) return '<img src="' + esc(a) + '" class="w-full h-full object-cover">';
+    return '<span class="' + (cls || 'text-xs font-bold text-body') + '">' + esc((a || name || '?').substring(0,2)) + '</span>';
+}
+/* The Bot | User switch. data-k rather than a quoted argument, so nothing has
+   to survive two rounds of escaping. */
+function segHTML(active, fn){
+    return ['bot','user'].map(function(k){
+        const on = active === k;
+        return '<button type="button" role="tab" aria-selected="' + on + '" data-k="' + k + '" class="seg-btn' + (on ? ' is-on' : '') + '"'
+            + ' onclick="event.stopPropagation();' + fn + '(this.dataset.k)">'
+            + '<i data-lucide="' + k + '" class="w-3.5 h-3.5"></i><span>' + (k === 'bot' ? 'Bot' : 'User') + '</span></button>';
+    }).join('');
+}
+
 async function loadPersonas(){
-    const res = await api('managePersonas', {op: 'list'});
+    const [res, ures] = await Promise.all([
+        api('managePersonas', {op: 'list'}),
+        api('manageUserPersonas', {op: 'list'}),
+    ]);
     S.personas = Array.isArray(res) ? res : [];
-    
+    if(Array.isArray(ures)) S.userPersonas = ures;
     if(!S.currentPersonaId && S.personas.length > 0) S.currentPersonaId = S.personas[0].id;
     updateHeader();
-    
-    const cont = $('personas-list-container'); cont.innerHTML = '';
-    S.personas.forEach(p => {
-        const isCurrent = p.id == S.currentPersonaId;
-        const div = document.createElement('div');
-        div.className = \`flex items-center justify-between border \${isCurrent?'border-accent':'border-line'} rounded-lg p-3 bg-surface\`;
-        
-        const avHtml = avImg(p.avatar) ? \`<img src="\${esc(p.avatar)}" class="w-full h-full object-cover">\` : \`<span class="text-xs font-bold text-dim">\${esc(p.avatar.substring(0,2))}</span>\`;
-        div.innerHTML = \`
-            <div class="flex items-center space-x-3 min-w-0">
-                <div class="w-10 h-10 rounded-lg bg-surface-2 flex items-center justify-center overflow-hidden flex-shrink-0">\${avHtml}</div>
-                <div class="min-w-0">
-                    <p class="text-sm font-semibold truncate">\${esc(p.name)}\${isCurrent?'<span class="ml-2 text-[10px] bg-accent-soft text-accent px-1.5 py-0.5 rounded">'+t('Active in Session')+'</span>':''}</p>
-                    <p class="text-xs text-dim truncate">\${esc(p.description || t('No description'))}</p>
-                </div>
-            </div>
-            <div class="flex items-center space-x-2 pl-3">
-                \${!isCurrent ? \`<button onclick="changeSessionPersona('\${p.id}')" class="text-[10px] px-2 py-1 rounded border border-line hover:border-info hover:text-info transition-colors whitespace-nowrap">\${t('Use Here')}</button>\` : ''}
-                <button onclick="showPersonaForm('\${p.id}')" class="p-1.5 text-dim hover:text-info"><i data-lucide="edit-2" class="w-4 h-4"></i></button>
-                <button onclick="deletePersona('\${p.id}')" class="p-1.5 text-dim hover:text-danger"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
-            </div>
-        \`;
-        cont.appendChild(div);
-    });
-    lucide.createIcons();
+    refreshUserAvatars();
+    renderPersonaList();
 }
+
+function setPersonaTab(k){ S.personaTab = k === 'user' ? 'user' : 'bot'; renderPersonaList(); }
+function createOfPersonaTab(){ if(S.personaTab === 'user') showUserPersonaForm(null); else showPersonaForm(null); }
+
+function renderPersonaList(){
+    const user = S.personaTab === 'user';
+    $('persona-tabs').innerHTML = segHTML(S.personaTab, 'setPersonaTab');
+    $('personas-sub').textContent = t(user ? 'Who you are in the story' : 'Define custom AI behaviors');
+    $('persona-create-label').textContent = t(user ? 'Create User Persona' : 'Create New Persona');
+
+    const cont = $('personas-list-container'); cont.innerHTML = '';
+    const list = user ? S.userPersonas : S.personas;
+    if(!list.length){
+        cont.innerHTML = '<p class="text-xs text-dim py-2">' + t(user ? 'No user personas yet. Make one and reuse it with any bot, in any chat.' : 'No personas yet.') + '</p>';
+    }
+    list.forEach(p => cont.appendChild(user ? userPersonaCard(p) : botPersonaCard(p)));
+    /* the injected search box filters what is on screen; run it again so the
+       other tab is filtered by the same words */
+    const q = cont.previousElementSibling;
+    if(q && q.classList.contains('rs-search') && q.value) q.dispatchEvent(new Event('input'));
+    lucide.createIcons();
+    if(typeof LG !== 'undefined') LG.refresh();   // new pills and menus join the glass
+}
+
+function personaCardHTML(avHtml, name, badge, desc, actions){
+    return '<div class="flex items-center space-x-3 min-w-0">'
+        + '<div class="w-10 h-10 rounded-lg bg-surface-2 flex items-center justify-center overflow-hidden flex-shrink-0">' + avHtml + '</div>'
+        + '<div class="min-w-0"><p class="text-sm font-semibold truncate">' + esc(name) + badge + '</p>'
+        + '<p class="text-xs text-dim truncate">' + desc + '</p></div></div>'
+        + '<div class="flex items-center space-x-2 pl-3">' + actions + '</div>';
+}
+function pill(text, strong){
+    return '<span class="ml-2 text-[10px] ' + (strong ? 'bg-accent-soft text-accent' : 'bg-surface-2 text-dim') + ' px-1.5 py-0.5 rounded">' + esc(text) + '</span>';
+}
+function iconBtn(fn, id, icon, tone){
+    return '<button data-id="' + esc(id) + '" onclick="' + fn + '(this.dataset.id)" class="p-1.5 text-dim hover:text-' + tone + '"><i data-lucide="' + icon + '" class="w-4 h-4"></i></button>';
+}
+function textBtn(fn, id, label){
+    return '<button data-id="' + esc(id) + '" onclick="' + fn + '(this.dataset.id)" class="text-[10px] px-2 py-1 rounded border border-line hover:border-info hover:text-info transition-colors whitespace-nowrap">' + esc(label) + '</button>';
+}
+
+function botPersonaCard(p){
+    const isCurrent = p.id == S.currentPersonaId;
+    const up = userPersonaById(p.user_persona_id);
+    const div = document.createElement('div');
+    div.className = 'flex items-center justify-between border ' + (isCurrent ? 'border-accent' : 'border-line') + ' rounded-lg p-3 bg-surface';
+    div.innerHTML = personaCardHTML(
+        avatarInner(p.avatar, p.name, 'text-xs font-bold text-dim'),
+        p.name,
+        (isCurrent ? pill(t('Active in Session'), true) : '') + (up ? pill(t('User') + ': ' + up.name) : ''),
+        esc(p.description || t('No description')),
+        (isCurrent ? '' : textBtn('changeSessionPersona', p.id, t('Use Here')))
+            + iconBtn('showPersonaForm', p.id, 'edit-2', 'info')
+            + iconBtn('deletePersona', p.id, 'trash-2', 'danger'));
+    return div;
+}
+
+function userPersonaCard(u){
+    const picked = u.id == S.currentUserPersonaId;
+    const bot = currentBot();
+    const viaBot = !S.currentUserPersonaId && bot && bot.user_persona_id == u.id;
+    const div = document.createElement('div');
+    div.className = 'flex items-center justify-between border ' + (picked || viaBot ? 'border-accent' : 'border-line') + ' rounded-lg p-3 bg-surface';
+    div.innerHTML = personaCardHTML(
+        avatarInner(u.avatar, u.name, 'text-xs font-bold text-dim'),
+        u.name,
+        picked ? pill(t('Active in Session'), true) : (viaBot ? pill(t('Active via the bot'), true) : ''),
+        esc(u.description || u.prompt || t('No description')),
+        (picked ? textBtn('changeSessionUserPersona', '', t('Stop using'))
+                : textBtn('changeSessionUserPersona', u.id, t('Use Here')))
+            + iconBtn('showUserPersonaForm', u.id, 'edit-2', 'info')
+            + iconBtn('deleteUserPersona', u.id, 'trash-2', 'danger'));
+    return div;
+}
+
+/* ── the bot form ── */
+/* What the user typed as the bot's own prompt. Picking a saved user persona
+   shows that persona's prompt in the box read-only, so this is where the
+   typed text waits in case the choice is switched back. */
+let _ownUserPrompt = '';
 
 function showPersonaForm(editId){
     S.editingPersonaId = editId;
     $('persona-edit-id').value = editId || '';
-    $('personas-title').textContent = editId ? 'Edit Persona' : 'Create Persona';
+    $('personas-title').textContent = t(editId ? 'Edit Persona' : 'Create Persona');
     $('personas-list-view').classList.add('hf');
+    $('upersona-form-view').classList.add('hf');
     $('personas-form-view').classList.remove('hf');
-    
-    if(editId) {
-        const p = S.personas.find(x => x.id == editId);
-        if(p) {
-            $('persona-name').value = p.name; $('persona-avatar').value = p.avatar;
-            $('persona-desc').value = p.description; $('persona-prompt').value = p.system_prompt;
-            $('persona-user').value = p.user_persona; $('persona-first-msg').value = p.greeting_message;
-        }
-    } else {
-        $('persona-name').value = ''; $('persona-avatar').value = 'AI';
-        $('persona-desc').value = ''; $('persona-prompt').value = '';
-        $('persona-user').value = ''; $('persona-first-msg').value = '';
-    }
+    $('persona-tabs').classList.add('hf');      // Bot | User only means something on the list
+
+    const p = editId ? S.personas.find(x => x.id == editId) : null;
+    $('persona-name').value = p ? p.name : '';
+    $('persona-avatar').value = p ? p.avatar : 'AI';
+    $('persona-desc').value = p ? p.description : '';
+    $('persona-prompt').value = p ? p.system_prompt : '';
+    $('persona-first-msg').value = p ? p.greeting_message : '';
+    _ownUserPrompt = p ? (p.user_persona || '') : '';
+    const ta = $('persona-user');
+    ta.readOnly = false; ta.value = _ownUserPrompt;
+    fillUserSrc(p ? p.user_persona_id : '');
+    syncUserSrc();
     /* Only the persona actually in use can be styled from here: the Appearance
        window previews on the live conversation, so styling a persona you are
        not talking to would show you somebody else's look. */
@@ -14530,13 +15018,32 @@ function showPersonaForm(editId){
     updateAvatarPreview();
 }
 
+function fillUserSrc(sel){
+    const box = $('persona-user-src');
+    const known = !!userPersonaById(sel);
+    box.innerHTML = '<option value="">' + esc(t('Own prompt (written below)')) + '</option>'
+        + S.userPersonas.map(u => '<option value="' + esc(u.id) + '">' + esc(t('User persona') + ': ' + u.name) + '</option>').join('');
+    box.value = known ? sel : '';
+}
+
+function syncUserSrc(){
+    const ta = $('persona-user'), up = userPersonaById($('persona-user-src').value);
+    if(!ta.readOnly) _ownUserPrompt = ta.value;     // leaving "own": keep what was typed
+    if(up){ ta.value = up.prompt || ''; ta.readOnly = true; ta.classList.add('opacity-70'); }
+    else  { ta.value = _ownUserPrompt;  ta.readOnly = false; ta.classList.remove('opacity-70'); }
+    $('persona-user-hint').classList.toggle('hf', !up);
+}
+
 function hidePersonaForm(){
     $('personas-form-view').classList.add('hf');
+    $('upersona-form-view').classList.add('hf');
     $('personas-list-view').classList.remove('hf');
-    $('personas-title').textContent = 'Personas & Prompts';
+    $('persona-tabs').classList.remove('hf');
+    $('personas-title').textContent = t('Personas & Prompts');
 }
 
 async function savePersona(){
+    const ta = $('persona-user');
     const p = {
         op: S.editingPersonaId ? 'edit' : 'add',
         id: S.editingPersonaId,
@@ -14544,15 +15051,16 @@ async function savePersona(){
         avatar: $('persona-avatar').value.trim() || 'AI',
         description: $('persona-desc').value.trim(),
         system_prompt: $('persona-prompt').value.trim(),
-        user_persona: $('persona-user').value.trim(),
+        user_persona: (ta.readOnly ? _ownUserPrompt : ta.value).trim(),
+        user_persona_id: $('persona-user-src').value || '',
         greeting_message: $('persona-first-msg').value.trim()
     };
-    
+
     if(!p.name) { toast("Name is required"); return; }
-    
+
     const res = await api('managePersonas', p);
     if(res.error) { toast(res.error); return; }
-    
+
     hidePersonaForm();
     await loadPersonas();
     toast('Persona saved!');
@@ -14567,24 +15075,236 @@ async function deletePersona(id){
     toast('Persona deleted.');
 }
 
+/* ── the user persona form ── */
+function showUserPersonaForm(editId){
+    S.editingUserPersonaId = editId || null;
+    const u = userPersonaById(editId);
+    $('personas-title').textContent = t(editId ? 'Edit User Persona' : 'Create User Persona');
+    $('personas-list-view').classList.add('hf');
+    $('personas-form-view').classList.add('hf');
+    $('upersona-form-view').classList.remove('hf');
+    $('persona-tabs').classList.add('hf');
+    $('upersona-name').value   = u ? u.name : '';
+    $('upersona-avatar').value = u ? (u.avatar || '') : '';
+    $('upersona-desc').value   = u ? (u.description || '') : '';
+    $('upersona-prompt').value = u ? (u.prompt || '') : '';
+    updateUserAvatarPreview();
+    if(window.lucide) lucide.createIcons();
+}
+
+function updateUserAvatarPreview(){
+    $('upersona-avatar-preview').innerHTML = avatarInner($('upersona-avatar').value.trim(), $('upersona-name').value.trim() || 'U', 'text-xl font-bold text-dim');
+}
+
+async function saveUserPersona(){
+    const p = {
+        op: S.editingUserPersonaId ? 'edit' : 'add',
+        id: S.editingUserPersonaId,
+        name: $('upersona-name').value.trim(),
+        avatar: $('upersona-avatar').value.trim(),
+        description: $('upersona-desc').value.trim(),
+        prompt: $('upersona-prompt').value.trim()
+    };
+    if(!p.name) { toast("Name is required"); return; }
+    const res = await api('manageUserPersonas', p);
+    if(res.error) { toast(res.error); return; }
+    hidePersonaForm();
+    await loadPersonas();
+    toast('User persona saved!');
+}
+
+async function deleteUserPersona(id){
+    if(!confirm(t('Delete this user persona? Bots and chats using it go back to their own prompt.'))) return;
+    const res = await api('manageUserPersonas', {op: 'delete', id});
+    if(res.error) { toast(res.error); return; }
+    if(S.currentUserPersonaId == id) S.currentUserPersonaId = null;
+    S.sessions.forEach(s => { if(s.user_persona_id == id) s.user_persona_id = null; });
+    await loadPersonas();         // the bots that pointed at it were cleared too
+    toast('User persona deleted.');
+}
+
+/* ── switching, for this chat ── */
 async function changeSessionPersona(pid) {
     closeAllDropdowns();
-    const res = await api('setSessionPersona', { session_id: S.session, persona_id: pid });
+    const sid = S.session;
+    const res = await api('setSessionPersona', { session_id: sid, persona_id: pid });
     if(res.error) { toast(res.error); return; }
     S.currentPersonaId = pid;
+    const s = S.sessions.find(x => x.id === sid); if(s) s.persona_id = pid;
     updateHeader();
+    refreshUserAvatars();        // "follow the bot" may now mean somebody else
     applyLook();                 // this persona may dress differently
-    if(!$('persona-modal').classList.contains('hf')) loadPersonas();
-    toast('Persona switched for this session.');
+    /* nothing said yet: the server swapped the greeting for the new bot's */
+    if(res.greeting_replaced && S.session === sid) await loadChatHistory();
+    if(!$('persona-modal').classList.contains('hf')) renderPersonaList();
+    toast(res.greeting_replaced ? 'Persona switched. The chat now opens with its greeting.' : 'Persona switched for this session.');
+}
+
+async function changeSessionUserPersona(id) {
+    closeAllDropdowns();
+    id = id || null;
+    const sid = S.session;
+    const res = await api('setSessionUserPersona', { session_id: sid, user_persona_id: id || '' });
+    if(res.error) { toast(res.error); return; }
+    if(S.session !== sid) return;
+    S.currentUserPersonaId = id;
+    const s = S.sessions.find(x => x.id === sid); if(s) s.user_persona_id = id;
+    updateHeader();
+    refreshUserAvatars();
+    if(!$('persona-modal').classList.contains('hf')) renderPersonaList();
+    const up = activeUserPersona();
+    toast(up ? t('You are now') + ': ' + up.name : t("Using the bot's own user prompt"));
+}
+
+/* The picture beside your own messages follows whoever you are right now. Every
+   user row carries the slot, so a switch repaints in place instead of
+   rebuilding a conversation that may be streaming. */
+function userAvatarHTML(){
+    const up = activeUserPersona();
+    return up ? avatarInner(up.avatar, up.name) : '';
+}
+function refreshUserAvatars(){
+    const html = userAvatarHTML();
+    document.querySelectorAll('#chat-container .msg-uav').forEach(el => {
+        el.innerHTML = html;
+        el.classList.toggle('hf', !html);
+    });
 }
 
 function updateHeader(){
-    const persona = S.personas.find(p => p.id == S.currentPersonaId) || S.personas[0] || {name: 'System Assistant', avatar: 'AI'};
-    $('header-name').textContent=persona.name;
-    const label=S.sessions.find(s=>s.id===S.session)?.label||S.session;
-    $('header-sess').textContent=label;
-    const av=persona.avatar;
-    $('header-avatar').innerHTML=avImg(av)?\`<img src="\${esc(av)}"class="w-full h-full object-cover">\`:\`<span class="text-xs font-bold text-body">\${esc(av.substring(0,2))}</span>\`;
+    const persona = currentBot() || {name: 'System Assistant', avatar: 'AI'};
+    $('header-name').textContent = persona.name;
+    $('header-avatar').innerHTML = avatarInner(persona.avatar || 'AI', persona.name);
+    const label = S.sessions.find(s => s.id === S.session)?.label || S.session;
+    const up = activeUserPersona();
+    setMarquee($('header-sess'), up ? label + ' - ' + up.name : label);
+}
+
+/* One line that scrolls, slowly, when it does not fit - and only then. The
+   text is laid twice end to end so the loop has no seam; the pause sits in the
+   keyframes. Re-measured on resize, because what fits changes with the width. */
+function setMarquee(box, text){
+    if(!box) return;
+    box.dataset.text = text;
+    box.title = text;
+    box.classList.remove('is-running');
+    box.innerHTML = '<span class="mq-track"><span class="mq-item"></span></span>';
+    const track = box.firstChild, item = track.firstChild;
+    item.textContent = text;
+    requestAnimationFrame(function(){
+        if(box.dataset.text !== text || !box.clientWidth) return;
+        if(item.scrollWidth <= box.clientWidth + 1) return;
+        box.classList.add('is-running');          // adds the gap after each copy
+        const copy = item.cloneNode(true);
+        copy.setAttribute('aria-hidden', 'true');
+        track.appendChild(copy);
+        const dist = item.offsetWidth;
+        track.style.setProperty('--mq-dist', (-dist) + 'px');
+        track.style.setProperty('--mq-dur', Math.max(8, dist / 20).toFixed(1) + 's');   // ~20px a second
+    });
+}
+let _mqTimer = 0;
+addEventListener('resize', function(){
+    clearTimeout(_mqTimer);
+    _mqTimer = setTimeout(function(){
+        const b = $('header-sess');
+        if(b && b.dataset.text != null) setMarquee(b, b.dataset.text);
+    }, 200);
+});
+
+/* ── QUICK MODEL SWITCH ─────────────────────────────────────────────────
+   Off by default (Appearance -> More). When on, the top bar shows the model of
+   the endpoint chat replies go to first, and picking from its list changes
+   that endpoint's model - the same field the API Endpoints form edits. */
+let _qmModels = [], _qmBusy = false;
+
+function quickModelOn(){ return !!UI.get().quickModel; }
+function toggleQuickModel(){
+    const u = UI.get(); u.quickModel = !u.quickModel; UI.set(u);
+    applyQuickModel();
+    if(u.quickModel && !S.chatModel) refreshQuickModel();
+    toast(u.quickModel ? 'Quick model switch on' : 'Quick model switch off');
+}
+function keyLine(m){
+    if(!m) return '';
+    return (m.name ? m.name + ' · ' : '') + m.provider;
+}
+function applyQuickModel(){
+    const on = quickModelOn();
+    const sw = $('qm-toggle');
+    if(sw){
+        sw.className = 'rp-switch w-11 h-6 rounded-full relative flex-shrink-0 ' + (on ? 'bg-success' : 'bg-surface-3');
+        const k = sw.firstElementChild; if(k) k.style.left = on ? '22px' : '2px';
+    }
+    const b = $('qm-btn'); if(!b) return;
+    b.classList.toggle('hf', !on);
+    if(!on){ $('qm-menu')?.classList.add('hf'); return; }
+    const m = S.chatModel;
+    $('qm-label').textContent = m ? m.model : t('No model');
+    b.setAttribute('aria-label', m ? t('Switch model') + ': ' + m.model : t('Switch model'));
+}
+async function refreshQuickModel(){
+    const r = await api('quickModel', {op: 'get'});
+    S.chatModel = (r && !r.error) ? r : null;
+    applyQuickModel();
+}
+
+async function toggleModelMenu(e){
+    e.stopPropagation();
+    const menu = $('qm-menu');
+    if(!menu.classList.contains('hf')){ closeAllDropdowns(); return; }
+    closeAllDropdowns();
+    const rect = e.currentTarget.getBoundingClientRect();
+    $('qm-search').value = '';
+    $('qm-key').textContent = keyLine(S.chatModel);
+    $('qm-list').innerHTML = '<p class="px-3 py-3 text-xs text-dim">' + t('Loading models...') + '</p>';
+    placeDropdown(menu, rect, 'right');
+    if(typeof LG !== 'undefined') LG.refresh();   // new pills and menus join the glass
+    if(_qmBusy) return;
+    _qmBusy = true;
+    try{
+        const r = await api('quickModel', {op: 'list'});
+        if(!r || r.error) throw new Error((r && r.error) || 'Could not read the model list');
+        S.chatModel = {id: r.id, name: r.name, provider: r.provider, model: r.model};
+        applyQuickModel();
+        $('qm-key').textContent = keyLine(S.chatModel);
+        _qmModels = (Array.isArray(r.models) ? r.models : []).filter(m => typeof m === 'string' && m);
+        if(_qmModels.length) renderModelMenu();
+        else $('qm-list').innerHTML = '<p class="px-3 py-3 text-xs text-dim">' + esc(srvErr(r.note || 'That provider returned no models')) + '</p>';
+        if(menu.classList.contains('hf')) return;        // closed while it loaded
+        placeDropdown(menu, rect, 'right');               // fit again, now it has content
+        /* a phone would throw its keyboard over the list */
+        if(window.matchMedia && matchMedia('(pointer:fine)').matches) $('qm-search').focus();
+    }catch(err){
+        $('qm-list').innerHTML = '<p class="px-3 py-3 text-xs text-danger">' + esc(srvErr(err.message)) + '</p>';
+    }finally{ _qmBusy = false; }
+}
+
+function renderModelMenu(){
+    const q = $('qm-search').value.trim().toLowerCase();
+    const cur = S.chatModel && S.chatModel.model;
+    const hit = q ? _qmModels.filter(m => m.toLowerCase().includes(q)) : _qmModels;
+    $('qm-list').innerHTML = hit.length
+        ? hit.slice(0, 300).map(m => '<button type="button" data-model="' + esc(m) + '" onclick="pickQuickModel(this.dataset.model)" class="qm-item' + (m === cur ? ' is-on' : '') + '">'
+            + '<span class="qm-name">' + esc(m) + '</span>' + (m === cur ? '<i data-lucide="check" class="w-3.5 h-3.5 flex-shrink-0"></i>' : '') + '</button>').join('')
+        : '<p class="px-3 py-3 text-xs text-dim">' + t('Nothing matches') + ' "' + esc(q) + '"</p>';
+    lucide.createIcons($('qm-list'));
+}
+
+async function pickQuickModel(m){
+    closeAllDropdowns();
+    if(!S.chatModel || m === S.chatModel.model) return;
+    const prev = S.chatModel.model;
+    S.chatModel.model = m; applyQuickModel();          // show it now, undo on failure
+    const r = await api('quickModel', {op: 'set', id: S.chatModel.id, model: m});
+    if(!r || r.error){
+        S.chatModel.model = prev; applyQuickModel();
+        toast((r && r.error) || 'Could not change the model', 5000);
+        return;
+    }
+    S.chatModel = {id: r.id, name: r.name, provider: r.provider, model: r.model};
+    applyQuickModel();
+    toast('Model: ' + r.model);
 }
 
 /* An avatar is drawn as a picture when it is a web address or an inline raster
@@ -14739,6 +15459,8 @@ async function loadApiKeys(){
         cont.appendChild(div);
     });
     lucide.createIcons();
+    /* runs after every add, edit and delete: the top bar's model may have moved */
+    refreshQuickModel();
 }
 
 async function showKeyForm(editId){
